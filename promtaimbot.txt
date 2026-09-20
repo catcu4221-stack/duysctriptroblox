@@ -1,0 +1,904 @@
+Hãy thiết kế và viết một hệ thống TARGETING + AIM ASSIST + ESP chuyên sâu bằng Luau cho Roblox Studio. Không cần tạo menu, GUI điều khiển hay giao diện cài đặt. Toàn bộ yêu cầu bên dưới là đặc tả kỹ thuật chính xác của hệ thống.
+
+MỤC TIÊU TỔNG QUÁT
+Tạo một hệ thống có khả năng:
+- Phát hiện Player/NPC hợp lệ trong workspace.
+- Phân loại mục tiêu theo Enemy/Ally/Neutral.
+- Theo dõi vị trí 3D của mục tiêu.
+- Chuyển đổi tọa độ thế giới sang tọa độ màn hình.
+- Xác định mục tiêu có nằm trong FOV hay không.
+- Xác định mục tiêu có thể nhìn thấy hay bị vật cản che hay không.
+- Chọn mục tiêu phù hợp nhất dựa trên thuật toán priority.
+- Hiển thị thông tin mục tiêu bằng ESP.
+- Vẽ Box ESP.
+- Vẽ Name ESP.
+- Vẽ Distance ESP.
+- Vẽ Health ESP.
+- Vẽ Skeleton ESP.
+- Đánh dấu mục tiêu hiện tại.
+- Hỗ trợ Aim Assist vào bộ phận cơ thể được chỉ định.
+- Hỗ trợ ưu tiên Head.
+- Hỗ trợ FOV.
+- Hỗ trợ smooth aiming.
+- Hỗ trợ prediction cho mục tiêu đang di chuyển.
+- Hỗ trợ target locking.
+- Hỗ trợ dynamic target validation.
+- Tối ưu hiệu năng và tránh memory leak.
+
+==================================================
+1. TARGET DISCOVERY / TARGET REGISTRY
+==================================================
+
+Hệ thống phải duy trì danh sách các mục tiêu có khả năng được chọn.
+
+Nguồn mục tiêu:
+- Players:GetPlayers()
+- NPC có Humanoid trong Workspace nếu được bật hỗ trợ NPC.
+
+Không bao giờ chọn:
+- LocalPlayer.
+- Character không tồn tại.
+- Character không có Humanoid.
+- Humanoid.Health <= 0.
+- Character không có bộ phận cần thiết.
+- Object đã bị Destroy.
+- Mục tiêu nằm ngoài giới hạn khoảng cách.
+- Mục tiêu không hợp lệ theo Team Check.
+- Mục tiêu không thỏa điều kiện visibility nếu Visibility Check được bật.
+
+Mỗi target cần có dữ liệu runtime tối thiểu:
+- Player hoặc Model reference.
+- Character reference.
+- Humanoid.
+- HumanoidRootPart.
+- Head nếu tồn tại.
+- UpperTorso nếu R15.
+- Torso nếu R6.
+- Team nếu là Player.
+- Health.
+- MaxHealth.
+- WorldPosition.
+- ScreenPosition.
+- Distance.
+- Visibility state.
+- FOV angle.
+- TargetPart.
+- Current priority score.
+
+Phải xử lý:
+- PlayerAdded.
+- PlayerRemoving.
+- CharacterAdded.
+- CharacterRemoving.
+- NPC spawn/despawn.
+- Respawn.
+
+Không được giữ reference tới object đã bị hủy.
+
+==================================================
+2. R6 / R15 SUPPORT
+==================================================
+
+Hệ thống phải hỗ trợ đồng thời:
+- R6
+- R15
+
+Target body part resolution phải có fallback.
+
+Head:
+- "Head"
+
+R6 torso:
+- "Torso"
+
+R15 torso:
+- "UpperTorso"
+- fallback "LowerTorso"
+- fallback "HumanoidRootPart"
+
+Root:
+- "HumanoidRootPart"
+
+Không được giả định mọi Character đều sử dụng cùng một rig.
+
+Skeleton ESP phải tự phát hiện structure của rig thay vì hard-code duy nhất một loại rig.
+
+==================================================
+3. TEAM / ENEMY DETECTION
+==================================================
+
+Tạo hàm:
+
+isValidTarget(target)
+
+và:
+
+isEnemy(target)
+
+Luật:
+- Nếu target == LocalPlayer => false.
+- Nếu target chết => false.
+- Nếu target không có Character => false.
+- Nếu Team Check bật:
+  - target cùng Team với LocalPlayer => false.
+  - khác Team => có thể chọn.
+- Nếu target không có Team => xử lý như Neutral/NPC tùy configuration.
+- Không sử dụng tên Team để suy đoán nếu có thể dùng object Team trực tiếp.
+
+==================================================
+4. WORLD TO SCREEN
+==================================================
+
+Sử dụng Camera.CurrentCamera.
+
+Mỗi frame hoặc mỗi update cycle:
+- Lấy world position của target.
+- Dùng Camera:WorldToViewportPoint(position).
+- Lưu:
+  - X
+  - Y
+  - Z
+  - onScreen
+
+Không được coi target có Z âm là mục tiêu hợp lệ trên màn hình.
+
+Screen center:
+
+Vector2.new(
+    Camera.ViewportSize.X / 2,
+    Camera.ViewportSize.Y / 2
+)
+
+Khoảng cách màn hình:
+
+(screenPosition - screenCenter).Magnitude
+
+Đây là screen-space distance và phải phân biệt với world distance.
+
+==================================================
+5. FOV SYSTEM
+==================================================
+
+FOV được biểu diễn bởi một vùng quanh tâm màn hình.
+
+Hệ thống phải hỗ trợ:
+- FOV radius.
+- FOV angle.
+- Dynamic FOV tùy FieldOfView của camera.
+- Screen-space FOV.
+- 3D angular FOV.
+
+Mục tiêu chỉ được chọn nếu:
+- target hợp lệ
+- target nằm trong FOV
+- target nằm trong màn hình nếu yêu cầu
+- target đáp ứng Visibility Check nếu bật
+
+Đối với angular targeting:
+1. Lấy Camera.CFrame.LookVector.
+2. Tạo direction từ camera tới target.
+3. Normalize direction.
+4. Dot product:
+   cameraLookVector:Dot(targetDirection)
+5. Clamp giá trị từ -1 tới 1.
+6. Dùng acos để lấy góc.
+7. Chuyển sang degree.
+8. Target hợp lệ nếu angle <= FOV/2.
+
+Không sử dụng phép đo khoảng cách màn hình thay thế cho angular FOV nếu đang mô tả FOV theo độ.
+
+==================================================
+6. TARGET SELECTION
+==================================================
+
+Không đơn giản chọn Player đầu tiên trong danh sách.
+
+Mỗi target phải được đánh giá bằng một scoring/priority system.
+
+Có thể ưu tiên theo:
+
+A. Screen Distance
+- Target càng gần tâm màn hình càng ưu tiên.
+
+B. Angular Distance
+- Target có góc lệch camera nhỏ nhất càng ưu tiên.
+
+C. World Distance
+- Target càng gần LocalPlayer càng ưu tiên.
+
+D. Health
+- Có thể ưu tiên mục tiêu có HP thấp hơn.
+
+E. Visibility
+- Target nhìn thấy trực tiếp phải được ưu tiên hơn target bị che.
+
+F. Target Part
+- Head có thể có priority cao hơn torso.
+
+Priority phải có thứ tự deterministic.
+
+Ví dụ thứ tự:
+1. Valid target.
+2. Enemy check.
+3. Alive check.
+4. Distance check.
+5. FOV check.
+6. Visibility check.
+7. Angular distance.
+8. Screen distance.
+9. World distance.
+
+Nếu hai target có score gần bằng nhau, dùng tie-breaker deterministic để tránh đổi target liên tục.
+
+==================================================
+7. TARGET STABILITY
+==================================================
+
+Không được đổi target liên tục chỉ vì hai mục tiêu có khoảng cách gần nhau.
+
+Triển khai target retention / hysteresis:
+
+- Nếu current target vẫn hợp lệ:
+  - giữ target.
+- Chỉ đổi target nếu:
+  - target chết.
+  - target rời FOV.
+  - target vượt MaxDistance.
+  - target biến mất.
+  - target mất visibility quá điều kiện cho phép.
+  - một target khác tốt hơn vượt ngưỡng switch threshold.
+
+Mục tiêu là tránh hiện tượng flicker giữa hai Player.
+
+==================================================
+8. VISIBILITY CHECK / LINE OF SIGHT
+==================================================
+
+Tạo hệ thống kiểm tra mục tiêu có đang nằm trong tầm nhìn trực tiếp hay không.
+
+Dùng Raycast từ:
+Camera.CFrame.Position
+
+tới:
+
+targetPart.Position
+
+RaycastParams phải:
+- Exclude LocalPlayer Character.
+- Loại bỏ các object không liên quan.
+- Không được để raycast bị chính Character của LocalPlayer chặn.
+
+Nếu raycast hit target Character hoặc targetPart:
+=> Visible = true.
+
+Nếu raycast hit wall/map/object khác:
+=> Visible = false.
+
+Phải xử lý các trường hợp:
+- Door.
+- Window.
+- Transparent object.
+- Terrain.
+- Multiple body parts.
+- Target partially visible.
+
+Có thể hỗ trợ Multi-Part Visibility:
+- thử Head
+- thử UpperTorso
+- thử HumanoidRootPart
+
+Nếu một trong các điểm quan trọng nhìn thấy => target có thể được đánh dấu partially visible tùy configuration.
+
+==================================================
+9. AIM TARGET PART RESOLUTION
+==================================================
+
+Hệ thống Aim phải có cơ chế xác định part mục tiêu.
+
+Các mode:
+
+Head:
+- ưu tiên Head.
+
+Torso:
+- R15 => UpperTorso.
+- R6 => Torso.
+- fallback HumanoidRootPart.
+
+Root:
+- HumanoidRootPart.
+
+Auto:
+- ưu tiên Head nếu tồn tại.
+- nếu Head không hợp lệ => UpperTorso/Torso.
+- cuối cùng => HumanoidRootPart.
+
+Không được crash khi body part không tồn tại.
+
+==================================================
+10. AIM HEAD
+==================================================
+
+Khi Aim Head bật:
+
+TargetPart = Character.Head
+
+Điều kiện:
+- Head tồn tại.
+- Head.Parent tồn tại.
+- Head thuộc Character của target.
+- Target còn sống.
+- Target nằm trong FOV.
+- Target hợp lệ.
+
+Không aim vào một part đã bị Destroy.
+
+==================================================
+11. AIM ASSIST
+==================================================
+
+Aim Assist phải có các bước:
+
+1. Acquire target.
+2. Validate target.
+3. Resolve TargetPart.
+4. Tính vị trí mục tiêu.
+5. Có thể áp dụng prediction.
+6. Tạo hướng nhìn mới bằng CFrame.lookAt.
+7. Không snap ngay lập tức nếu Smoothness > 0.
+8. Nội suy camera từ hướng hiện tại tới hướng mục tiêu.
+
+Smoothness phải hoạt động ổn định:
+- giá trị nhỏ => thay đổi nhanh hơn.
+- giá trị lớn => thay đổi chậm hơn.
+
+Không được tạo rung camera khi target đứng yên.
+
+Không được liên tục tính target khác nếu current target vẫn hợp lệ.
+
+==================================================
+12. AIM PREDICTION
+==================================================
+
+Prediction dùng để ước lượng vị trí mục tiêu trong tương lai.
+
+Thông tin:
+- Target position.
+- Target velocity.
+- Estimated travel time.
+
+Công thức cơ bản:
+
+predictedPosition =
+    currentPosition + velocity * predictionTime
+
+PredictionTime có thể phụ thuộc vào:
+- khoảng cách camera-target.
+- camera/target relative velocity.
+- prediction coefficient.
+
+Không dùng prediction khi:
+- Velocity không hợp lệ.
+- Character không có root.
+- Target đứng yên.
+- Prediction bị tắt.
+
+Giới hạn prediction để tránh target position bị dự đoán quá xa.
+
+==================================================
+13. MOVEMENT COMPENSATION
+==================================================
+
+Khi mục tiêu di chuyển:
+- dùng AssemblyLinearVelocity của HumanoidRootPart.
+- Có thể lấy velocity theo X/Y/Z.
+- Ưu tiên horizontal prediction nếu game sử dụng chiến đấu trên mặt đất.
+- Cho phép xử lý vertical movement riêng.
+
+Không dự đoán quá mức khi mục tiêu đổi hướng đột ngột.
+
+Có thể áp dụng velocity smoothing để giảm jitter.
+
+==================================================
+14. TARGET LOCK
+==================================================
+
+Target Lock phải giữ current target.
+
+State machine:
+
+IDLE
+↓
+SEARCHING
+↓
+LOCKED
+↓
+INVALID / LOST
+↓
+SEARCHING
+
+LOCKED:
+- không search lại mỗi frame nếu target vẫn hợp lệ.
+
+INVALID nếu:
+- chết.
+- rời game.
+- mất Character.
+- ra khỏi MaxDistance.
+- vượt FOV.
+- không còn TargetPart.
+- Visibility không đạt điều kiện.
+
+Khi INVALID:
+- clear target reference.
+- tìm target mới.
+
+==================================================
+15. ESP CORE
+==================================================
+
+ESP phải được render độc lập với Aim.
+
+ESP không được phụ thuộc vào việc Aim đang bật.
+
+Mỗi target có thể có:
+- Box.
+- Name.
+- Distance.
+- Health.
+- Skeleton.
+- Highlight.
+- Tracer.
+- Target indicator.
+
+Mỗi thành phần phải có lifecycle riêng:
+- Create.
+- Update.
+- Hide.
+- Destroy.
+
+Khi Player rời game:
+- tất cả ESP object tương ứng phải bị destroy.
+
+==================================================
+16. BOX ESP
+==================================================
+
+Box ESP phải bao quanh Character theo screen-space.
+
+Không được chỉ lấy một điểm HumanoidRootPart rồi tạo box cố định.
+
+Nên tính bounding box dựa trên Character.
+
+Có thể sử dụng:
+Model:GetBoundingBox()
+
+Sau đó:
+- lấy CFrame.
+- lấy Size.
+- tính các điểm 3D.
+- project các điểm sang screen.
+- lấy minX, maxX, minY, maxY.
+
+Box:
+left = minX
+right = maxX
+top = minY
+bottom = maxY
+
+Ưu điểm:
+- chính xác hơn khi character quay.
+- phù hợp với camera perspective.
+
+Box phải cập nhật khi:
+- player di chuyển.
+- player xoay.
+- camera di chuyển.
+- camera FOV thay đổi.
+
+==================================================
+17. NAME ESP
+==================================================
+
+Hiển thị:
+- DisplayName hoặc Name.
+- Có thể thêm UserId nếu cần.
+- Có thể hiển thị team.
+
+Tên phải nằm phía trên bounding box.
+
+Khoảng cách giữa Name và Box phải ổn định.
+
+Khi target ra khỏi màn hình:
+- hide Name hoặc chuyển sang off-screen indicator tùy configuration.
+
+==================================================
+18. DISTANCE ESP
+==================================================
+
+Khoảng cách:
+
+distance =
+    (LocalPlayerRoot.Position - TargetRoot.Position).Magnitude
+
+Hiển thị dạng:
+123 studs
+
+Phải làm tròn hợp lý.
+
+Không dùng screen-space distance để hiển thị khoảng cách 3D.
+
+==================================================
+19. HEALTH ESP
+==================================================
+
+Lấy:
+Humanoid.Health
+Humanoid.MaxHealth
+
+HealthPercent:
+
+Health / MaxHealth
+
+Giới hạn:
+0 đến 1.
+
+Thanh health:
+- chiều cao phụ thuộc phần trăm HP.
+- full HP => full bar.
+- 0 HP => empty.
+
+Phải xử lý MaxHealth = 0 để tránh chia cho 0.
+
+==================================================
+20. SKELETON ESP
+==================================================
+
+Skeleton phải hỗ trợ cả R6 và R15.
+
+R6 connections:
+
+Head -> Torso
+Torso -> Left Arm
+Torso -> Right Arm
+Torso -> Left Leg
+Torso -> Right Leg
+
+R15 phải dựa vào Motor6D/body-part relationships.
+
+Ví dụ các mối liên kết:
+Head -> UpperTorso
+UpperTorso -> LowerTorso
+UpperTorso -> LeftUpperArm
+LeftUpperArm -> LeftLowerArm
+LeftLowerArm -> LeftHand
+UpperTorso -> RightUpperArm
+RightUpperArm -> RightLowerArm
+RightLowerArm -> RightHand
+LowerTorso -> LeftUpperLeg
+LeftUpperLeg -> LeftLowerLeg
+LeftLowerLeg -> LeftFoot
+LowerTorso -> RightUpperLeg
+RightUpperLeg -> RightLowerLeg
+RightLowerLeg -> RightFoot
+
+Mỗi bone connection:
+1. Lấy world position của part A.
+2. Lấy world position của part B.
+3. WorldToViewportPoint().
+4. Nếu hợp lệ:
+   - vẽ line A -> B.
+5. Nếu một endpoint không hợp lệ:
+   - hide line.
+
+Skeleton phải tự động cập nhật theo animation.
+
+Không hard-code screen coordinates.
+
+==================================================
+21. TRACER
+==================================================
+
+Tracer là đường từ một điểm cố định trên màn hình tới target.
+
+Các origin:
+- Bottom Center.
+- Bottom Left.
+- Center.
+
+Target point:
+- HumanoidRootPart hoặc box center.
+
+Chỉ render khi target:
+- on-screen.
+- valid.
+
+==================================================
+22. TARGET INDICATOR
+==================================================
+
+Target hiện tại phải có dấu hiệu riêng để phân biệt với các ESP khác.
+
+Ví dụ:
+- viền box khác.
+- marker trên head.
+- circle quanh target.
+- target line.
+
+Indicator phải phụ thuộc vào currentTarget.
+
+Khi currentTarget = nil:
+- toàn bộ target indicator phải ẩn.
+
+==================================================
+23. OFF-SCREEN TARGET
+==================================================
+
+Nếu mục tiêu không nằm trong viewport:
+- tính hướng từ tâm camera tới target.
+- project hướng đó thành vị trí sát mép màn hình.
+- hiển thị arrow/indicator.
+
+Phải clamp indicator vào screen bounds.
+
+Arrow phải xoay theo hướng mục tiêu.
+
+Không hiển thị arrow cho target đã chết hoặc không hợp lệ.
+
+==================================================
+24. ESP UPDATE ARCHITECTURE
+==================================================
+
+Không nên tạo/destroy object mỗi frame.
+
+Kiến trúc:
+
+TargetRegistry
+    ↓
+TargetValidation
+    ↓
+TargetData
+    ↓
+ESP Renderer
+    ↓
+Aim Targeting
+
+ESP object phải được cache.
+
+Chỉ:
+- tạo khi target mới xuất hiện.
+- update khi target tồn tại.
+- destroy khi target bị remove.
+
+==================================================
+25. RENDER PRIORITY
+==================================================
+
+Tổ chức update theo thứ tự:
+
+1. Camera reference.
+2. Target registry.
+3. Target validation.
+4. World data.
+5. Visibility.
+6. FOV calculation.
+7. Target selection.
+8. Prediction.
+9. Aim update.
+10. ESP update.
+
+Không chạy cùng một phép tính nhiều lần nếu có thể cache.
+
+==================================================
+26. PERFORMANCE
+==================================================
+
+Tối ưu cho nhiều Player/NPC.
+
+Không sử dụng:
+- while true do cực nhanh không có delay.
+- tạo Instance mỗi frame.
+- tạo Connection lặp lại mỗi frame.
+- Raycast quá mức nếu không cần thiết.
+- FindFirstChild hàng trăm lần mỗi frame.
+
+Cache:
+- Character.
+- Humanoid.
+- HumanoidRootPart.
+- Head.
+- body parts.
+
+Dùng RenderStepped cho:
+- screen projection.
+- ESP rendering.
+- camera-related logic.
+
+Dùng Heartbeat cho:
+- world-state updates nếu phù hợp.
+
+Không tạo memory leak.
+
+Khi target biến mất:
+- Disconnect connection.
+- Destroy drawing/UI object.
+- Remove target khỏi registry.
+
+==================================================
+27. ERROR HANDLING
+==================================================
+
+Tất cả code phải chịu được:
+- Character chưa spawn.
+- Character đang respawn.
+- Head missing.
+- HumanoidRootPart missing.
+- Camera chưa sẵn sàng.
+- Player rời game trong lúc update.
+- NPC bị Destroy.
+- Team nil.
+- MaxHealth = 0.
+- CurrentCamera thay đổi.
+
+Không được để một target lỗi làm dừng toàn bộ Render loop.
+
+==================================================
+28. DATA FLOW
+==================================================
+
+Luồng hoạt động bắt buộc:
+
+SCAN TARGETS
+    ↓
+VALIDATE
+    ↓
+GET CHARACTER PARTS
+    ↓
+GET WORLD POSITION
+    ↓
+GET DISTANCE
+    ↓
+WORLD TO SCREEN
+    ↓
+FOV TEST
+    ↓
+VISIBILITY TEST
+    ↓
+TARGET SCORING
+    ↓
+CURRENT TARGET
+    ↓
+PREDICTION
+    ↓
+AIM UPDATE
+
+ESP song song:
+
+TARGET DATA
+    ↓
+BOX
+NAME
+DISTANCE
+HEALTH
+SKELETON
+TRACER
+TARGET INDICATOR
+
+==================================================
+29. CODE QUALITY
+==================================================
+
+Không viết toàn bộ thành một function khổng lồ.
+
+Tách thành các module logic:
+
+- TargetRegistry
+- TargetValidation
+- TargetResolver
+- VisibilityChecker
+- FOVCalculator
+- TargetSelector
+- Prediction
+- AimController
+- ESPController
+- BoxRenderer
+- NameRenderer
+- HealthRenderer
+- SkeletonRenderer
+- TracerRenderer
+
+Mỗi module có trách nhiệm rõ ràng.
+
+Tên biến phải dễ hiểu.
+
+Ví dụ:
+
+currentTarget
+targetPart
+targetDistance
+screenPosition
+angularDistance
+isVisible
+isEnemy
+predictionTime
+
+Không sử dụng tên biến vô nghĩa như:
+a, b, c, x1, x2 cho logic quan trọng.
+
+==================================================
+30. ĐỘ CHÍNH XÁC CỦA TARGETING
+==================================================
+
+Target được xem là hợp lệ chỉ khi thỏa toàn bộ điều kiện:
+
+- Không phải LocalPlayer.
+- Character tồn tại.
+- Humanoid tồn tại.
+- HumanoidRootPart tồn tại.
+- Health > 0.
+- Enemy hợp lệ.
+- Trong MaxDistance.
+- TargetPart tồn tại.
+- Target nằm trong FOV.
+- Visibility hợp lệ nếu Visibility Check bật.
+- Không bị excluded.
+- Không đang trong trạng thái respawn.
+
+Sau khi đạt tất cả điều kiện mới được đưa vào Candidate List.
+
+Từ Candidate List:
+- tính angular distance.
+- tính screen distance.
+- tính world distance.
+- tính visibility.
+- tính priority score.
+- chọn candidate tốt nhất.
+
+==================================================
+31. YÊU CẦU VỀ AIM ACCURACY
+==================================================
+
+Aim phải:
+- ưu tiên đúng TargetPart.
+- không aim vào vị trí cũ.
+- cập nhật target position theo frame.
+- bám mục tiêu đang di chuyển.
+- giảm jitter.
+- không đổi target vô lý.
+- không snap nếu Smooth Aim được bật.
+- không tiếp tục aim khi target đã invalid.
+- không aim qua tường khi Visibility Check bật.
+- không aim sang đồng đội khi Team Check bật.
+
+==================================================
+32. KẾT QUẢ CUỐI CÙNG
+==================================================
+
+Hãy viết code Luau hoàn chỉnh theo đặc tả trên.
+
+Không tạo menu.
+
+Không tạo hệ thống settings GUI.
+
+Không bỏ qua R6/R15.
+
+Không rút gọn phần Skeleton.
+
+Không sử dụng placeholder kiểu:
+-- code here
+-- implement later
+
+Mỗi module phải có implementation thật.
+
+Sau phần code:
+1. Giải thích kiến trúc.
+2. Giải thích Target Selection.
+3. Giải thích FOV calculation.
+4. Giải thích Visibility Check.
+5. Giải thích Prediction.
+6. Giải thích Skeleton R6/R15.
+7. Giải thích cách tối ưu RenderStepped.
+8. Giải thích lifecycle và cleanup.
+9. Liệt kê các edge case đã xử lý.
+10.sử dụng được trên pc/mobile pc là dành cho app xeno
+10. Kiểm tra code để phát hiện lỗi API, nil reference, division by zero và connection leak trước khi đưa ra kết quả.
