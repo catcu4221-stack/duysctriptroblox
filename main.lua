@@ -6,6 +6,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 local Mouse = LocalPlayer:GetMouse()
@@ -41,7 +42,7 @@ local Config = {
     ToggleKeyEnabled = true,
     UIScale = 1.0,
     BackgroundTransparency = 0.15,
-    
+
     -- Color Palette
     DarkBg = Color3.fromRGB(15, 15, 18),
     SidebarBg = Color3.fromRGB(20, 20, 24),
@@ -50,8 +51,19 @@ local Config = {
     TextColor = Color3.fromRGB(240, 240, 245),
     SubTextColor = Color3.fromRGB(160, 160, 170),
     BorderColor = Color3.fromRGB(45, 45, 55),
-    
-    StartPage = "Information"
+
+    StartPage = "ESP",
+
+    -- ESP Core Configuration
+    Enabled = false,
+    ShowEnemies = true,
+    ShowTeammates = false,
+    ShowName = false,
+    ShowTracer = false,
+    ShowSkeleton = false,
+    ShowHealth = false,
+    ShowDistance = false,
+    MaxDistance = 2000
 }
 
 local GUIState = {
@@ -67,6 +79,10 @@ local GUIState = {
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = GUI_NAME
 ScreenGui.ResetOnSpawn = false
+-- Camera:WorldToViewportPoint() trả tọa độ theo viewport.
+-- IgnoreGuiInset = true giúp ESP overlay khớp chính xác với tọa độ camera,
+-- tránh toàn bộ Name/Health/Distance/Tracer/Skeleton bị lệch xuống.
+ScreenGui.IgnoreGuiInset = true
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = TargetParent
 
@@ -243,19 +259,24 @@ SidebarDivider.BackgroundColor3 = Config.BorderColor
 SidebarDivider.BorderSizePixel = 0
 SidebarDivider.Parent = Sidebar
 
+-- Khung riêng cho các TAB.
+-- Tách khỏi SidebarList để Divider/Author không chiếm chỗ của tab buttons.
+local TabContainer = Instance.new("Frame")
+TabContainer.Name = "TabContainer"
+TabContainer.Size = UDim2.new(1, -16, 1, -58)
+TabContainer.Position = UDim2.new(0, 8, 0, 10)
+TabContainer.BackgroundTransparency = 1
+TabContainer.BorderSizePixel = 0
+TabContainer.Parent = Sidebar
+
 local SidebarList = Instance.new("UIListLayout")
 SidebarList.SortOrder = Enum.SortOrder.LayoutOrder
 SidebarList.Padding = UDim.new(0, 6)
-SidebarList.Parent = Sidebar
-
-local SidebarPadding = Instance.new("UIPadding")
-SidebarPadding.PaddingTop = UDim.new(0, 10)
-SidebarPadding.PaddingLeft = UDim.new(0, 8)
-SidebarPadding.PaddingRight = UDim.new(0, 8)
-SidebarPadding.Parent = Sidebar
+SidebarList.Parent = TabContainer
 
 -- Author Label bottom sidebar
 local AuthorLabel = Instance.new("TextLabel")
+AuthorLabel.Name = "AuthorLabel"
 AuthorLabel.Size = UDim2.new(1, -16, 0, 30)
 AuthorLabel.Position = UDim2.new(0, 8, 1, -35)
 AuthorLabel.Text = Config.Author
@@ -338,7 +359,7 @@ function PageManager:AddPage(pageName)
     tabBtn.TextSize = 13
     tabBtn.BackgroundColor3 = Config.DarkBg
     tabBtn.AutoButtonColor = false
-    tabBtn.Parent = Sidebar
+    tabBtn.Parent = TabContainer
 
     local tabCorner = Instance.new("UICorner")
     tabCorner.CornerRadius = UDim.new(0, 6)
@@ -661,165 +682,583 @@ function UI:CreateTextbox(parent, options)
     bCorner.Parent = box
 
     box.FocusLost:Connect(function(enterPressed)
-        callback(box.Text, enterPressed)
+        local num = tonumber(box.Text)
+        if num then
+            callback(num, enterPressed)
+        else
+            callback(box.Text, enterPressed)
+        end
     end)
 
     return box
-end
-
-function UI:CreateDropdown(parent, options)
-    options = options or {}
-    local text = options.Text or "Dropdown"
-    local list = options.Options or {}
-    local default = options.Default or list[1] or ""
-    local callback = options.Callback or function() end
-
-    local isOpened = false
-
-    local dropFrame = Instance.new("Frame")
-    dropFrame.Size = UDim2.new(1, 0, 0, 32)
-    dropFrame.BackgroundColor3 = Config.DarkBg
-    dropFrame.BorderSizePixel = 0
-    dropFrame.ClipsDescendants = true
-    dropFrame.Parent = parent
-
-    local dCorner = Instance.new("UICorner")
-    dCorner.CornerRadius = UDim.new(0, 5)
-    dCorner.Parent = dropFrame
-
-    local titleBtn = Instance.new("TextButton")
-    titleBtn.Size = UDim2.new(1, 0, 0, 32)
-    titleBtn.Text = "  " .. text .. ": " .. default
-    titleBtn.TextColor3 = Config.TextColor
-    titleBtn.Font = Enum.Font.GothamMedium
-    titleBtn.TextSize = 12
-    titleBtn.TextXAlignment = Enum.TextXAlignment.Left
-    titleBtn.BackgroundTransparency = 1
-    titleBtn.Parent = dropFrame
-
-    local arrow = Instance.new("TextLabel")
-    arrow.Size = UDim2.new(0, 32, 0, 32)
-    arrow.Position = UDim2.new(1, -32, 0, 0)
-    arrow.Text = "▼"
-    arrow.TextColor3 = Config.SubTextColor
-    arrow.Font = Enum.Font.GothamBold
-    arrow.TextSize = 10
-    arrow.BackgroundTransparency = 1
-    arrow.Parent = dropFrame
-
-    local optContainer = Instance.new("Frame")
-    optContainer.Size = UDim2.new(1, 0, 0, #list * 25)
-    optContainer.Position = UDim2.new(0, 0, 0, 32)
-    optContainer.BackgroundTransparency = 1
-    optContainer.Parent = dropFrame
-
-    local oList = Instance.new("UIListLayout")
-    oList.SortOrder = Enum.SortOrder.LayoutOrder
-    oList.Parent = optContainer
-
-    for _, optText in ipairs(list) do
-        local optBtn = Instance.new("TextButton")
-        optBtn.Size = UDim2.new(1, 0, 0, 25)
-        optBtn.Text = "  " .. optText
-        optBtn.TextColor3 = Config.SubTextColor
-        optBtn.Font = Enum.Font.Gotham
-        optBtn.TextSize = 11
-        optBtn.TextXAlignment = Enum.TextXAlignment.Left
-        optBtn.BackgroundTransparency = 1
-        optBtn.Parent = optContainer
-
-        optBtn.MouseButton1Click:Connect(function()
-            titleBtn.Text = "  " .. text .. ": " .. optText
-            isOpened = false
-            TweenService:Create(dropFrame, TweenInfo.new(0.2), {Size = UDim2.new(1, 0, 0, 32)}):Play()
-            arrow.Text = "▼"
-            callback(optText)
-        end)
-    end
-
-    titleBtn.MouseButton1Click:Connect(function()
-        isOpened = not isOpened
-        local targetSize = isOpened and UDim2.new(1, 0, 0, 32 + (#list * 25)) or UDim2.new(1, 0, 0, 32)
-        arrow.Text = isOpened and "▲" or "▼"
-        TweenService:Create(dropFrame, TweenInfo.new(0.2), {Size = targetSize}):Play()
-    end)
-
-    return dropFrame
 end
 
 -- ==========================================
 -- 8. INITIALIZE PAGES & DEFAULT CONTENT
 -- ==========================================
 
--- Tab 1: Information
-local InfoPage = PageManager:AddPage("Information")
+-- ==========================================
+-- 9. ESP CORE & ESP TAB INTEGRATION
+-- ==========================================
 
-local WelcomeSec = UI:CreateSection(InfoPage, "Information")
-UI:CreateLabel(WelcomeSec, "Welcome, Brothers!")
-UI:CreateLabel(WelcomeSec, "TAO LA BỐ CỦA CHÚNG MÀY OK ")
-UI:CreateLabel(WelcomeSec, "HACK ANTI CHO TỚI LÚC BAN ")
+-- Tab 3: ESP
+-- Đúng một tab ESP trong Sidebar, page chỉ tạo một lần.
+-- Click ESP sẽ gọi PageManager:ShowPage("ESP") và ẩn các page khác.
+local ESPPage = PageManager:AddPage("ESP")
 
-local CreditsSec = UI:CreateSection(InfoPage, "Credits")
-UI:CreateLabel(CreditsSec, "- Dev: @Duyhoccode")
-UI:CreateLabel(CreditsSec, "- UI: hehe tự copy ")
+local ESPMainSec = UI:CreateSection(ESPPage, "ESP Main")
 
--- Tab 2: Settings
-local SettingsPage = PageManager:AddPage("Settings")
-
-local ConfigSec = UI:CreateSection(SettingsPage, "Configuration")
-UI:CreateLabel(ConfigSec, "You can change the menu color, background, and keybinds.")
-
-UI:CreateSlider(ConfigSec, {
-    Text = "Background Transparency",
-    Min = 0,
-    Max = 100,
-    Default = math.floor(Config.BackgroundTransparency * 100),
-    Increment = 5,
-    Callback = function(val)
-        Config.BackgroundTransparency = val / 100
-        MainWindow.BackgroundTransparency = Config.BackgroundTransparency
+UI:CreateToggle(ESPMainSec, {
+    Text = "ESP Enable",
+    Default = Config.Enabled,
+    Callback = function(v)
+        Config.Enabled = v
     end
 })
 
-UI:CreateSlider(ConfigSec, {
-    Text = "UI Scale",
-    Min = 8,
-    Max = 14,
-    Default = 10,
-    Increment = 1,
-    Callback = function(val)
-        UIScaleObj.Scale = val / 10
+UI:CreateToggle(ESPMainSec, {
+    Text = "ESP Enemy",
+    Default = Config.ShowEnemies,
+    Callback = function(v)
+        Config.ShowEnemies = v
     end
 })
 
-local KeybindSec = UI:CreateSection(SettingsPage, "Keybind Menu (PC)")
-UI:CreateLabel(KeybindSec, "For PC users, you can use this keybind as a shortcut to open/close the menu.")
-
-UI:CreateToggle(KeybindSec, {
-    Text = "Enable Keybind Toggle",
-    Default = Config.ToggleKeyEnabled,
-    Callback = function(state)
-        Config.ToggleKeyEnabled = state
+UI:CreateToggle(ESPMainSec, {
+    Text = "ESP Team",
+    Default = Config.ShowTeammates,
+    Callback = function(v)
+        Config.ShowTeammates = v
     end
 })
 
-local ActionsSec = UI:CreateSection(SettingsPage, "Actions")
+local ESPVisualsSec = UI:CreateSection(ESPPage, "ESP Visuals")
 
-UI:CreateButton(ActionsSec, "Reset UI Position", function()
-    MainWindow.Position = UDim2.new(0.5, -280, 0.5, -180)
-end)
+UI:CreateToggle(ESPVisualsSec, {
+    Text = "ESP Name",
+    Default = Config.ShowName,
+    Callback = function(v)
+        Config.ShowName = v
+    end
+})
 
-UI:CreateButton(ActionsSec, "Reset Settings", function()
-    MainWindow.BackgroundTransparency = 0.15
-    UIScaleObj.Scale = 1.0
-    MainWindow.Position = UDim2.new(0.5, -280, 0.5, -180)
-end)
+UI:CreateToggle(ESPVisualsSec, {
+    Text = "ESP Tracer",
+    Default = Config.ShowTracer,
+    Callback = function(v)
+        Config.ShowTracer = v
+    end
+})
 
--- Mở mặc định Tab Information
+UI:CreateToggle(ESPVisualsSec, {
+    Text = "ESP Skeleton",
+    Default = Config.ShowSkeleton,
+    Callback = function(v)
+        Config.ShowSkeleton = v
+    end
+})
+
+UI:CreateToggle(ESPVisualsSec, {
+    Text = "ESP Health",
+    Default = Config.ShowHealth,
+    Callback = function(v)
+        Config.ShowHealth = v
+    end
+})
+
+UI:CreateToggle(ESPVisualsSec, {
+    Text = "ESP Distance",
+    Default = Config.ShowDistance,
+    Callback = function(v)
+        Config.ShowDistance = v
+    end
+})
+
+local ESPSettingsSec = UI:CreateSection(ESPPage, "ESP Settings")
+
+local ESPDistanceInput
+
+ESPDistanceInput = UI:CreateTextbox(ESPSettingsSec, {
+    Text = "ESP Distance",
+    Placeholder = "50 - 10000",
+    Default = tostring(Config.MaxDistance),
+    Callback = function(value)
+        local oldValue = Config.MaxDistance
+        local numberValue = tonumber(value)
+
+        if numberValue then
+            Config.MaxDistance = math.clamp(numberValue, 50, 10000)
+            ESPDistanceInput.Text = tostring(Config.MaxDistance)
+        else
+            Config.MaxDistance = oldValue
+            ESPDistanceInput.Text = tostring(oldValue)
+        end
+    end
+})
+
+-- ------------------------------------------
+-- ESP RENDER ENGINE CORE
+-- ------------------------------------------
+
+local espData = {}
+
+local R6Skeleton = {
+    {"Head", "Torso"},
+    {"Torso", "Left Arm"},
+    {"Torso", "Right Arm"},
+    {"Torso", "Left Leg"},
+    {"Torso", "Right Leg"}
+}
+
+local R15Skeleton = {
+    {"Head", "UpperTorso"},
+    {"UpperTorso", "LowerTorso"},
+
+    {"UpperTorso", "LeftUpperArm"},
+    {"LeftUpperArm", "LeftLowerArm"},
+    {"LeftLowerArm", "LeftHand"},
+
+    {"UpperTorso", "RightUpperArm"},
+    {"RightUpperArm", "RightLowerArm"},
+    {"RightLowerArm", "RightHand"},
+
+    {"LowerTorso", "LeftUpperLeg"},
+    {"LeftUpperLeg", "LeftLowerLeg"},
+    {"LeftLowerLeg", "LeftFoot"},
+
+    {"LowerTorso", "RightUpperLeg"},
+    {"RightUpperLeg", "RightLowerLeg"},
+    {"RightLowerLeg", "RightFoot"}
+}
+
+local function createScreenLine(name)
+    local line = Instance.new("Frame")
+    line.Name = name
+    line.Size = UDim2.fromOffset(0, 2)
+    line.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+    line.BorderSizePixel = 0
+    line.AnchorPoint = Vector2.new(0.5, 0.5)
+    line.Visible = false
+    line.ZIndex = 20
+    line.Parent = ScreenGui
+    return line
+end
+
+local function updateScreenLine(line, from, to)
+    if not line then
+        return
+    end
+
+    local delta = to - from
+    local length = delta.Magnitude
+
+    if length <= 0 then
+        line.Visible = false
+        return
+    end
+
+    local midpoint = (from + to) / 2
+
+    line.Position = UDim2.fromOffset(midpoint.X, midpoint.Y)
+    line.Size = UDim2.fromOffset(length, 2)
+    line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+    line.Visible = true
+end
+
+local function createInfo()
+    local holder = Instance.new("Frame")
+    holder.Name = "ESPInfo"
+    holder.Size = UDim2.fromOffset(200, 75)
+    holder.AnchorPoint = Vector2.new(0.5, 1)
+    holder.BackgroundTransparency = 1
+    holder.Visible = false
+    holder.ZIndex = 25
+    holder.Parent = ScreenGui
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Name = "Name"
+    nameLabel.Size = UDim2.new(1, 0, 0, 20)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nameLabel.TextStrokeTransparency = 0
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 14
+    nameLabel.ZIndex = 26
+    nameLabel.Parent = holder
+
+    local healthLabel = Instance.new("TextLabel")
+    healthLabel.Name = "Health"
+    healthLabel.Size = UDim2.new(1, 0, 0, 18)
+    healthLabel.Position = UDim2.fromOffset(0, 20)
+    healthLabel.BackgroundTransparency = 1
+    healthLabel.TextColor3 = Color3.fromRGB(70, 255, 100)
+    healthLabel.TextStrokeTransparency = 0
+    healthLabel.Font = Enum.Font.GothamSemibold
+    healthLabel.TextSize = 12
+    healthLabel.ZIndex = 26
+    healthLabel.Parent = holder
+
+    local distanceLabel = Instance.new("TextLabel")
+    distanceLabel.Name = "Distance"
+    distanceLabel.Size = UDim2.new(1, 0, 0, 18)
+    distanceLabel.Position = UDim2.fromOffset(0, 38)
+    distanceLabel.BackgroundTransparency = 1
+    distanceLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+    distanceLabel.TextStrokeTransparency = 0
+    distanceLabel.Font = Enum.Font.Gotham
+    distanceLabel.TextSize = 11
+    distanceLabel.ZIndex = 26
+    distanceLabel.Parent = holder
+
+    return holder
+end
+
+local function createTargetESP(target)
+    local data = {}
+
+    data.character = target.Character
+    data.info = createInfo()
+    data.tracer = createScreenLine("ESPTracer")
+    data.skeleton = {}
+
+    local character = target.Character
+
+    if character then
+        local skeletonList
+
+        if character:FindFirstChild("UpperTorso") then
+            skeletonList = R15Skeleton
+        else
+            skeletonList = R6Skeleton
+        end
+
+        for _, connection in ipairs(skeletonList) do
+            local line = createScreenLine("ESPSkeleton")
+            line.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+
+            table.insert(data.skeleton, {
+                line = line,
+                partA = connection[1],
+                partB = connection[2]
+            })
+        end
+    end
+
+    return data
+end
+
+local function destroyTargetESP(target)
+    local data = espData[target]
+
+    if not data then
+        return
+    end
+
+    if data.info then
+        data.info:Destroy()
+    end
+
+    if data.tracer then
+        data.tracer:Destroy()
+    end
+
+    for _, skeleton in ipairs(data.skeleton or {}) do
+        if skeleton.line then
+            skeleton.line:Destroy()
+        end
+    end
+
+    espData[target] = nil
+end
+
+local function hideTargetESP(data)
+    if not data then
+        return
+    end
+
+    if data.info then
+        data.info.Visible = false
+    end
+
+    if data.tracer then
+        data.tracer.Visible = false
+    end
+
+    for _, skeleton in ipairs(data.skeleton or {}) do
+        if skeleton.line then
+            skeleton.line.Visible = false
+        end
+    end
+end
+
+local function updateTargetESP(target)
+    local character = target.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local head = character and character:FindFirstChild("Head")
+
+    if not character or not humanoid or humanoid.Health <= 0 or not root then
+        destroyTargetESP(target)
+        return
+    end
+
+    -- Team / Enemy hoàn toàn độc lập với Aim.
+    local isTeammate = target.Team == LocalPlayer.Team
+    local isEnemy = target.Team ~= LocalPlayer.Team
+
+    if isEnemy then
+        if not Config.ShowEnemies then
+            destroyTargetESP(target)
+            return
+        end
+    elseif isTeammate then
+        if not Config.ShowTeammates then
+            destroyTargetESP(target)
+            return
+        end
+    end
+
+    local data = espData[target]
+
+    -- Respawn: character cũ bị xóa và rebuild theo character mới.
+    if data and data.character ~= character then
+        destroyTargetESP(target)
+        data = nil
+    end
+
+    if not data then
+        data = createTargetESP(target)
+        espData[target] = data
+    end
+
+    local camera = Workspace.CurrentCamera
+
+    if not camera then
+        return
+    end
+
+    -- Khoảng cách 3D.
+    local myRoot =
+        LocalPlayer.Character and
+        LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+
+    local distance =
+        myRoot and
+        (myRoot.Position - root.Position).Magnitude or
+        math.huge
+
+    if distance > Config.MaxDistance or not Config.Enabled then
+        hideTargetESP(data)
+        return
+    end
+
+    -- Tọa độ màn hình.
+    local rootScreen, rootOnScreen =
+        camera:WorldToViewportPoint(root.Position)
+
+    local headScreen
+    local headOnScreen = false
+
+    if head then
+        headScreen, headOnScreen =
+            camera:WorldToViewportPoint(head.Position)
+    end
+
+    -- NAME / HEALTH / DISTANCE
+    local showInfo =
+        Config.ShowName or
+        Config.ShowHealth or
+        Config.ShowDistance
+
+    if
+        showInfo and
+        headOnScreen and
+        headScreen.Z > 0
+    then
+        local info = data.info
+
+        -- AnchorPoint = (0.5, 1) => info nằm phía trên đầu.
+        info.Position =
+            UDim2.fromOffset(
+                headScreen.X,
+                headScreen.Y - 8
+            )
+
+        info.Visible = true
+
+        local nameLabel = info:FindFirstChild("Name")
+        local healthLabel = info:FindFirstChild("Health")
+        local distanceLabel = info:FindFirstChild("Distance")
+
+        if nameLabel then
+            nameLabel.Visible = Config.ShowName
+            nameLabel.Text =
+                target.DisplayName ..
+                "  @" ..
+                target.Name
+        end
+
+        if healthLabel then
+            healthLabel.Visible = Config.ShowHealth
+
+            local currentHP = math.floor(humanoid.Health)
+            local maxHP = math.floor(humanoid.MaxHealth)
+
+            if maxHP <= 0 then
+                maxHP = 100
+            end
+
+            healthLabel.Text =
+                "HP: " ..
+                currentHP ..
+                " / " ..
+                maxHP
+        end
+
+        if distanceLabel then
+            distanceLabel.Visible = Config.ShowDistance
+            distanceLabel.Text = math.floor(distance) .. " studs"
+        end
+    else
+        data.info.Visible = false
+    end
+
+    -- TRACER
+    if
+        Config.ShowTracer and
+        rootOnScreen and
+        rootScreen.Z > 0
+    then
+        -- Bottom Center -> HumanoidRootPart của frame hiện tại.
+        local from =
+            Vector2.new(
+                camera.ViewportSize.X / 2,
+                camera.ViewportSize.Y - 8
+            )
+
+        local to =
+            Vector2.new(
+                rootScreen.X,
+                rootScreen.Y
+            )
+
+        updateScreenLine(
+            data.tracer,
+            from,
+            to
+        )
+    else
+        data.tracer.Visible = false
+    end
+
+    -- SKELETON R6 / R15.
+    if Config.ShowSkeleton then
+        -- Lấy lại Position từng part mỗi frame để bám animation.
+        for _, skeleton in ipairs(data.skeleton) do
+            local partA = character:FindFirstChild(skeleton.partA)
+            local partB = character:FindFirstChild(skeleton.partB)
+
+            if partA and partB then
+                local posA, visibleA =
+                    camera:WorldToViewportPoint(partA.Position)
+
+                local posB, visibleB =
+                    camera:WorldToViewportPoint(partB.Position)
+
+                if
+                    visibleA and
+                    visibleB and
+                    posA.Z > 0 and
+                    posB.Z > 0
+                then
+                    updateScreenLine(
+                        skeleton.line,
+                        Vector2.new(posA.X, posA.Y),
+                        Vector2.new(posB.X, posB.Y)
+                    )
+                else
+                    skeleton.line.Visible = false
+                end
+            else
+                skeleton.line.Visible = false
+            end
+        end
+    else
+        for _, skeleton in ipairs(data.skeleton) do
+            skeleton.line.Visible = false
+        end
+    end
+end
+
+local function updateESP()
+    -- Master Toggle: tắt thì không render bất kỳ module nào.
+    if not Config.Enabled then
+        for target in pairs(espData) do
+            destroyTargetESP(target)
+        end
+        return
+    end
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= LocalPlayer then
+            updateTargetESP(target)
+        end
+    end
+end
+
+local function bindPlayerLifecycle(target)
+    if target == LocalPlayer then
+        return
+    end
+
+    -- Khi respawn, bỏ object của character cũ để RenderStepped rebuild.
+    AddConnection(
+        target.CharacterAdded:Connect(function()
+            destroyTargetESP(target)
+        end)
+    )
+
+    AddConnection(
+        target.CharacterRemoving:Connect(function()
+            destroyTargetESP(target)
+        end)
+    )
+end
+
+-- Players đã có sẵn khi script khởi động.
+for _, target in ipairs(Players:GetPlayers()) do
+    if target ~= LocalPlayer then
+        bindPlayerLifecycle(target)
+    end
+end
+
+-- PlayerAdded: player mới được nhận bởi ESP core ở RenderStepped kế tiếp.
+AddConnection(
+    Players.PlayerAdded:Connect(function(target)
+        bindPlayerLifecycle(target)
+    end)
+)
+
+-- PlayerRemoving: cleanup toàn bộ object của player rời game.
+AddConnection(
+    Players.PlayerRemoving:Connect(function(target)
+        destroyTargetESP(target)
+    end)
+)
+
+-- Chỉ một RenderStepped cho ESP core.
+AddConnection(
+    RunService.RenderStepped:Connect(function()
+        updateESP()
+    end)
+)
+
+
+-- Mở mặc định Tab ESP
 PageManager:ShowPage(Config.StartPage)
 
 -- ==========================================
--- 9. EVENT CONTROLS & MINIMIZE / CLOSE
+-- 10. EVENT CONTROLS & MINIMIZE / CLOSE
 -- ==========================================
 
 local function SetMenuState(newState)
@@ -850,6 +1289,9 @@ end)
 -- Close Button
 CloseBtn.MouseButton1Click:Connect(function()
     SetMenuState("Closed")
+    for target in pairs(espData) do
+        destroyTargetESP(target)
+    end
     for _, conn in ipairs(Connections) do
         conn:Disconnect()
     end
@@ -868,12 +1310,13 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 end))
 
--- Expose UI Framework global variable để dễ dàng gọi thêm về sau
+-- Expose UI Framework global variable
 _G.MyGUIFramework = {
     PageManager = PageManager,
     UI = UI,
     ScreenGui = ScreenGui,
-    MainWindow = MainWindow
+    MainWindow = MainWindow,
+    Config = Config
 }
 
-print("[GUI Framework Loaded Successfully!]")
+print("[Hood Rivals Framework & ESP Integrated Successfully!]")
