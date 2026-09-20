@@ -7,6 +7,20 @@ local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local CoreGui = game:GetService("CoreGui")
 local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+
+-- Clean up the previous framework before rebuilding the current one.
+-- This also prevents old Player runtime state from surviving a re-execution.
+pcall(function()
+    if type(_G.MyGUIFramework) == "table" and type(_G.MyGUIFramework.Cleanup) == "function" then
+        _G.MyGUIFramework.Cleanup()
+    end
+end)
+
+-- Clean up a previous render binding if the script is re-executed.
+pcall(function()
+    RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
+end)
 
 local LocalPlayer = Players.LocalPlayer
 local Mouse = LocalPlayer:GetMouse()
@@ -24,6 +38,25 @@ local GUI_NAME = "HoodRivals_GUI_Framework"
 if TargetParent:FindFirstChild(GUI_NAME) then
     TargetParent[GUI_NAME]:Destroy()
 end
+
+-- Remove highlight objects left by previous reference versions.
+pcall(function()
+    for _, target in ipairs(Players:GetPlayers()) do
+        local character = target.Character
+        if character then
+            local legacyHighlight = character:FindFirstChild("ESPHighlight")
+            if legacyHighlight and legacyHighlight:IsA("Highlight") then
+                legacyHighlight:Destroy()
+            end
+
+            local currentHighlight =
+                character:FindFirstChild("__HoodRivals_ESPHighlight")
+            if currentHighlight and currentHighlight:IsA("Highlight") then
+                currentHighlight:Destroy()
+            end
+        end
+    end
+end)
 
 -- Quản lý Event Connections
 local Connections = {}
@@ -56,14 +89,52 @@ local Config = {
 
     -- ESP Core Configuration
     Enabled = false,
-    ShowEnemies = true,
+    ShowEnemies = false,
     ShowTeammates = false,
     ShowName = false,
     ShowTracer = false,
     ShowSkeleton = false,
     ShowHealth = false,
     ShowDistance = false,
-    MaxDistance = 2000
+    MaxDistance = 2000,
+    ESPHighlightEnabled = false,
+
+    -- =========================================================
+    -- AIM CONFIGURATION
+    -- =========================================================
+    AimEnabled = false,
+    TeamCheck = false,
+    WallCheck = false,
+    IgnoreVisibility = false,
+    UseFOV = false,
+    FOV = 90,
+    AlwaysAim = false,
+    AimOnFire = false,
+    AimPart = "Head",
+    Smoothness = 0.20,
+    AimMaxDistance = 2000,
+
+    -- =========================================================
+    -- PLAYER CONFIGURATION
+    -- =========================================================
+    Player = {
+        CFrameSpeedEnabled = false,
+        CFrameSpeed = 50,
+
+        AirFlyEnabled = false,
+        JumpPower = 50,
+
+        FlyEnabled = false,
+        FlySpeed = 50,
+
+        FullBrightEnabled = false,
+
+        NoclipEnabled = false
+    },
+
+    Teleport = {
+        SelectedPlayer = nil
+    }
 }
 
 local GUIState = {
@@ -90,11 +161,68 @@ local UIScaleObj = Instance.new("UIScale")
 UIScaleObj.Scale = Config.UIScale
 UIScaleObj.Parent = ScreenGui
 
+-- =========================================================
+-- AIM FOV CIRCLE
+-- The circle uses screen-pixel FOV units and follows the
+-- camera viewport center. Color continuously cycles through
+-- the full HSV spectrum to create a rainbow effect.
+-- =========================================================
+local FOVCircle = Instance.new("Frame")
+FOVCircle.Name = "AimFOVCircle"
+FOVCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+FOVCircle.BackgroundTransparency = 1
+FOVCircle.BorderSizePixel = 0
+FOVCircle.Visible = false
+FOVCircle.ZIndex = 0
+FOVCircle.Parent = ScreenGui
+
+local FOVCircleCorner = Instance.new("UICorner")
+FOVCircleCorner.CornerRadius = UDim.new(1, 0)
+FOVCircleCorner.Parent = FOVCircle
+
+local FOVCircleStroke = Instance.new("UIStroke")
+FOVCircleStroke.Thickness = 2
+FOVCircleStroke.Transparency = 0
+FOVCircleStroke.Color = Color3.fromRGB(255, 0, 0)
+FOVCircleStroke.Parent = FOVCircle
+
+local function UpdateFOVCircle()
+    local camera = Workspace.CurrentCamera
+
+    if not camera then
+        FOVCircle.Visible = false
+        return
+    end
+
+    if not Config.AimEnabled or not Config.UseFOV then
+        FOVCircle.Visible = false
+        return
+    end
+
+    local viewport = camera.ViewportSize
+    local scale = math.max(UIScaleObj.Scale, 0.01)
+    local diameter = (Config.FOV * 2) / scale
+
+    FOVCircle.Size = UDim2.fromOffset(diameter, diameter)
+    FOVCircle.Position = UDim2.fromOffset(
+        (viewport.X / 2) / scale,
+        (viewport.Y / 2) / scale
+    )
+
+    -- Continuous 7-color rainbow cycle.
+    local hue = (os.clock() * 0.20) % 1
+    FOVCircleStroke.Color = Color3.fromHSV(hue, 1, 1)
+
+    FOVCircle.Visible = true
+end
+
 -- ==========================================
 -- 4. UTILITY FUNCTIONS (DRAG & TOUCH)
 -- ==========================================
-local function MakeDraggable(guiObject, dragHandle)
+local function MakeDraggable(guiObject, dragHandle, cleanupOnDestroy)
     dragHandle = dragHandle or guiObject
+    cleanupOnDestroy = cleanupOnDestroy == true
+
     local dragging = false
     local dragInput, dragStart, startPos
     local wasDragged = false
@@ -140,6 +268,24 @@ local function MakeDraggable(guiObject, dragHandle)
     AddConnection(conn1)
     AddConnection(conn2)
     AddConnection(conn3)
+
+    -- Optional per-object cleanup used by transient floating controls.
+    -- Existing drag behavior is unchanged for all existing callers.
+    if cleanupOnDestroy then
+        local cleanupConn
+        cleanupConn = guiObject.AncestryChanged:Connect(
+            function(_, parent)
+                if parent == nil then
+                    pcall(function() conn1:Disconnect() end)
+                    pcall(function() conn2:Disconnect() end)
+                    pcall(function() conn3:Disconnect() end)
+                    pcall(function() cleanupConn:Disconnect() end)
+                end
+            end
+        )
+
+        AddConnection(cleanupConn)
+    end
 
     return function() return wasDragged end
 end
@@ -557,8 +703,34 @@ function UI:CreateSlider(parent, options)
     local default = options.Default or min
     local increment = options.Increment or 1
     local callback = options.Callback or function() end
+    local allowTextInputBeyondRange =
+        options.AllowTextInputBeyondRange == true
+    local editableValue =
+        options.EditableValue == true
 
-    local currentValue = math.clamp(default, min, max)
+    -- currentValue is the single source of truth.
+    local currentValue = default
+    local sliderMax = max
+
+    local function IsFiniteNumber(value)
+        return type(value) == "number"
+            and value == value
+            and value ~= math.huge
+            and value ~= -math.huge
+    end
+
+    if not IsFiniteNumber(currentValue) then
+        currentValue = min
+    end
+
+    currentValue = math.clamp(currentValue, min, max)
+
+    local function FormatValue(value)
+        if increment < 1 then
+            return string.format("%.2f", value)
+        end
+        return tostring(value)
+    end
 
     local sliderFrame = Instance.new("Frame")
     sliderFrame.Size = UDim2.new(1, 0, 0, 40)
@@ -566,7 +738,7 @@ function UI:CreateSlider(parent, options)
     sliderFrame.Parent = parent
 
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0.6, 0, 0, 18)
+    label.Size = UDim2.new(0.58, 0, 0, 18)
     label.Text = text
     label.TextColor3 = Config.TextColor
     label.Font = Enum.Font.GothamMedium
@@ -575,16 +747,41 @@ function UI:CreateSlider(parent, options)
     label.BackgroundTransparency = 1
     label.Parent = sliderFrame
 
-    local valLabel = Instance.new("TextLabel")
-    valLabel.Size = UDim2.new(0.4, 0, 0, 18)
-    valLabel.Position = UDim2.new(0.6, 0, 0, 0)
-    valLabel.Text = tostring(currentValue)
-    valLabel.TextColor3 = Config.SubTextColor
-    valLabel.Font = Enum.Font.Gotham
-    valLabel.TextSize = 12
-    valLabel.TextXAlignment = Enum.TextXAlignment.Right
-    valLabel.BackgroundTransparency = 1
-    valLabel.Parent = sliderFrame
+    local valueBox
+
+    if editableValue then
+        -- The original value label becomes an editable TextBox only
+        -- for sliders that explicitly request direct numeric input.
+        valueBox = Instance.new("TextBox")
+        valueBox.Size = UDim2.new(0.40, 0, 0, 18)
+        valueBox.Position = UDim2.new(0.60, 0, 0, 0)
+        valueBox.Text = FormatValue(currentValue)
+        valueBox.TextColor3 = Config.SubTextColor
+        valueBox.PlaceholderText = FormatValue(currentValue)
+        valueBox.PlaceholderColor3 = Config.SubTextColor
+        valueBox.Font = Enum.Font.Gotham
+        valueBox.TextSize = 12
+        valueBox.TextXAlignment = Enum.TextXAlignment.Right
+        valueBox.BackgroundColor3 = Config.DarkBg
+        valueBox.BorderSizePixel = 0
+        valueBox.ClearTextOnFocus = false
+        valueBox.Parent = sliderFrame
+
+        local vCorner = Instance.new("UICorner")
+        vCorner.CornerRadius = UDim.new(0, 4)
+        vCorner.Parent = valueBox
+    else
+        valueBox = Instance.new("TextLabel")
+        valueBox.Size = UDim2.new(0.40, 0, 0, 18)
+        valueBox.Position = UDim2.new(0.60, 0, 0, 0)
+        valueBox.Text = FormatValue(currentValue)
+        valueBox.TextColor3 = Config.SubTextColor
+        valueBox.Font = Enum.Font.Gotham
+        valueBox.TextSize = 12
+        valueBox.TextXAlignment = Enum.TextXAlignment.Right
+        valueBox.BackgroundTransparency = 1
+        valueBox.Parent = sliderFrame
+    end
 
     local track = Instance.new("Frame")
     track.Size = UDim2.new(1, 0, 0, 6)
@@ -598,7 +795,7 @@ function UI:CreateSlider(parent, options)
     tCorner.Parent = track
 
     local fill = Instance.new("Frame")
-    fill.Size = UDim2.new((currentValue - min) / (max - min), 0, 1, 0)
+    fill.Size = UDim2.new(0, 0, 1, 0)
     fill.BackgroundColor3 = Config.AccentColor
     fill.BorderSizePixel = 0
     fill.Parent = track
@@ -609,35 +806,145 @@ function UI:CreateSlider(parent, options)
 
     local dragging = false
 
-    local function updateValue(inputPos)
-        local percentage = math.clamp((inputPos.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-        local rawValue = min + (max - min) * percentage
-        currentValue = math.floor(rawValue / increment + 0.5) * increment
-        currentValue = math.clamp(currentValue, min, max)
+    local function updateVisuals()
+        local visualMax = math.max(sliderMax, min + increment)
+        local denominator = visualMax - min
 
-        fill.Size = UDim2.new((currentValue - min) / (max - min), 0, 1, 0)
-        valLabel.Text = tostring(currentValue)
+        local percentage = 0
+        if denominator > 0 then
+            percentage = math.clamp(
+                (currentValue - min) / denominator,
+                0,
+                1
+            )
+        end
+
+        fill.Size = UDim2.new(percentage, 0, 1, 0)
+        valueBox.Text = FormatValue(currentValue)
+    end
+
+    -- Slider input intentionally stays inside the configured range.
+    local function updateFromSlider(inputPos)
+        local percentage = math.clamp(
+            (inputPos.X - track.AbsolutePosition.X) /
+                math.max(track.AbsoluteSize.X, 1),
+            0,
+            1
+        )
+
+        local rawValue =
+            min + (sliderMax - min) * percentage
+
+        currentValue =
+            math.floor(rawValue / increment + 0.5) * increment
+
+        currentValue = math.clamp(
+            currentValue,
+            min,
+            sliderMax
+        )
+
+        updateVisuals()
         callback(currentValue)
     end
 
-    track.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    local function updateFromText()
+        local enteredValue = tonumber(valueBox.Text)
+
+        if not IsFiniteNumber(enteredValue) then
+            valueBox.Text = FormatValue(currentValue)
+            return
+        end
+
+        if enteredValue < min then
+            valueBox.Text = FormatValue(currentValue)
+            return
+        end
+
+        if allowTextInputBeyondRange then
+            -- Player values can exceed the original visual slider range.
+            -- Expand the slider range so the textbox and track remain
+            -- synchronized instead of hard-clamping the typed value.
+            if enteredValue > sliderMax then
+                sliderMax = enteredValue
+            end
+
+            currentValue = enteredValue
+        else
+            -- Preserve the configured slider range for existing sliders.
+            currentValue = math.clamp(
+                enteredValue,
+                min,
+                sliderMax
+            )
+
+            -- Respect the configured increment for regular sliders.
+            if increment > 0 then
+                currentValue =
+                    math.floor(
+                        ((currentValue - min) / increment) + 0.5
+                    ) * increment + min
+
+                currentValue = math.clamp(
+                    currentValue,
+                    min,
+                    sliderMax
+                )
+            end
+        end
+
+        updateVisuals()
+        callback(currentValue)
+    end
+
+    if editableValue then
+        AddConnection(
+            valueBox.FocusLost:Connect(function()
+                updateFromText()
+            end)
+        )
+    end
+
+    AddConnection(
+        track.InputBegan:Connect(function(input)
+        if
+            input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch
+        then
             dragging = true
-            updateValue(input.Position)
+            updateFromSlider(input.Position)
         end
-    end)
+        end)
+    )
 
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            updateValue(input.Position)
+    AddConnection(
+        UserInputService.InputChanged:Connect(function(input)
+        if
+            dragging
+            and (
+                input.UserInputType
+                    == Enum.UserInputType.MouseMovement
+                or input.UserInputType
+                    == Enum.UserInputType.Touch
+            )
+        then
+            updateFromSlider(input.Position)
         end
-    end)
+        end)
+    )
 
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    AddConnection(
+        UserInputService.InputEnded:Connect(function(input)
+        if
+            input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch
+        then
             dragging = false
         end
-    end)
+        end)
+    )
+
+    updateVisuals()
 
     return sliderFrame
 end
@@ -700,6 +1007,670 @@ end
 -- ==========================================
 -- 9. ESP CORE & ESP TAB INTEGRATION
 -- ==========================================
+
+-- =========================================================
+-- PLAYER CONFIG / CORE / CHARACTER HANDLER
+-- =========================================================
+
+local PlayerRuntime = {
+    Character = nil,
+    Humanoid = nil,
+    RootPart = nil,
+
+    AirFlyJumpRequested = false,
+
+    NoclipOriginalCanCollide = {},
+
+    FullBrightSaved = nil
+}
+
+local PLAYER_FLY_VELOCITY_NAME = "__HoodRivals_PlayerFlyVelocity"
+local PLAYER_FLY_GYRO_NAME = "__HoodRivals_PlayerFlyGyro"
+
+local FULL_BRIGHT_VALUES = {
+    Brightness = 2,
+    ClockTime = 14,
+    FogEnd = 100000,
+    GlobalShadows = false
+}
+
+local function GetLocalCharacterParts()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil, nil, nil
+    end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+    return character, humanoid, rootPart
+end
+
+local function RefreshPlayerCharacterReferences(character)
+    PlayerRuntime.Character = character
+    PlayerRuntime.Humanoid = character and character:FindFirstChildOfClass("Humanoid") or nil
+    PlayerRuntime.RootPart = character and character:FindFirstChild("HumanoidRootPart") or nil
+    PlayerRuntime.NoclipOriginalCanCollide = {}
+end
+
+-- =========================
+-- PLAYER CLEANUP HELPERS
+-- =========================
+
+local function RestoreNoclip(character)
+    local originalStates = PlayerRuntime.NoclipOriginalCanCollide
+
+    for part, originalCanCollide in pairs(originalStates) do
+        if part and part.Parent and part:IsA("BasePart") then
+            pcall(function()
+                part.CanCollide = originalCanCollide
+            end)
+        end
+    end
+
+    PlayerRuntime.NoclipOriginalCanCollide = {}
+end
+
+local function DestroyFlyObjects(character)
+    if not character then
+        return
+    end
+
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then
+        return
+    end
+
+    local velocity = rootPart:FindFirstChild(PLAYER_FLY_VELOCITY_NAME)
+    if velocity then
+        velocity:Destroy()
+    end
+
+    local gyro = rootPart:FindFirstChild(PLAYER_FLY_GYRO_NAME)
+    if gyro then
+        gyro:Destroy()
+    end
+end
+
+local function CaptureFullBrightState()
+    if PlayerRuntime.FullBrightSaved then
+        return
+    end
+
+    PlayerRuntime.FullBrightSaved = {
+        Brightness = Lighting.Brightness,
+        ClockTime = Lighting.ClockTime,
+        FogEnd = Lighting.FogEnd,
+        GlobalShadows = Lighting.GlobalShadows
+    }
+end
+
+local function ApplyFullBright()
+    for propertyName, propertyValue in pairs(FULL_BRIGHT_VALUES) do
+        if Lighting[propertyName] ~= propertyValue then
+            Lighting[propertyName] = propertyValue
+        end
+    end
+end
+
+local function RestoreFullBright()
+    local saved = PlayerRuntime.FullBrightSaved
+    if not saved then
+        return
+    end
+
+    for propertyName, propertyValue in pairs(saved) do
+        pcall(function()
+            Lighting[propertyName] = propertyValue
+        end)
+    end
+
+    PlayerRuntime.FullBrightSaved = nil
+end
+
+local function CleanupPlayerRuntime()
+    local character = PlayerRuntime.Character or LocalPlayer.Character
+
+    if character then
+        RestoreNoclip(character)
+        DestroyFlyObjects(character)
+    else
+        PlayerRuntime.NoclipOriginalCanCollide = {}
+    end
+
+    RestoreFullBright()
+
+    PlayerRuntime.Character = nil
+    PlayerRuntime.Humanoid = nil
+    PlayerRuntime.RootPart = nil
+    PlayerRuntime.AirFlyJumpRequested = false
+end
+
+-- =========================
+-- PLAYER CORE
+-- =========================
+
+local function ApplyJumpPower(humanoid)
+    if not humanoid then
+        return
+    end
+
+    pcall(function()
+        humanoid.UseJumpPower = true
+        local jumpPower = tonumber(Config.Player.JumpPower) or 50
+
+        if jumpPower == jumpPower
+            and jumpPower ~= math.huge
+            and jumpPower ~= -math.huge
+        then
+            humanoid.JumpPower = math.max(jumpPower, 0)
+        end
+    end)
+end
+
+local function UpdateCFrameSpeed(dt, humanoid, rootPart)
+    if not Config.Player.CFrameSpeedEnabled then
+        return
+    end
+
+    if not humanoid or not rootPart then
+        return
+    end
+
+    local moveDirection = humanoid.MoveDirection
+    if moveDirection.Magnitude <= 0 then
+        return
+    end
+
+    rootPart.CFrame =
+        rootPart.CFrame
+        + (moveDirection * (Config.Player.CFrameSpeed * dt))
+end
+
+local function UpdateAirFly()
+    if not Config.Player.AirFlyEnabled then
+        PlayerRuntime.AirFlyJumpRequested = false
+        return
+    end
+
+    if not PlayerRuntime.AirFlyJumpRequested then
+        return
+    end
+
+    PlayerRuntime.AirFlyJumpRequested = false
+
+    local character, humanoid, rootPart = GetLocalCharacterParts()
+    if not character or not humanoid or not rootPart then
+        return
+    end
+
+    pcall(function()
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+
+        local boostPower = tonumber(Config.Player.JumpPower) or 50
+
+        if boostPower ~= boostPower
+            or boostPower == math.huge
+            or boostPower == -math.huge
+        then
+            boostPower = 50
+        end
+
+        boostPower = math.max(boostPower, 0)
+
+        local velocity = rootPart.AssemblyLinearVelocity
+
+        rootPart.AssemblyLinearVelocity = Vector3.new(
+            velocity.X,
+            boostPower,
+            velocity.Z
+        )
+    end)
+end
+
+local function UpdateFly(humanoid, rootPart)
+    if not Config.Player.FlyEnabled then
+        if rootPart then
+            DestroyFlyObjects(PlayerRuntime.Character or LocalPlayer.Character)
+        end
+        return
+    end
+
+    if not humanoid or not rootPart then
+        return
+    end
+
+    local bodyVelocity = rootPart:FindFirstChild(PLAYER_FLY_VELOCITY_NAME)
+    local bodyGyro = rootPart:FindFirstChild(PLAYER_FLY_GYRO_NAME)
+
+    if not bodyVelocity then
+        bodyVelocity = Instance.new("BodyVelocity")
+        bodyVelocity.Name = PLAYER_FLY_VELOCITY_NAME
+        bodyVelocity.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+        bodyVelocity.Parent = rootPart
+    end
+
+    if not bodyGyro then
+        bodyGyro = Instance.new("BodyGyro")
+        bodyGyro.Name = PLAYER_FLY_GYRO_NAME
+        bodyGyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+        bodyGyro.P = 9e4
+        bodyGyro.Parent = rootPart
+    end
+
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        bodyVelocity.Velocity = Vector3.zero
+        return
+    end
+
+    local moveDirection = humanoid.MoveDirection
+
+    if moveDirection.Magnitude > 0 then
+        local flatLook =
+            Vector3.new(
+                camera.CFrame.LookVector.X,
+                0,
+                camera.CFrame.LookVector.Z
+            )
+
+        local flatRight =
+            Vector3.new(
+                camera.CFrame.RightVector.X,
+                0,
+                camera.CFrame.RightVector.Z
+            )
+
+        if flatLook.Magnitude > 0 then
+            flatLook = flatLook.Unit
+        end
+
+        if flatRight.Magnitude > 0 then
+            flatRight = flatRight.Unit
+        end
+
+        bodyVelocity.Velocity =
+            (
+                camera.CFrame.LookVector * flatLook:Dot(moveDirection)
+                + camera.CFrame.RightVector * flatRight:Dot(moveDirection)
+            ) * Config.Player.FlySpeed
+    else
+        bodyVelocity.Velocity = Vector3.zero
+    end
+
+    bodyGyro.CFrame = camera.CFrame
+end
+
+local function UpdateNoclip(character)
+    if not Config.Player.NoclipEnabled then
+        RestoreNoclip(character)
+        return
+    end
+
+    if not character then
+        return
+    end
+
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if PlayerRuntime.NoclipOriginalCanCollide[part] == nil then
+                PlayerRuntime.NoclipOriginalCanCollide[part] =
+                    part.CanCollide
+            end
+
+            if part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end
+end
+
+local function UpdatePlayer(dt)
+    local character, humanoid, rootPart = GetLocalCharacterParts()
+
+    if character ~= PlayerRuntime.Character then
+        PlayerRuntime.NoclipOriginalCanCollide = {}
+    end
+
+    PlayerRuntime.Character = character
+    PlayerRuntime.Humanoid = humanoid
+    PlayerRuntime.RootPart = rootPart
+
+    if not character or not humanoid or not rootPart then
+        return
+    end
+
+    -- Jump Power is independent from Air Fly and has no toggle.
+    ApplyJumpPower(humanoid)
+
+    UpdateCFrameSpeed(dt, humanoid, rootPart)
+    UpdateAirFly()
+    UpdateFly(humanoid, rootPart)
+    UpdateNoclip(character)
+
+    if Config.Player.FullBrightEnabled then
+        CaptureFullBrightState()
+        ApplyFullBright()
+    end
+end
+
+-- =========================
+-- PLAYER CHARACTER HANDLER
+-- =========================
+
+local function HandleLocalCharacterAdded(character)
+    RefreshPlayerCharacterReferences(character)
+
+    PlayerRuntime.AirFlyJumpRequested = false
+
+    -- Remove only our previous fly objects from the new character, if any.
+    DestroyFlyObjects(character)
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        ApplyJumpPower(humanoid)
+    end
+end
+
+local function HandleLocalCharacterRemoving(character)
+    PlayerRuntime.AirFlyJumpRequested = false
+
+    RestoreNoclip(character)
+    DestroyFlyObjects(character)
+
+    if PlayerRuntime.Character == character then
+        PlayerRuntime.Character = nil
+        PlayerRuntime.Humanoid = nil
+        PlayerRuntime.RootPart = nil
+    end
+end
+
+RefreshPlayerCharacterReferences(LocalPlayer.Character)
+
+AddConnection(
+    LocalPlayer.CharacterAdded:Connect(function(character)
+        HandleLocalCharacterAdded(character)
+    end)
+)
+
+AddConnection(
+    LocalPlayer.CharacterRemoving:Connect(function(character)
+        HandleLocalCharacterRemoving(character)
+    end)
+)
+
+-- One JumpRequest connection for the whole script.
+-- The actual jump is consumed by UpdateAirFly() inside the unified render lifecycle.
+AddConnection(
+    UserInputService.JumpRequest:Connect(function()
+        if Config.Player.AirFlyEnabled
+            and GUIState.CurrentState ~= "Closed"
+        then
+            PlayerRuntime.AirFlyJumpRequested = true
+        end
+    end)
+)
+
+-- =========================
+-- PLAYER UI
+-- Uses the existing PageManager + UI component engine only.
+-- =========================
+
+local PlayerPage = PageManager:AddPage("PLAYER")
+
+local PlayerMovementSec = UI:CreateSection(PlayerPage, "MOVEMENT")
+
+UI:CreateToggle(PlayerMovementSec, {
+    Text = "CFrame Speed",
+    Default = false,
+    Callback = function(value)
+        Config.Player.CFrameSpeedEnabled = value
+    end
+})
+
+UI:CreateSlider(PlayerMovementSec, {
+    Text = "CFrame Speed",
+    Min = 20,
+    Max = 200,
+    Default = 50,
+    Increment = 1,
+    EditableValue = true,
+    AllowTextInputBeyondRange = true,
+    Callback = function(value)
+        Config.Player.CFrameSpeed = value
+    end
+})
+
+local PlayerJumpSec = UI:CreateSection(PlayerPage, "JUMP")
+
+UI:CreateToggle(PlayerJumpSec, {
+    Text = "Air Fly",
+    Default = false,
+    Callback = function(value)
+        Config.Player.AirFlyEnabled = value
+
+        if not value then
+            PlayerRuntime.AirFlyJumpRequested = false
+        end
+    end
+})
+
+UI:CreateSlider(PlayerJumpSec, {
+    Text = "Jump Power",
+    Min = 20,
+    Max = 200,
+    Default = 50,
+    Increment = 1,
+    EditableValue = true,
+    AllowTextInputBeyondRange = true,
+    Callback = function(value)
+        Config.Player.JumpPower = value
+        ApplyJumpPower(PlayerRuntime.Humanoid)
+    end
+})
+
+local PlayerFlySec = UI:CreateSection(PlayerPage, "FLY")
+
+UI:CreateToggle(PlayerFlySec, {
+    Text = "Fly",
+    Default = false,
+    Callback = function(value)
+        Config.Player.FlyEnabled = value
+
+        if not value then
+            DestroyFlyObjects(PlayerRuntime.Character or LocalPlayer.Character)
+        end
+    end
+})
+
+UI:CreateSlider(PlayerFlySec, {
+    Text = "Fly Speed",
+    Min = 0,
+    Max = 200,
+    Default = 50,
+    Increment = 1,
+    EditableValue = true,
+    AllowTextInputBeyondRange = true,
+    Callback = function(value)
+        Config.Player.FlySpeed = value
+    end
+})
+
+local PlayerVisualSec = UI:CreateSection(PlayerPage, "VISUAL")
+
+UI:CreateToggle(PlayerVisualSec, {
+    Text = "Full Bright",
+    Default = false,
+    Callback = function(value)
+        Config.Player.FullBrightEnabled = value
+
+        if value then
+            CaptureFullBrightState()
+            ApplyFullBright()
+        else
+            RestoreFullBright()
+        end
+    end
+})
+
+local PlayerCharacterSec = UI:CreateSection(PlayerPage, "CHARACTER")
+
+UI:CreateToggle(PlayerCharacterSec, {
+    Text = "Noclip",
+    Default = false,
+    Callback = function(value)
+        Config.Player.NoclipEnabled = value
+
+        if value then
+            -- The unified Player update will capture per-part collision state.
+            return
+        end
+
+        RestoreNoclip(PlayerRuntime.Character or LocalPlayer.Character)
+    end
+})
+
+-- =========================================================
+-- TAB: AIM
+-- Created exactly once in the existing PageManager.
+-- Future tabs can be registered in this section.
+-- =========================================================
+local AimPage = PageManager:AddPage("AIM")
+
+local AimMainSec = UI:CreateSection(AimPage, "AIM Main")
+
+UI:CreateToggle(AimMainSec, {
+    Text = "Aim Enable",
+    Default = Config.AimEnabled,
+    Callback = function(value)
+        Config.AimEnabled = value
+    end
+})
+
+UI:CreateToggle(AimMainSec, {
+    Text = "Team Check",
+    Default = Config.TeamCheck,
+    Callback = function(value)
+        Config.TeamCheck = value
+    end
+})
+
+UI:CreateToggle(AimMainSec, {
+    Text = "Wall Check",
+    Default = Config.WallCheck,
+    Callback = function(value)
+        Config.WallCheck = value
+    end
+})
+
+UI:CreateToggle(AimMainSec, {
+    Text = "Ignore Visibility",
+    Default = Config.IgnoreVisibility,
+    Callback = function(value)
+        Config.IgnoreVisibility = value
+    end
+})
+
+local AimTargetSec = UI:CreateSection(AimPage, "AIM Target")
+
+local AimPartButton
+AimPartButton = UI:CreateButton(
+    AimTargetSec,
+    "Aim Part: " .. Config.AimPart,
+    function()
+        Config.AimPart =
+            (Config.AimPart == "Head") and "Body" or "Head"
+
+        AimPartButton.Text = "Aim Part: " .. Config.AimPart
+    end
+)
+
+local AimFovSec = UI:CreateSection(AimPage, "AIM FOV")
+
+UI:CreateToggle(AimFovSec, {
+    Text = "Use FOV",
+    Default = Config.UseFOV,
+    Callback = function(value)
+        Config.UseFOV = value
+    end
+})
+
+UI:CreateSlider(AimFovSec, {
+    Text = "FOV",
+    Min = 0,
+    Max = 180,
+    Default = Config.FOV,
+    Increment = 1,
+    Callback = function(value)
+        Config.FOV = math.clamp(value, 0, 180)
+    end
+})
+
+local AimMaxDistanceInput
+AimMaxDistanceInput = UI:CreateTextbox(AimFovSec, {
+    Text = "Max Distance",
+    Placeholder = "50 - 10000",
+    Default = tostring(Config.AimMaxDistance),
+    Callback = function(value)
+        local oldValue = Config.AimMaxDistance
+        local numberValue = tonumber(value)
+
+        if numberValue then
+            Config.AimMaxDistance = math.clamp(numberValue, 50, 10000)
+            AimMaxDistanceInput.Text = tostring(Config.AimMaxDistance)
+        else
+            Config.AimMaxDistance = oldValue
+            AimMaxDistanceInput.Text = tostring(oldValue)
+        end
+    end
+})
+
+local AimModeSec = UI:CreateSection(AimPage, "AIM Mode")
+
+local AimAlwaysToggle
+local AimOnFireToggle
+
+AimAlwaysToggle = UI:CreateToggle(AimModeSec, {
+    Text = "Always Aim",
+    Default = false,
+    Callback = function(value)
+        Config.AlwaysAim = value
+        if value then
+            Config.AimOnFire = false
+            if AimOnFireToggle then
+                AimOnFireToggle.Set(false)
+            end
+        end
+    end
+})
+
+AimOnFireToggle = UI:CreateToggle(AimModeSec, {
+    Text = "Aim On Fire",
+    Default = false,
+    Callback = function(value)
+        Config.AimOnFire = value
+        if value then
+            Config.AlwaysAim = false
+            if AimAlwaysToggle then
+                AimAlwaysToggle.Set(false)
+            end
+        end
+    end
+})
+
+local AimSettingsSec = UI:CreateSection(AimPage, "AIM Settings")
+
+UI:CreateSlider(AimSettingsSec, {
+    Text = "Smoothness",
+    Min = 0.2,
+    Max = 1,
+    Default = 0.20,
+    Increment = 0.01,
+    EditableValue = false,
+    Callback = function(value)
+        Config.Smoothness = math.clamp(value, 0.2, 1)
+    end
+})
 
 -- Tab 3: ESP
 -- Đúng một tab ESP trong Sidebar, page chỉ tạo một lần.
@@ -774,6 +1745,14 @@ UI:CreateToggle(ESPVisualsSec, {
     end
 })
 
+UI:CreateToggle(ESPVisualsSec, {
+    Text = "ESP Highlight",
+    Default = Config.ESPHighlightEnabled,
+    Callback = function(v)
+        Config.ESPHighlightEnabled = v
+    end
+})
+
 local ESPSettingsSec = UI:CreateSection(ESPPage, "ESP Settings")
 
 local ESPDistanceInput
@@ -795,6 +1774,403 @@ ESPDistanceInput = UI:CreateTextbox(ESPSettingsSec, {
         end
     end
 })
+
+-- =========================================================
+-- AIM CORE
+--
+-- MENU -> CONFIG -> TARGET VALIDATION -> TARGET SELECTION
+--      -> AIM CONTROLLER -> CAMERA RENDER
+--
+-- AIM is independent from ESP.
+-- It does not read ESPData, tracer objects, or skeleton objects.
+-- =========================================================
+
+local CurrentAimTarget = nil
+
+local function GetAimPart(target)
+    local character = target and target.Character
+    if not character then
+        return nil
+    end
+
+    if Config.AimPart == "Head" then
+        return character:FindFirstChild("Head")
+    end
+
+    -- Body follows the actual rig structure:
+    -- R15 -> UpperTorso
+    -- R6  -> Torso
+    -- fallback -> HumanoidRootPart
+    return character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("HumanoidRootPart")
+end
+
+local function GetAimRoot(target)
+    local character = target and target.Character
+    if not character then
+        return nil
+    end
+
+    return character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("Head")
+end
+
+local function IsAliveAimTarget(target)
+    local character = target and target.Character
+    local humanoid =
+        character and character:FindFirstChildOfClass("Humanoid")
+
+    return humanoid ~= nil and humanoid.Health > 0
+end
+
+local function PassesAimTeamCheck(target)
+    if not Config.TeamCheck then
+        return true
+    end
+
+    -- In games without Roblox Teams, Team may be nil for both players.
+    -- Do not reject every target just because both Team values are nil.
+    local localTeam = LocalPlayer.Team
+    local targetTeam = target.Team
+
+    if localTeam and targetTeam and localTeam == targetTeam then
+        return false
+    end
+
+    return true
+end
+
+local function PassesVisibility(targetPart)
+    if Config.IgnoreVisibility then
+        return true
+    end
+
+    if not Config.WallCheck then
+        return true
+    end
+
+    local camera = Workspace.CurrentCamera
+    if not camera or not targetPart or not targetPart.Parent then
+        return false
+    end
+
+    local origin = camera.CFrame.Position
+    local direction = targetPart.Position - origin
+
+    if direction.Magnitude <= 0 then
+        return true
+    end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    local ignoreList = {}
+
+    if LocalPlayer.Character then
+        table.insert(ignoreList, LocalPlayer.Character)
+    end
+
+    local targetCharacter = targetPart:FindFirstAncestorOfClass("Model")
+    if targetCharacter then
+        table.insert(ignoreList, targetCharacter)
+    end
+
+    rayParams.FilterDescendantsInstances = ignoreList
+
+    -- The target character is excluded so the ray only reports
+    -- a blocking object between camera and target.
+    local result = Workspace:Raycast(
+        origin,
+        direction,
+        rayParams
+    )
+
+    return result == nil
+end
+
+local function GetAimWorldDistance(targetRoot)
+    local localCharacter = LocalPlayer.Character
+    local localRoot =
+        localCharacter and (
+            localCharacter:FindFirstChild("HumanoidRootPart")
+            or localCharacter.PrimaryPart
+            or localCharacter:FindFirstChild("UpperTorso")
+            or localCharacter:FindFirstChild("Torso")
+            or localCharacter:FindFirstChild("Head")
+        )
+
+    if not localRoot or not targetRoot then
+        return math.huge
+    end
+
+    return (
+        localRoot.Position - targetRoot.Position
+    ).Magnitude
+end
+
+local function GetScreenDistance(targetPart, camera)
+    local screenPosition, onScreen =
+        camera:WorldToViewportPoint(
+            targetPart.Position
+        )
+
+    if screenPosition.Z <= 0 then
+        return math.huge, false, screenPosition
+    end
+
+    local screenCenter = Vector2.new(
+        camera.ViewportSize.X / 2,
+        camera.ViewportSize.Y / 2
+    )
+
+    local target2D = Vector2.new(
+        screenPosition.X,
+        screenPosition.Y
+    )
+
+    local screenDistance =
+        (target2D - screenCenter).Magnitude
+
+    return screenDistance, onScreen, screenPosition
+end
+
+-- Single validation function for AIM.
+local function IsValidTarget(target)
+    if not Config.AimEnabled then
+        return false
+    end
+
+    if not target or target == LocalPlayer then
+        return false
+    end
+
+    if not target:IsDescendantOf(Players) then
+        return false
+    end
+
+    if not IsAliveAimTarget(target) then
+        return false
+    end
+
+    if not PassesAimTeamCheck(target) then
+        return false
+    end
+
+    local targetRoot = GetAimRoot(target)
+    if not targetRoot then
+        return false
+    end
+
+    local targetPart = GetAimPart(target)
+    if not targetPart then
+        return false
+    end
+
+    local worldDistance = GetAimWorldDistance(targetRoot)
+    if worldDistance > Config.AimMaxDistance then
+        return false
+    end
+
+    if not PassesVisibility(targetPart) then
+        return false
+    end
+
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        return false
+    end
+
+    local screenDistance, onScreen =
+        GetScreenDistance(targetPart, camera)
+
+    if screenDistance == math.huge then
+        return false
+    end
+
+    if Config.UseFOV then
+        if not onScreen then
+            return false
+        end
+
+        if screenDistance > Config.FOV then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function GetBestTarget()
+    local camera = Workspace.CurrentCamera
+
+    if not camera or not Config.AimEnabled then
+        return nil, nil
+    end
+
+    local bestTarget = nil
+    local bestAimPart = nil
+    local bestScreenDistance = math.huge
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= LocalPlayer and IsValidTarget(target) then
+            -- Re-read the CURRENT target part on every frame.
+            local targetPart = GetAimPart(target)
+
+            if targetPart then
+                local screenDistance, onScreen =
+                    GetScreenDistance(
+                        targetPart,
+                        camera
+                    )
+
+                if screenDistance < math.huge then
+                    if (not Config.UseFOV) or onScreen then
+                        if screenDistance < bestScreenDistance then
+                            bestScreenDistance = screenDistance
+                            bestTarget = target
+                            bestAimPart = targetPart
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestTarget, bestAimPart
+end
+
+-- ---------------------------------------------------------
+-- Fire-state input
+-- This only supplies an input-state check for "Aim On Fire".
+-- It does not implement, replace, or spoof the game's weapon.
+-- ---------------------------------------------------------
+local TouchFireActive = false
+
+AddConnection(
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then
+            return
+        end
+
+        if input.UserInputType == Enum.UserInputType.Touch then
+            TouchFireActive = true
+        end
+    end)
+)
+
+AddConnection(
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch then
+            TouchFireActive = false
+        end
+    end)
+)
+
+local function IsFiring()
+    if UserInputService:IsMouseButtonPressed(
+        Enum.UserInputType.MouseButton1
+    ) then
+        return true
+    end
+
+    return TouchFireActive
+end
+
+local function IsAimAllowed()
+    if Config.AlwaysAim then
+        return true
+    end
+
+    if Config.AimOnFire then
+        return IsFiring()
+    end
+
+    return false
+end
+
+local function AimAtTarget(targetPart)
+    if not targetPart or not targetPart.Parent then
+        return
+    end
+
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    -- Use the CURRENT world position from the current skeleton part.
+    local targetPosition = targetPart.Position
+
+    local currentCFrame = camera.CFrame
+
+    local targetCFrame =
+        CFrame.lookAt(
+            currentCFrame.Position,
+            targetPosition
+        )
+
+    local smoothness = math.clamp(
+        tonumber(Config.Smoothness) or 0.20,
+        0.2,
+        1
+    )
+
+    camera.CFrame =
+        currentCFrame:Lerp(
+            targetCFrame,
+            smoothness
+        )
+end
+
+local function UpdateAim()
+    if not Config.AimEnabled then
+        CurrentAimTarget = nil
+        return
+    end
+
+    if not IsAimAllowed() then
+        CurrentAimTarget = nil
+        return
+    end
+
+    local target, targetPart = GetBestTarget()
+
+    if not target or not targetPart then
+        CurrentAimTarget = nil
+        return
+    end
+
+    -- Re-validate immediately before camera movement.
+    if not IsValidTarget(target) then
+        CurrentAimTarget = nil
+        return
+    end
+
+    -- Re-acquire from the current character, avoiding stale part refs.
+    local currentAimPart = GetAimPart(target)
+
+    if not currentAimPart or not currentAimPart.Parent then
+        CurrentAimTarget = nil
+        return
+    end
+
+    CurrentAimTarget = target
+    AimAtTarget(currentAimPart)
+end
+
+-- ---------------------------------------------------------
+-- Future AIM features
+-- ---------------------------------------------------------
+-- Prediction
+-- Target Priority
+-- Switch Target
+-- Sticky Aim
+-- Velocity Prediction
+-- Distance Priority
 
 -- ------------------------------------------
 -- ESP RENDER ENGINE CORE
@@ -913,28 +2289,40 @@ local function createInfo()
     return holder
 end
 
-local function createTargetESP(target)
-    local data = {}
+local function GetSkeletonDefinition(character)
+    if not character then
+        return R6Skeleton
+    end
 
-    data.character = target.Character
-    data.info = createInfo()
-    data.tracer = createScreenLine("ESPTracer")
-    data.skeleton = {}
+    if character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("LowerTorso")
+        or character:FindFirstChild("LeftUpperArm")
+        or character:FindFirstChild("RightUpperArm") then
+        return R15Skeleton
+    end
 
-    local character = target.Character
+    return R6Skeleton
+end
 
-    if character then
-        local skeletonList
+local function EnsureSkeletonLines(data, character)
+    if not data or not character then
+        return
+    end
 
-        if character:FindFirstChild("UpperTorso") then
-            skeletonList = R15Skeleton
-        else
-            skeletonList = R6Skeleton
-        end
+    local skeletonList = GetSkeletonDefinition(character)
+    local existing = {}
 
-        for _, connection in ipairs(skeletonList) do
+    for _, skeleton in ipairs(data.skeleton or {}) do
+        existing[skeleton.partA .. "|" .. skeleton.partB] = skeleton
+    end
+
+    for _, connection in ipairs(skeletonList) do
+        local key = connection[1] .. "|" .. connection[2]
+
+        if not existing[key] then
             local line = createScreenLine("ESPSkeleton")
-            line.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            line.BackgroundColor3 =
+                Color3.fromRGB(255, 255, 255)
 
             table.insert(data.skeleton, {
                 line = line,
@@ -943,6 +2331,17 @@ local function createTargetESP(target)
             })
         end
     end
+end
+
+local function createTargetESP(target)
+    local data = {}
+
+    data.character = target.Character
+    data.info = createInfo()
+    data.tracer = createScreenLine("ESPTracer")
+    data.skeleton = {}
+
+    EnsureSkeletonLines(data, data.character)
 
     return data
 end
@@ -1003,8 +2402,11 @@ local function updateTargetESP(target)
     end
 
     -- Team / Enemy hoàn toàn độc lập với Aim.
-    local isTeammate = target.Team == LocalPlayer.Team
-    local isEnemy = target.Team ~= LocalPlayer.Team
+    -- In games without Roblox Teams, both Team values can be nil;
+    -- treat those players as enemies instead of teammates.
+    local hasTeams = LocalPlayer.Team ~= nil and target.Team ~= nil
+    local isTeammate = hasTeams and (target.Team == LocalPlayer.Team)
+    local isEnemy = not isTeammate
 
     if isEnemy then
         if not Config.ShowEnemies then
@@ -1029,6 +2431,8 @@ local function updateTargetESP(target)
     if not data then
         data = createTargetESP(target)
         espData[target] = data
+    else
+        EnsureSkeletonLines(data, character)
     end
 
     local camera = Workspace.CurrentCamera
@@ -1206,50 +2610,588 @@ local function updateESP()
     end
 end
 
-local function bindPlayerLifecycle(target)
+-- =========================================================
+-- ESP HIGHLIGHT ADD-ON
+-- Independent of the existing ESP render objects.
+-- Uses one shared rainbow color for every Highlight.
+-- =========================================================
+
+local espHighlightData = {}
+local ESPHighlightName = "__HoodRivals_ESPHighlight"
+
+local function destroyESPHighlight(target)
+    local data = espHighlightData[target]
+
+    if data then
+        if data.highlight and data.highlight.Parent then
+            data.highlight:Destroy()
+        end
+
+        espHighlightData[target] = nil
+        return
+    end
+
+    local character = target and target.Character
+    if character then
+        local orphan = character:FindFirstChild(ESPHighlightName)
+        if orphan and orphan:IsA("Highlight") then
+            orphan:Destroy()
+        end
+    end
+end
+
+local function destroyAllESPHighlights()
+    local targets = {}
+
+    for target in pairs(espHighlightData) do
+        table.insert(targets, target)
+    end
+
+    for _, target in ipairs(targets) do
+        destroyESPHighlight(target)
+    end
+
+    -- Also remove orphaned objects from any character.
+    for _, target in ipairs(Players:GetPlayers()) do
+        local character = target.Character
+        if character then
+            local orphan = character:FindFirstChild(ESPHighlightName)
+            if orphan and orphan:IsA("Highlight") then
+                orphan:Destroy()
+            end
+        end
+    end
+end
+
+local function IsESPHighlightTargetValid(target)
+    if not target or target == LocalPlayer then
+        return false
+    end
+
+    local character = target.Character
+    local humanoid =
+        character and
+        character:FindFirstChildOfClass("Humanoid")
+    local root =
+        character and
+        character:FindFirstChild("HumanoidRootPart")
+
+    if
+        not character
+        or not humanoid
+        or humanoid.Health <= 0
+        or not root
+    then
+        return false
+    end
+
+    -- Match the existing ESP team/enemy classification.
+    local hasTeams =
+        LocalPlayer.Team ~= nil
+        and target.Team ~= nil
+
+    local isTeammate =
+        hasTeams
+        and target.Team == LocalPlayer.Team
+
+    local isEnemy = not isTeammate
+
+    if isEnemy and not Config.ShowEnemies then
+        return false
+    end
+
+    if isTeammate and not Config.ShowTeammates then
+        return false
+    end
+
+    local myRoot =
+        LocalPlayer.Character
+        and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+
+    if myRoot then
+        local distance =
+            (myRoot.Position - root.Position).Magnitude
+
+        if distance > Config.MaxDistance then
+            return false
+        end
+    end
+
+    return true, character
+end
+
+local function UpdateESPHighlight()
+    if not Config.ESPHighlightEnabled then
+        destroyAllESPHighlights()
+        return
+    end
+
+    -- One shared rainbow state for ALL highlight instances.
+    local rainbowColor =
+        Color3.fromHSV(
+            (os.clock() * 0.20) % 1,
+            1,
+            1
+        )
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= LocalPlayer then
+            local valid, character =
+                IsESPHighlightTargetValid(target)
+
+            if not valid then
+                destroyESPHighlight(target)
+            else
+                local data = espHighlightData[target]
+
+                if data and data.character ~= character then
+                    destroyESPHighlight(target)
+                    data = nil
+                end
+
+                if not data then
+                    local highlight = Instance.new("Highlight")
+                    highlight.Name = ESPHighlightName
+                    highlight.Adornee = character
+                    highlight.FillTransparency = 0.50
+                    highlight.OutlineTransparency = 0
+                    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    highlight.Parent = ScreenGui
+
+                    data = {
+                        character = character,
+                        highlight = highlight
+                    }
+
+                    espHighlightData[target] = data
+                end
+
+                if
+                    data.highlight
+                    and data.highlight.Parent
+                then
+                    data.highlight.Adornee = character
+                    data.highlight.FillColor = rainbowColor
+                    data.highlight.OutlineColor = rainbowColor
+                end
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- TELEPORT TAB ADD-ON
+-- Uses the existing PageManager/UI components.
+-- Floating controls live directly under ScreenGui, outside MainWindow.
+-- =========================================================
+
+local TeleportPage = PageManager:AddPage("TELEPORT")
+local ActiveTpButtons = {}
+
+local TeleportListSec =
+    UI:CreateSection(
+        TeleportPage,
+        "PLAYER LIST"
+    )
+
+local TeleportList =
+    Instance.new("ScrollingFrame")
+
+TeleportList.Name = "TeleportPlayerList"
+TeleportList.Size = UDim2.new(1, 0, 0, 150)
+TeleportList.BackgroundTransparency = 1
+TeleportList.BorderSizePixel = 0
+TeleportList.ScrollBarThickness = 3
+TeleportList.ScrollBarImageColor3 = Config.SubTextColor
+TeleportList.Parent = TeleportListSec
+
+local TeleportListLayout =
+    Instance.new("UIListLayout")
+
+TeleportListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+TeleportListLayout.Padding = UDim.new(0, 6)
+TeleportListLayout.Parent = TeleportList
+
+local TeleportSelectedSec =
+    UI:CreateSection(
+        TeleportPage,
+        "SELECTED PLAYER"
+    )
+
+local SelectedPlayerLabel =
+    UI:CreateLabel(
+        TeleportSelectedSec,
+        "No player selected"
+    )
+
+local function UpdateSelectedPlayerLabel()
+    local selected = Config.Teleport.SelectedPlayer
+
+    if selected and selected.Parent == Players then
+        SelectedPlayerLabel.Text =
+            "Selected: "
+            .. selected.DisplayName
+            .. " (@"
+            .. selected.Name
+            .. ")"
+    else
+        SelectedPlayerLabel.Text = "No player selected"
+        Config.Teleport.SelectedPlayer = nil
+    end
+end
+
+local function DestroyTeleportButton(target)
+    local data = ActiveTpButtons[target]
+
+    if not data then
+        return
+    end
+
+    data.active = false
+
+    if data.tpConnection then
+        pcall(function()
+            data.tpConnection:Disconnect()
+        end)
+        data.tpConnection = nil
+    end
+
+    if data.closeConnection then
+        pcall(function()
+            data.closeConnection:Disconnect()
+        end)
+        data.closeConnection = nil
+    end
+
+    if data.frame and data.frame.Parent then
+        data.frame:Destroy()
+    end
+
+    ActiveTpButtons[target] = nil
+end
+
+local function GetTeleportButtonIndex()
+    local count = 0
+
+    for target, data in pairs(ActiveTpButtons) do
+        if
+            target
+            and target.Parent == Players
+            and data
+            and data.frame
+            and data.frame.Parent
+        then
+            count += 1
+        end
+    end
+
+    return count
+end
+
+local function CreateTeleportButton(target)
+    local existing = ActiveTpButtons[target]
+
+    if
+        existing
+        and existing.frame
+        and existing.frame.Parent
+    then
+        return existing
+    end
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Teleport_" .. target.Name
+    frame.Size = UDim2.new(0, 155, 0, 58)
+    frame.Position =
+        UDim2.new(
+            1,
+            -180,
+            0.12,
+            GetTeleportButtonIndex() * 68
+        )
+    frame.BackgroundColor3 = Config.CardBg
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.ZIndex = 50
+    frame.Parent = ScreenGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Config.BorderColor
+    stroke.Thickness = 1
+    stroke.Parent = frame
+
+    local tpButton = Instance.new("TextButton")
+    tpButton.Name = "TPButton"
+    tpButton.Size = UDim2.new(1, -30, 0, 30)
+    tpButton.Position = UDim2.new(0, 6, 0, 5)
+    tpButton.Text = "TP OFF"
+    tpButton.TextColor3 = Config.TextColor
+    tpButton.Font = Enum.Font.GothamMedium
+    tpButton.TextSize = 12
+    tpButton.BackgroundColor3 = Config.DarkBg
+    tpButton.AutoButtonColor = false
+    tpButton.ZIndex = 51
+    tpButton.Parent = frame
+
+    local tpCorner = Instance.new("UICorner")
+    tpCorner.CornerRadius = UDim.new(0, 5)
+    tpCorner.Parent = tpButton
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Name = "TargetName"
+    nameLabel.Size = UDim2.new(1, -12, 0, 16)
+    nameLabel.Position = UDim2.new(0, 6, 0, 37)
+    nameLabel.Text =
+        target.DisplayName .. "  @" .. target.Name
+    nameLabel.TextColor3 = Config.SubTextColor
+    nameLabel.Font = Enum.Font.Gotham
+    nameLabel.TextSize = 10
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.ZIndex = 51
+    nameLabel.Parent = frame
+
+    local closeButton = Instance.new("TextButton")
+    closeButton.Name = "Close"
+    closeButton.Size = UDim2.new(0, 20, 0, 20)
+    closeButton.Position = UDim2.new(1, -24, 0, 3)
+    closeButton.Text = "X"
+    closeButton.TextColor3 = Config.TextColor
+    closeButton.Font = Enum.Font.GothamBold
+    closeButton.TextSize = 10
+    closeButton.BackgroundColor3 = Config.DarkBg
+    closeButton.AutoButtonColor = false
+    closeButton.ZIndex = 52
+    closeButton.Parent = frame
+
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 4)
+    closeCorner.Parent = closeButton
+
+    local data = {
+        frame = frame,
+        button = tpButton,
+        active = false
+    }
+
+    ActiveTpButtons[target] = data
+
+    -- Reuse the menu's existing drag utility for the floating control.
+    MakeDraggable(frame, nameLabel, true)
+
+    data.tpConnection =
+        tpButton.MouseButton1Click:Connect(function()
+            if not target or target.Parent ~= Players then
+                DestroyTeleportButton(target)
+                return
+            end
+
+            data.active = not data.active
+
+            if data.active then
+                tpButton.Text = "TP ON"
+                tpButton.BackgroundColor3 = Config.AccentColor
+            else
+                tpButton.Text = "TP OFF"
+                tpButton.BackgroundColor3 = Config.DarkBg
+            end
+        end)
+
+    data.closeConnection =
+        closeButton.MouseButton1Click:Connect(function()
+            DestroyTeleportButton(target)
+        end)
+
+    return data
+end
+
+local function RefreshTeleportPlayerList()
+    for _, child in ipairs(TeleportList:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+
+    local players = Players:GetPlayers()
+
+    for _, target in ipairs(players) do
+        if target ~= LocalPlayer then
+            local button =
+                UI:CreateButton(
+                    TeleportList,
+                    target.DisplayName
+                        .. "  (@"
+                        .. target.Name
+                        .. ")",
+                    function()
+                        if target.Parent ~= Players then
+                            return
+                        end
+
+                        Config.Teleport.SelectedPlayer = target
+                        UpdateSelectedPlayerLabel()
+
+                        -- Click = select + create/reuse floating TP control.
+                        CreateTeleportButton(target)
+
+                        RefreshTeleportPlayerList()
+                    end
+                )
+
+            if Config.Teleport.SelectedPlayer == target then
+                button.BackgroundColor3 =
+                    Config.AccentColor
+                button.TextColor3 =
+                    Color3.fromRGB(255, 255, 255)
+            end
+        end
+    end
+
+    TeleportList.CanvasSize =
+        UDim2.new(
+            0,
+            0,
+            0,
+            TeleportListLayout.AbsoluteContentSize.Y + 8
+        )
+
+    UpdateSelectedPlayerLabel()
+end
+
+local function UpdateTeleport()
+    local localCharacter = LocalPlayer.Character
+    local localRoot =
+        localCharacter
+        and localCharacter:FindFirstChild("HumanoidRootPart")
+
+    if not localRoot then
+        return
+    end
+
+    local invalidTargets = {}
+
+    for target, data in pairs(ActiveTpButtons) do
+        if
+            not target
+            or target.Parent ~= Players
+            or not data
+            or not data.frame
+            or not data.frame.Parent
+        then
+            table.insert(invalidTargets, target)
+        elseif data.active then
+            local targetCharacter = target.Character
+            local targetRoot =
+                targetCharacter
+                and targetCharacter:FindFirstChild(
+                    "HumanoidRootPart"
+                )
+
+            if targetRoot then
+                localRoot.CFrame =
+                    targetRoot.CFrame
+                    * CFrame.new(0, 0, 3)
+            end
+        end
+    end
+
+    for _, target in ipairs(invalidTargets) do
+        DestroyTeleportButton(target)
+    end
+end
+
+RefreshTeleportPlayerList()
+
+-- =========================================================
+-- UNIFIED RENDER LOOP
+-- One frame pipeline for AIM + FOV + ESP.
+-- Runs after Roblox's camera update so camera changes are not
+-- immediately overwritten by the default camera controller.
+-- =========================================================
+pcall(function()
+    RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
+end)
+
+RunService:BindToRenderStep(
+    "HoodRivalsUnifiedRender",
+    Enum.RenderPriority.Camera.Value + 1,
+    function(renderDt)
+        UpdateAim()
+        UpdateFOVCircle()
+        updateESP()
+        UpdateESPHighlight()
+        UpdatePlayer(renderDt)
+        UpdateTeleport()
+    end
+)
+
+-- =========================================================
+-- SHARED PLAYER LIFECYCLE
+-- =========================================================
+
+local function BindPlayerLifecycle(target)
     if target == LocalPlayer then
         return
     end
 
-    -- Khi respawn, bỏ object của character cũ để RenderStepped rebuild.
     AddConnection(
         target.CharacterAdded:Connect(function()
+            -- ESP rebuilds from the new character.
             destroyTargetESP(target)
+            destroyESPHighlight(target)
+
+            -- AIM must never retain the old target state.
+            if CurrentAimTarget == target then
+                CurrentAimTarget = nil
+            end
         end)
     )
 
     AddConnection(
         target.CharacterRemoving:Connect(function()
             destroyTargetESP(target)
+            destroyESPHighlight(target)
+
+            if CurrentAimTarget == target then
+                CurrentAimTarget = nil
+            end
         end)
     )
 end
 
--- Players đã có sẵn khi script khởi động.
 for _, target in ipairs(Players:GetPlayers()) do
     if target ~= LocalPlayer then
-        bindPlayerLifecycle(target)
+        BindPlayerLifecycle(target)
     end
 end
 
--- PlayerAdded: player mới được nhận bởi ESP core ở RenderStepped kế tiếp.
 AddConnection(
     Players.PlayerAdded:Connect(function(target)
-        bindPlayerLifecycle(target)
+        BindPlayerLifecycle(target)
+        RefreshTeleportPlayerList()
     end)
 )
 
--- PlayerRemoving: cleanup toàn bộ object của player rời game.
 AddConnection(
     Players.PlayerRemoving:Connect(function(target)
         destroyTargetESP(target)
-    end)
-)
+        destroyESPHighlight(target)
+        DestroyTeleportButton(target)
 
--- Chỉ một RenderStepped cho ESP core.
-AddConnection(
-    RunService.RenderStepped:Connect(function()
-        updateESP()
+        if Config.Teleport.SelectedPlayer == target then
+            Config.Teleport.SelectedPlayer = nil
+            UpdateSelectedPlayerLabel()
+        end
+
+        if CurrentAimTarget == target then
+            CurrentAimTarget = nil
+        end
+
+        RefreshTeleportPlayerList()
     end)
 )
 
@@ -1289,12 +3231,20 @@ end)
 -- Close Button
 CloseBtn.MouseButton1Click:Connect(function()
     SetMenuState("Closed")
+
+    CleanupPlayerRuntime()
+
+    pcall(function()
+        RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
+    end)
+
+    FOVCircle.Visible = false
+
     for target in pairs(espData) do
         destroyTargetESP(target)
     end
-    for _, conn in ipairs(Connections) do
-        conn:Disconnect()
-    end
+
+    destroyAllESPHighlights()
 end)
 
 -- Keybind Event (RightControl)
@@ -1305,18 +3255,91 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
             SetMenuState("Minimized")
         elseif GUIState.CurrentState == "Minimized" or GUIState.CurrentState == "Closed" then
             ScreenGui.Enabled = true
+
+            -- Rebind the single unified render callback safely.
+            pcall(function()
+                RunService:UnbindFromRenderStep(
+                    "HoodRivalsUnifiedRender"
+                )
+            end)
+
+            RunService:BindToRenderStep(
+                "HoodRivalsUnifiedRender",
+                Enum.RenderPriority.Camera.Value + 1,
+                function(renderDt)
+                    UpdateAim()
+                    UpdateFOVCircle()
+                    updateESP()
+                    UpdateESPHighlight()
+                    UpdatePlayer(renderDt)
+                    UpdateTeleport()
+                end
+            )
+
             SetMenuState("Open")
         end
     end
 end))
 
 -- Expose UI Framework global variable
+local function CleanupFramework()
+    CleanupPlayerRuntime()
+
+    pcall(function()
+        RunService:UnbindFromRenderStep(
+            "HoodRivalsUnifiedRender"
+        )
+    end)
+
+    FOVCircle.Visible = false
+
+    for target in pairs(espData) do
+        destroyTargetESP(target)
+    end
+
+    destroyAllESPHighlights()
+
+    local teleportTargetsToCleanup = {}
+
+    for target in pairs(ActiveTpButtons) do
+        table.insert(teleportTargetsToCleanup, target)
+    end
+
+    for _, target in ipairs(teleportTargetsToCleanup) do
+        DestroyTeleportButton(target)
+    end
+
+    Config.Teleport.SelectedPlayer = nil
+
+    for _, conn in ipairs(Connections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+end
+
 _G.MyGUIFramework = {
     PageManager = PageManager,
     UI = UI,
     ScreenGui = ScreenGui,
     MainWindow = MainWindow,
-    Config = Config
+    Config = Config,
+
+    Player = {
+        Cleanup = CleanupPlayerRuntime,
+        Update = UpdatePlayer
+    },
+
+    Aim = {
+        IsValidTarget = IsValidTarget,
+        GetBestTarget = GetBestTarget,
+        Update = UpdateAim,
+        GetCurrentTarget = function()
+            return CurrentAimTarget
+        end
+    },
+
+    Cleanup = CleanupFramework
 }
 
 print("[Hood Rivals Framework & ESP Integrated Successfully!]")
