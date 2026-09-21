@@ -154,6 +154,10 @@ ScreenGui.ResetOnSpawn = false
 -- IgnoreGuiInset = true giúp ESP overlay khớp chính xác với tọa độ camera,
 -- tránh toàn bộ Name/Health/Distance/Tracer/Skeleton bị lệch xuống.
 ScreenGui.IgnoreGuiInset = true
+-- Keep viewport-based ESP coordinates aligned with the full render viewport.
+pcall(function()
+    ScreenGui.ScreenInsets = Enum.ScreenInsets.None
+end)
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = TargetParent
 
@@ -3109,8 +3113,8 @@ RefreshTeleportPlayerList()
 -- =========================================================
 -- UNIFIED RENDER LOOP
 -- One frame pipeline for AIM + FOV + ESP.
--- Runs after Roblox's camera update so camera changes are not
--- immediately overwritten by the default camera controller.
+-- Bound to Enum.RenderPriority.Last.Value + 100 to guarantee
+-- execution AFTER Hood Rivals updates its custom shoulder camera/scope CFrame.
 -- =========================================================
 pcall(function()
     RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
@@ -3118,7 +3122,7 @@ end)
 
 RunService:BindToRenderStep(
     "HoodRivalsUnifiedRender",
-    Enum.RenderPriority.Camera.Value + 1,
+    Enum.RenderPriority.Last.Value + 100,
     function(renderDt)
         UpdateAim()
         UpdateFOVCircle()
@@ -3265,7 +3269,7 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 
             RunService:BindToRenderStep(
                 "HoodRivalsUnifiedRender",
-                Enum.RenderPriority.Camera.Value + 1,
+                Enum.RenderPriority.Last.Value + 100,
                 function(renderDt)
                     UpdateAim()
                     UpdateFOVCircle()
