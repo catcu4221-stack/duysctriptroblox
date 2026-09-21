@@ -8,6 +8,7 @@ local RunService = game:GetService("RunService")
 local CoreGui = game:GetService("CoreGui")
 local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
 
 -- Clean up the previous framework before rebuilding the current one.
 -- This also prevents old Player runtime state from surviving a re-execution.
@@ -17,9 +18,11 @@ pcall(function()
     end
 end)
 
--- Clean up a previous render binding if the script is re-executed.
+-- Clean up previous render bindings if the script is re-executed.
 pcall(function()
     RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
+    RunService:UnbindFromRenderStep("HoodRivalsAimRender")
+    RunService:UnbindFromRenderStep("HoodRivalsESPRender")
 end)
 
 local LocalPlayer = Players.LocalPlayer
@@ -98,6 +101,9 @@ local Config = {
     ShowDistance = false,
     MaxDistance = 2000,
     ESPHighlightEnabled = false,
+    ESPOffsetX = 0,
+    ESPOffsetY = 0,
+    ESPOffsetZ = 0,
 
     -- =========================================================
     -- AIM CONFIGURATION
@@ -115,6 +121,14 @@ local Config = {
     AimMaxDistance = 2000,
 
     -- =========================================================
+    -- TELEKILL CONFIGURATION
+    -- =========================================================
+    TelekillEnabled = false,
+    TelekillTarget = "Enemy",
+    TelekillDistanceMode = "Nearest",
+    TelekillDistance = 3,
+
+    -- =========================================================
     -- PLAYER CONFIGURATION
     -- =========================================================
     Player = {
@@ -123,6 +137,7 @@ local Config = {
 
         AirFlyEnabled = false,
         JumpPower = 50,
+        JumpPowerOverrideEnabled = false,
 
         FlyEnabled = false,
         FlySpeed = 50,
@@ -142,6 +157,12 @@ local GUIState = {
     ActivePage = nil,
     Pages = {},
     TabButtons = {}
+}
+
+local UIRefs = {
+    Toggles = {},
+    Sliders = {},
+    Textboxes = {}
 }
 
 -- ==========================================
@@ -680,21 +701,43 @@ function UI:CreateToggle(parent, options)
     cCorner.CornerRadius = UDim.new(1, 0)
     cCorner.Parent = circle
 
-    local function toggle()
-        state = not state
+    local function applyState(newState, invokeCallback)
+        if type(newState) ~= "boolean" then
+            return
+        end
+
+        state = newState
         local targetColor = state and Config.AccentColor or Config.DarkBg
         local targetPos = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
 
         TweenService:Create(switch, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
         TweenService:Create(circle, TweenInfo.new(0.2), {Position = targetPos}):Play()
 
-        callback(state)
+        if invokeCallback ~= false then
+            callback(state)
+        end
+    end
+
+    local function toggle()
+        applyState(not state, true)
     end
 
     switch.MouseButton1Click:Connect(toggle)
     return {
-        Set = function(val)
-            if state ~= val then toggle() end
+        Set = function(val, silent)
+            if type(val) ~= "boolean" then
+                return
+            end
+
+            if state ~= val then
+                applyState(val, silent ~= true)
+            elseif silent then
+                -- Force a visual refresh without firing the callback.
+                applyState(val, false)
+            end
+        end,
+        Get = function()
+            return state
         end
     }
 end
@@ -901,6 +944,29 @@ function UI:CreateSlider(parent, options)
         callback(currentValue)
     end
 
+    local function SetValue(value, silent)
+        if not IsFiniteNumber(value) then
+            return false
+        end
+
+        if value < min then
+            value = min
+        end
+
+        if allowTextInputBeyondRange and value > sliderMax then
+            sliderMax = value
+        end
+
+        currentValue = math.clamp(value, min, sliderMax)
+        updateVisuals()
+
+        if silent ~= true then
+            callback(currentValue)
+        end
+
+        return true
+    end
+
     if editableValue then
         AddConnection(
             valueBox.FocusLost:Connect(function()
@@ -950,7 +1016,13 @@ function UI:CreateSlider(parent, options)
 
     updateVisuals()
 
-    return sliderFrame
+    return {
+        Frame = sliderFrame,
+        Set = SetValue,
+        Get = function()
+            return currentValue
+        end
+    }
 end
 
 function UI:CreateTextbox(parent, options)
@@ -1023,6 +1095,9 @@ local PlayerRuntime = {
 
     AirFlyJumpRequested = false,
 
+    JumpPowerOriginal = nil,
+    UseJumpPowerOriginal = nil,
+
     NoclipOriginalCanCollide = {},
 
     FullBrightSaved = nil
@@ -1050,11 +1125,60 @@ local function GetLocalCharacterParts()
     return character, humanoid, rootPart
 end
 
+local function CaptureOriginalJumpPower(humanoid)
+    if not humanoid then
+        PlayerRuntime.JumpPowerOriginal = nil
+        PlayerRuntime.UseJumpPowerOriginal = nil
+        return
+    end
+
+    PlayerRuntime.JumpPowerOriginal = humanoid.JumpPower
+    PlayerRuntime.UseJumpPowerOriginal = humanoid.UseJumpPower
+end
+
+local function RestoreOriginalJumpPower(humanoid)
+    if not humanoid then
+        return
+    end
+
+    local originalJumpPower = PlayerRuntime.JumpPowerOriginal
+    local originalUseJumpPower = PlayerRuntime.UseJumpPowerOriginal
+
+    pcall(function()
+        if originalJumpPower ~= nil then
+            humanoid.JumpPower = originalJumpPower
+        end
+
+        if originalUseJumpPower ~= nil then
+            humanoid.UseJumpPower = originalUseJumpPower
+        end
+    end)
+end
+
 local function RefreshPlayerCharacterReferences(character)
     PlayerRuntime.Character = character
     PlayerRuntime.Humanoid = character and character:FindFirstChildOfClass("Humanoid") or nil
     PlayerRuntime.RootPart = character and character:FindFirstChild("HumanoidRootPart") or nil
     PlayerRuntime.NoclipOriginalCanCollide = {}
+
+    CaptureOriginalJumpPower(PlayerRuntime.Humanoid)
+
+    -- Preserve the game's native jump value until the user explicitly enables
+    -- the Jump Power override control.
+    if
+        PlayerRuntime.Humanoid
+        and not Config.Player.JumpPowerOverrideEnabled
+    then
+        local nativeJumpPower = PlayerRuntime.Humanoid.JumpPower
+
+        if type(nativeJumpPower) == "number"
+            and nativeJumpPower == nativeJumpPower
+            and nativeJumpPower ~= math.huge
+            and nativeJumpPower ~= -math.huge
+        then
+            Config.Player.JumpPower = nativeJumpPower
+        end
+    end
 end
 
 -- =========================
@@ -1144,10 +1268,16 @@ local function CleanupPlayerRuntime()
 
     RestoreFullBright()
 
+    if PlayerRuntime.Humanoid then
+        RestoreOriginalJumpPower(PlayerRuntime.Humanoid)
+    end
+
     PlayerRuntime.Character = nil
     PlayerRuntime.Humanoid = nil
     PlayerRuntime.RootPart = nil
     PlayerRuntime.AirFlyJumpRequested = false
+    PlayerRuntime.JumpPowerOriginal = nil
+    PlayerRuntime.UseJumpPowerOriginal = nil
 end
 
 -- =========================
@@ -1344,8 +1474,10 @@ local function UpdatePlayer(dt)
         return
     end
 
-    -- Jump Power is independent from Air Fly and has no toggle.
-    ApplyJumpPower(humanoid)
+    -- Never override the game's jump settings unless the user explicitly enables it.
+    if Config.Player.JumpPowerOverrideEnabled then
+        ApplyJumpPower(humanoid)
+    end
 
     UpdateCFrameSpeed(dt, humanoid, rootPart)
     UpdateAirFly()
@@ -1371,7 +1503,7 @@ local function HandleLocalCharacterAdded(character)
     DestroyFlyObjects(character)
 
     local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if humanoid then
+    if humanoid and Config.Player.JumpPowerOverrideEnabled then
         ApplyJumpPower(humanoid)
     end
 end
@@ -1424,7 +1556,7 @@ local PlayerPage = PageManager:AddPage("PLAYER")
 
 local PlayerMovementSec = UI:CreateSection(PlayerPage, "MOVEMENT")
 
-UI:CreateToggle(PlayerMovementSec, {
+UIRefs.Toggles.CFrameSpeedEnabled = UI:CreateToggle(PlayerMovementSec, {
     Text = "CFrame Speed",
     Default = false,
     Callback = function(value)
@@ -1432,7 +1564,7 @@ UI:CreateToggle(PlayerMovementSec, {
     end
 })
 
-UI:CreateSlider(PlayerMovementSec, {
+UIRefs.Sliders.CFrameSpeed = UI:CreateSlider(PlayerMovementSec, {
     Text = "CFrame Speed",
     Min = 20,
     Max = 200,
@@ -1447,7 +1579,23 @@ UI:CreateSlider(PlayerMovementSec, {
 
 local PlayerJumpSec = UI:CreateSection(PlayerPage, "JUMP")
 
-UI:CreateToggle(PlayerJumpSec, {
+UIRefs.Toggles.JumpPowerOverrideEnabled = UI:CreateToggle(PlayerJumpSec, {
+    Text = "Jump Power Override",
+    Default = Config.Player.JumpPowerOverrideEnabled,
+    Callback = function(value)
+        Config.Player.JumpPowerOverrideEnabled = value
+
+        local humanoid = PlayerRuntime.Humanoid
+
+        if value then
+            ApplyJumpPower(humanoid)
+        else
+            RestoreOriginalJumpPower(humanoid)
+        end
+    end
+})
+
+UIRefs.Toggles.AirFlyEnabled = UI:CreateToggle(PlayerJumpSec, {
     Text = "Air Fly",
     Default = false,
     Callback = function(value)
@@ -1459,7 +1607,7 @@ UI:CreateToggle(PlayerJumpSec, {
     end
 })
 
-UI:CreateSlider(PlayerJumpSec, {
+UIRefs.Sliders.JumpPower = UI:CreateSlider(PlayerJumpSec, {
     Text = "Jump Power",
     Min = 20,
     Max = 200,
@@ -1469,13 +1617,16 @@ UI:CreateSlider(PlayerJumpSec, {
     AllowTextInputBeyondRange = true,
     Callback = function(value)
         Config.Player.JumpPower = value
-        ApplyJumpPower(PlayerRuntime.Humanoid)
+
+        if Config.Player.JumpPowerOverrideEnabled then
+            ApplyJumpPower(PlayerRuntime.Humanoid)
+        end
     end
 })
 
 local PlayerFlySec = UI:CreateSection(PlayerPage, "FLY")
 
-UI:CreateToggle(PlayerFlySec, {
+UIRefs.Toggles.FlyEnabled = UI:CreateToggle(PlayerFlySec, {
     Text = "Fly",
     Default = false,
     Callback = function(value)
@@ -1487,7 +1638,7 @@ UI:CreateToggle(PlayerFlySec, {
     end
 })
 
-UI:CreateSlider(PlayerFlySec, {
+UIRefs.Sliders.FlySpeed = UI:CreateSlider(PlayerFlySec, {
     Text = "Fly Speed",
     Min = 0,
     Max = 200,
@@ -1502,7 +1653,7 @@ UI:CreateSlider(PlayerFlySec, {
 
 local PlayerVisualSec = UI:CreateSection(PlayerPage, "VISUAL")
 
-UI:CreateToggle(PlayerVisualSec, {
+UIRefs.Toggles.FullBrightEnabled = UI:CreateToggle(PlayerVisualSec, {
     Text = "Full Bright",
     Default = false,
     Callback = function(value)
@@ -1519,7 +1670,7 @@ UI:CreateToggle(PlayerVisualSec, {
 
 local PlayerCharacterSec = UI:CreateSection(PlayerPage, "CHARACTER")
 
-UI:CreateToggle(PlayerCharacterSec, {
+UIRefs.Toggles.NoclipEnabled = UI:CreateToggle(PlayerCharacterSec, {
     Text = "Noclip",
     Default = false,
     Callback = function(value)
@@ -1543,7 +1694,7 @@ local AimPage = PageManager:AddPage("AIM")
 
 local AimMainSec = UI:CreateSection(AimPage, "AIM Main")
 
-UI:CreateToggle(AimMainSec, {
+UIRefs.Toggles.AimEnabled = UI:CreateToggle(AimMainSec, {
     Text = "Aim Enable",
     Default = Config.AimEnabled,
     Callback = function(value)
@@ -1551,7 +1702,7 @@ UI:CreateToggle(AimMainSec, {
     end
 })
 
-UI:CreateToggle(AimMainSec, {
+UIRefs.Toggles.TeamCheck = UI:CreateToggle(AimMainSec, {
     Text = "Team Check",
     Default = Config.TeamCheck,
     Callback = function(value)
@@ -1559,7 +1710,7 @@ UI:CreateToggle(AimMainSec, {
     end
 })
 
-UI:CreateToggle(AimMainSec, {
+UIRefs.Toggles.WallCheck = UI:CreateToggle(AimMainSec, {
     Text = "Wall Check",
     Default = Config.WallCheck,
     Callback = function(value)
@@ -1567,7 +1718,7 @@ UI:CreateToggle(AimMainSec, {
     end
 })
 
-UI:CreateToggle(AimMainSec, {
+UIRefs.Toggles.IgnoreVisibility = UI:CreateToggle(AimMainSec, {
     Text = "Ignore Visibility",
     Default = Config.IgnoreVisibility,
     Callback = function(value)
@@ -1591,7 +1742,7 @@ AimPartButton = UI:CreateButton(
 
 local AimFovSec = UI:CreateSection(AimPage, "AIM FOV")
 
-UI:CreateToggle(AimFovSec, {
+UIRefs.Toggles.UseFOV = UI:CreateToggle(AimFovSec, {
     Text = "Use FOV",
     Default = Config.UseFOV,
     Callback = function(value)
@@ -1599,7 +1750,7 @@ UI:CreateToggle(AimFovSec, {
     end
 })
 
-UI:CreateSlider(AimFovSec, {
+UIRefs.Sliders.FOV = UI:CreateSlider(AimFovSec, {
     Text = "FOV",
     Min = 0,
     Max = 180,
@@ -1629,6 +1780,8 @@ AimMaxDistanceInput = UI:CreateTextbox(AimFovSec, {
     end
 })
 
+UIRefs.Textboxes.AimMaxDistance = AimMaxDistanceInput
+
 local AimModeSec = UI:CreateSection(AimPage, "AIM Mode")
 
 local AimAlwaysToggle
@@ -1648,6 +1801,8 @@ AimAlwaysToggle = UI:CreateToggle(AimModeSec, {
     end
 })
 
+UIRefs.Toggles.AlwaysAim = AimAlwaysToggle
+
 AimOnFireToggle = UI:CreateToggle(AimModeSec, {
     Text = "Aim On Fire",
     Default = false,
@@ -1662,9 +1817,11 @@ AimOnFireToggle = UI:CreateToggle(AimModeSec, {
     end
 })
 
+UIRefs.Toggles.AimOnFire = AimOnFireToggle
+
 local AimSettingsSec = UI:CreateSection(AimPage, "AIM Settings")
 
-UI:CreateSlider(AimSettingsSec, {
+UIRefs.Sliders.Smoothness = UI:CreateSlider(AimSettingsSec, {
     Text = "Smoothness",
     Min = 0.2,
     Max = 1,
@@ -1676,6 +1833,72 @@ UI:CreateSlider(AimSettingsSec, {
     end
 })
 
+-- =========================================================
+-- TELEKILL
+-- Added directly to the existing AIM tab.
+-- Uses the existing UI component engine only.
+-- =========================================================
+local TelekillSec = UI:CreateSection(AimPage, "TELEKILL")
+
+UIRefs.Toggles.TelekillEnabled = UI:CreateToggle(TelekillSec, {
+    Text = "Telekill",
+    Default = Config.TelekillEnabled,
+    Callback = function(value)
+        Config.TelekillEnabled = value
+    end
+})
+
+UIRefs.TelekillTargetButton = UI:CreateButton(
+    TelekillSec,
+    "Target: " .. tostring(Config.TelekillTarget),
+    function()
+        if Config.TelekillTarget == "Enemy" then
+            Config.TelekillTarget = "Nearest"
+        elseif Config.TelekillTarget == "Nearest" then
+            Config.TelekillTarget = "Farthest"
+        else
+            Config.TelekillTarget = "Enemy"
+        end
+
+        UIRefs.TelekillTargetButton.Text =
+            "Target: " .. tostring(Config.TelekillTarget)
+    end
+)
+
+UIRefs.TelekillDistanceModeButton = UI:CreateButton(
+    TelekillSec,
+    "Distance: " .. tostring(Config.TelekillDistanceMode),
+    function()
+        if Config.TelekillDistanceMode == "Nearest" then
+            Config.TelekillDistanceMode = "Farthest"
+        else
+            Config.TelekillDistanceMode = "Nearest"
+        end
+
+        UIRefs.TelekillDistanceModeButton.Text =
+            "Distance: " .. tostring(Config.TelekillDistanceMode)
+    end
+)
+
+UIRefs.Sliders.TelekillDistance = UI:CreateSlider(TelekillSec, {
+    Text = "Tele Distance",
+    Min = 1,
+    Max = 20,
+    Default = Config.TelekillDistance,
+    Increment = 1,
+    EditableValue = true,
+    AllowTextInputBeyondRange = false,
+    Callback = function(value)
+        if type(value) == "number"
+            and value == value
+            and value ~= math.huge
+            and value ~= -math.huge
+        then
+            Config.TelekillDistance = math.clamp(value, 1, 20)
+        end
+    end
+})
+
 -- Tab 3: ESP
 -- Đúng một tab ESP trong Sidebar, page chỉ tạo một lần.
 -- Click ESP sẽ gọi PageManager:ShowPage("ESP") và ẩn các page khác.
@@ -1683,7 +1906,7 @@ local ESPPage = PageManager:AddPage("ESP")
 
 local ESPMainSec = UI:CreateSection(ESPPage, "ESP Main")
 
-UI:CreateToggle(ESPMainSec, {
+UIRefs.Toggles.Enabled = UI:CreateToggle(ESPMainSec, {
     Text = "ESP Enable",
     Default = Config.Enabled,
     Callback = function(v)
@@ -1691,7 +1914,7 @@ UI:CreateToggle(ESPMainSec, {
     end
 })
 
-UI:CreateToggle(ESPMainSec, {
+UIRefs.Toggles.ShowEnemies = UI:CreateToggle(ESPMainSec, {
     Text = "ESP Enemy",
     Default = Config.ShowEnemies,
     Callback = function(v)
@@ -1699,7 +1922,7 @@ UI:CreateToggle(ESPMainSec, {
     end
 })
 
-UI:CreateToggle(ESPMainSec, {
+UIRefs.Toggles.ShowTeammates = UI:CreateToggle(ESPMainSec, {
     Text = "ESP Team",
     Default = Config.ShowTeammates,
     Callback = function(v)
@@ -1709,7 +1932,7 @@ UI:CreateToggle(ESPMainSec, {
 
 local ESPVisualsSec = UI:CreateSection(ESPPage, "ESP Visuals")
 
-UI:CreateToggle(ESPVisualsSec, {
+UIRefs.Toggles.ShowName = UI:CreateToggle(ESPVisualsSec, {
     Text = "ESP Name",
     Default = Config.ShowName,
     Callback = function(v)
@@ -1717,7 +1940,7 @@ UI:CreateToggle(ESPVisualsSec, {
     end
 })
 
-UI:CreateToggle(ESPVisualsSec, {
+UIRefs.Toggles.ShowTracer = UI:CreateToggle(ESPVisualsSec, {
     Text = "ESP Tracer",
     Default = Config.ShowTracer,
     Callback = function(v)
@@ -1725,7 +1948,7 @@ UI:CreateToggle(ESPVisualsSec, {
     end
 })
 
-UI:CreateToggle(ESPVisualsSec, {
+UIRefs.Toggles.ShowSkeleton = UI:CreateToggle(ESPVisualsSec, {
     Text = "ESP Skeleton",
     Default = Config.ShowSkeleton,
     Callback = function(v)
@@ -1733,7 +1956,7 @@ UI:CreateToggle(ESPVisualsSec, {
     end
 })
 
-UI:CreateToggle(ESPVisualsSec, {
+UIRefs.Toggles.ShowHealth = UI:CreateToggle(ESPVisualsSec, {
     Text = "ESP Health",
     Default = Config.ShowHealth,
     Callback = function(v)
@@ -1741,7 +1964,7 @@ UI:CreateToggle(ESPVisualsSec, {
     end
 })
 
-UI:CreateToggle(ESPVisualsSec, {
+UIRefs.Toggles.ShowDistance = UI:CreateToggle(ESPVisualsSec, {
     Text = "ESP Distance",
     Default = Config.ShowDistance,
     Callback = function(v)
@@ -1749,7 +1972,7 @@ UI:CreateToggle(ESPVisualsSec, {
     end
 })
 
-UI:CreateToggle(ESPVisualsSec, {
+UIRefs.Toggles.ESPHighlightEnabled = UI:CreateToggle(ESPVisualsSec, {
     Text = "ESP Highlight",
     Default = Config.ESPHighlightEnabled,
     Callback = function(v)
@@ -1779,6 +2002,8 @@ ESPDistanceInput = UI:CreateTextbox(ESPSettingsSec, {
     end
 })
 
+UIRefs.Textboxes.MaxDistance = ESPDistanceInput
+
 -- =========================================================
 -- AIM CORE
 --
@@ -1790,6 +2015,12 @@ ESPDistanceInput = UI:CreateTextbox(ESPSettingsSec, {
 -- =========================================================
 
 local CurrentAimTarget = nil
+
+-- Telekill state is kept in one table so the existing top-level local budget
+-- is not expanded by a collection of separate helper locals.
+local Telekill = {
+    CurrentTarget = nil
+}
 
 local function GetAimPart(target)
     local character = target and target.Character
@@ -2131,6 +2362,28 @@ local function AimAtTarget(targetPart)
 end
 
 local function UpdateAim()
+    -- Telekill ON uses the existing AIM controller only for the final
+    -- camera rotation. Telekill supplies the target; AimAtTarget() remains
+    -- the existing camera-aim implementation.
+    if Config.TelekillEnabled then
+        local telekillTarget = Telekill.CurrentTarget
+
+        if telekillTarget and Telekill.IsValidTarget(telekillTarget) then
+            local telekillHead = GetAimPart(telekillTarget)
+
+            if telekillHead and telekillHead.Parent then
+                CurrentAimTarget = telekillTarget
+                AimAtTarget(telekillHead)
+                return
+            end
+        end
+
+        Telekill.CurrentTarget = nil
+        -- No valid Telekill target: fall through to the original AIM path.
+        -- This preserves the existing AIM behavior whenever Telekill cannot
+        -- provide a valid target.
+    end
+
     if not Config.AimEnabled then
         CurrentAimTarget = nil
         return
@@ -2164,6 +2417,261 @@ local function UpdateAim()
 
     CurrentAimTarget = target
     AimAtTarget(currentAimPart)
+end
+
+-- ---------------------------------------------------------
+-- TELEKILL TARGET / TELEPORT ENGINE
+-- ---------------------------------------------------------
+-- Telekill reuses the existing target/character helpers where possible.
+-- It does not replace GetBestTarget() or the normal AIM target path when
+-- Telekill is OFF.
+
+function Telekill.IsFiniteNumber(value)
+    return type(value) == "number"
+        and value == value
+        and value ~= math.huge
+        and value ~= -math.huge
+end
+
+function Telekill.IsValidTarget(target)
+    if not target or target == LocalPlayer then
+        return false
+    end
+
+    if not target:IsDescendantOf(Players) then
+        return false
+    end
+
+    local character = target.Character
+    local humanoid =
+        character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+
+    if not character or not humanoid or humanoid.Health <= 0 or not root then
+        return false
+    end
+
+    return true
+end
+
+function Telekill.IsEnemy(target)
+    if not target or target == LocalPlayer then
+        return false
+    end
+
+    local localTeam = LocalPlayer.Team
+    local targetTeam = target.Team
+
+    -- When the game does not expose Teams, keep the target eligible instead
+    -- of incorrectly rejecting everyone because both Team values are nil.
+    if localTeam and targetTeam then
+        return targetTeam ~= localTeam
+    end
+
+    return true
+end
+
+function Telekill.GetLocalRoot()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil
+    end
+
+    return character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("Head")
+end
+
+function Telekill.GetTargetDistance(targetRoot, localRoot)
+    if not targetRoot or not localRoot then
+        return math.huge
+    end
+
+    local distance =
+        (localRoot.Position - targetRoot.Position).Magnitude
+
+    if not Telekill.IsFiniteNumber(distance) then
+        return math.huge
+    end
+
+    return distance
+end
+
+function Telekill.GetBestTarget()
+    if not Config.TelekillEnabled then
+        return nil
+    end
+
+    local localRoot = Telekill.GetLocalRoot()
+    if not localRoot then
+        return nil
+    end
+
+    local mode = Config.TelekillTarget
+    local distanceMode = Config.TelekillDistanceMode
+
+    local bestTarget = nil
+    local bestDistance =
+        (mode == "Farthest" or (mode == "Enemy" and distanceMode == "Farthest"))
+        and -math.huge
+        or math.huge
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= LocalPlayer and Telekill.IsValidTarget(target) then
+            local eligible = false
+
+            if mode == "Enemy" then
+                eligible = Telekill.IsEnemy(target)
+            else
+                -- "Nearest" and "Farthest" intentionally consider all
+                -- other valid players, independent of Team Check.
+                eligible = true
+            end
+
+            if eligible then
+                local targetRoot = GetAimRoot(target)
+                local distance =
+                    Telekill.GetTargetDistance(targetRoot, localRoot)
+
+                if mode == "Farthest"
+                    or (mode == "Enemy" and distanceMode == "Farthest")
+                then
+                    if distance < math.huge and distance > bestDistance then
+                        bestDistance = distance
+                        bestTarget = target
+                    end
+                elseif distance < bestDistance then
+                    bestDistance = distance
+                    bestTarget = target
+                end
+            end
+        end
+    end
+
+    return bestTarget
+end
+
+function Telekill.GetPosition(targetRoot, teleDistance)
+    if not targetRoot then
+        return nil
+    end
+
+    local distance = tonumber(teleDistance) or 3
+    if not Telekill.IsFiniteNumber(distance) then
+        distance = 3
+    end
+    distance = math.clamp(distance, 1, 20)
+
+    local localRoot = Telekill.GetLocalRoot()
+    local away = Vector3.zero
+
+    if localRoot then
+        away = localRoot.Position - targetRoot.Position
+    end
+
+    away = Vector3.new(away.X, 0, away.Z)
+
+    if away.Magnitude < 0.001 then
+        local look = targetRoot.CFrame.LookVector
+        away = Vector3.new(look.X, 0, look.Z)
+    end
+
+    if away.Magnitude < 0.001 then
+        away = Vector3.new(0, 0, 1)
+    else
+        away = away.Unit
+    end
+
+    -- Keep the player's vertical level aligned with the target root instead
+    -- of constructing an arbitrary downward position. This prevents the
+    -- Telekill offset itself from sending the character below the target.
+    local candidate =
+        targetRoot.Position
+        + (away * distance)
+
+    if not Telekill.IsFiniteNumber(candidate.X)
+        or not Telekill.IsFiniteNumber(candidate.Y)
+        or not Telekill.IsFiniteNumber(candidate.Z)
+    then
+        return nil
+    end
+
+    return candidate
+end
+
+function Telekill.Teleport(target)
+    if not target or not Telekill.IsValidTarget(target) then
+        return false
+    end
+
+    local character = LocalPlayer.Character
+    local localRoot = Telekill.GetLocalRoot()
+    local targetRoot = GetAimRoot(target)
+
+    if not character or not localRoot or not targetRoot then
+        return false
+    end
+
+    local destination =
+        Telekill.GetPosition(
+            targetRoot,
+            Config.TelekillDistance
+        )
+
+    if not destination then
+        return false
+    end
+
+    local currentPivot = character:GetPivot()
+    local destinationCFrame =
+        CFrame.new(destination) * currentPivot.Rotation
+
+    local ok = pcall(function()
+        character:PivotTo(destinationCFrame)
+    end)
+
+    if not ok then
+        return false
+    end
+
+    return true
+end
+
+function Telekill.Update()
+    if not Config.TelekillEnabled then
+        Telekill.CurrentTarget = nil
+        return
+    end
+
+    -- Re-evaluate the requested target mode from CURRENT player positions.
+    -- The target reference is only a context handle; no position is cached.
+    local target = Telekill.GetBestTarget()
+    Telekill.CurrentTarget = target
+
+    if not target then
+        CurrentAimTarget = nil
+        return
+    end
+
+    -- Re-read the current target root at the moment of teleport.
+    local targetRoot = GetAimRoot(target)
+    if not targetRoot then
+        Telekill.CurrentTarget = nil
+        CurrentAimTarget = nil
+        return
+    end
+
+    if not Telekill.Teleport(target) then
+        -- Target remains eligible for the next render update; no stale
+        -- position is cached and no error is allowed to break the script.
+        CurrentAimTarget = target
+        return
+    end
+
+    -- Supply the same target context to the existing AIM controller.
+    CurrentAimTarget = target
 end
 
 -- ---------------------------------------------------------
@@ -2224,10 +2732,65 @@ local function createScreenLine(name)
     return line
 end
 
+local function IsFiniteESPNumber(value)
+    return type(value) == "number"
+        and value == value
+        and value ~= math.huge
+        and value ~= -math.huge
+end
+
+local function ApplyESPScreenOffset(position)
+    if not position then
+        return nil
+    end
+
+    local offsetX = tonumber(Config.ESPOffsetX) or 0
+    local offsetY = tonumber(Config.ESPOffsetY) or 0
+
+    -- X positive = right / negative = left.
+    -- Y positive = up / negative = down.
+    return Vector2.new(
+        position.X + offsetX,
+        position.Y - offsetY
+    )
+end
+
+-- Z is applied in camera-relative WORLD space BEFORE projection.
+-- X/Y are deliberately NOT applied here, preventing double application.
+local function ProjectESPWorldPosition(camera, worldPosition)
+    if not camera or not worldPosition then
+        return nil, false, nil
+    end
+
+    local zOffset = tonumber(Config.ESPOffsetZ) or 0
+
+    -- Config +Z = closer to the camera, -Z = farther away.
+    -- Roblox Camera.LookVector points forward into the scene, so subtracting
+    -- it makes positive Z move the ESP projection toward the camera.
+    local adjustedWorldPosition =
+        worldPosition - camera.CFrame.LookVector * zOffset
+
+    local projected, onScreen =
+        camera:WorldToViewportPoint(adjustedWorldPosition)
+
+    if not IsFiniteESPNumber(projected.X)
+        or not IsFiniteESPNumber(projected.Y)
+        or not IsFiniteESPNumber(projected.Z)
+    then
+        return nil, false, nil
+    end
+
+    return Vector2.new(projected.X, projected.Y), onScreen, projected.Z
+end
+
 local function updateScreenLine(line, from, to)
-    if not line then
+    if not line or not from or not to then
         return
     end
+
+    -- Apply screen-space X/Y exactly once to the final line.
+    from = ApplyESPScreenOffset(from)
+    to = ApplyESPScreenOffset(to)
 
     local delta = to - from
     local length = delta.Magnitude
@@ -2394,7 +2957,17 @@ local function hideTargetESP(data)
     end
 end
 
-local function updateTargetESP(target)
+local function updateTargetESP(target, camera)
+    -- Every ESP element in this frame uses the same CurrentCamera snapshot.
+    if not camera then
+        local staleData = espData[target]
+        if staleData then
+            hideTargetESP(staleData)
+        end
+        return
+    end
+
+    -- Resolve the CURRENT target character and CURRENT parts every frame.
     local character = target.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -2406,8 +2979,6 @@ local function updateTargetESP(target)
     end
 
     -- Team / Enemy hoàn toàn độc lập với Aim.
-    -- In games without Roblox Teams, both Team values can be nil;
-    -- treat those players as enemies instead of teammates.
     local hasTeams = LocalPlayer.Team ~= nil and target.Team ~= nil
     local isTeammate = hasTeams and (target.Team == LocalPlayer.Team)
     local isEnemy = not isTeammate
@@ -2426,7 +2997,7 @@ local function updateTargetESP(target)
 
     local data = espData[target]
 
-    -- Respawn: character cũ bị xóa và rebuild theo character mới.
+    -- Respawn: discard the old character-backed ESP and rebuild for the new character.
     if data and data.character ~= character then
         destroyTargetESP(target)
         data = nil
@@ -2439,13 +3010,7 @@ local function updateTargetESP(target)
         EnsureSkeletonLines(data, character)
     end
 
-    local camera = Workspace.CurrentCamera
-
-    if not camera then
-        return
-    end
-
-    -- Khoảng cách 3D.
+    -- Distance uses CURRENT root positions.
     local myRoot =
         LocalPlayer.Character and
         LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -2460,16 +3025,15 @@ local function updateTargetESP(target)
         return
     end
 
-    -- Tọa độ màn hình.
-    local rootScreen, rootOnScreen =
-        camera:WorldToViewportPoint(root.Position)
+    -- CURRENT world positions -> the SAME camera snapshot -> projection.
+    local rootScreen, rootOnScreen, rootDepth =
+        ProjectESPWorldPosition(camera, root.Position)
 
-    local headScreen
-    local headOnScreen = false
+    local headScreen, headOnScreen, headDepth
 
     if head then
-        headScreen, headOnScreen =
-            camera:WorldToViewportPoint(head.Position)
+        headScreen, headOnScreen, headDepth =
+            ProjectESPWorldPosition(camera, head.Position)
     end
 
     -- NAME / HEALTH / DISTANCE
@@ -2480,17 +3044,23 @@ local function updateTargetESP(target)
 
     if
         showInfo and
+        headScreen and
         headOnScreen and
-        headScreen.Z > 0
+        headDepth > 0
     then
         local info = data.info
 
-        -- AnchorPoint = (0.5, 1) => info nằm phía trên đầu.
-        info.Position =
-            UDim2.fromOffset(
+        local infoPosition = ApplyESPScreenOffset(
+            Vector2.new(
                 headScreen.X,
                 headScreen.Y - 8
             )
+        )
+
+        info.Position = UDim2.fromOffset(
+            infoPosition.X,
+            infoPosition.Y
+        )
 
         info.Visible = true
 
@@ -2534,21 +3104,17 @@ local function updateTargetESP(target)
     -- TRACER
     if
         Config.ShowTracer and
+        rootScreen and
         rootOnScreen and
-        rootScreen.Z > 0
+        rootDepth > 0
     then
-        -- Bottom Center -> HumanoidRootPart của frame hiện tại.
         local from =
             Vector2.new(
                 camera.ViewportSize.X / 2,
                 camera.ViewportSize.Y - 8
             )
 
-        local to =
-            Vector2.new(
-                rootScreen.X,
-                rootScreen.Y
-            )
+        local to = rootScreen
 
         updateScreenLine(
             data.tracer,
@@ -2559,30 +3125,32 @@ local function updateTargetESP(target)
         data.tracer.Visible = false
     end
 
-    -- SKELETON R6 / R15.
+    -- SKELETON R6 / R15
     if Config.ShowSkeleton then
-        -- Lấy lại Position từng part mỗi frame để bám animation.
+        -- Each endpoint re-reads the CURRENT part.Position every frame.
         for _, skeleton in ipairs(data.skeleton) do
             local partA = character:FindFirstChild(skeleton.partA)
             local partB = character:FindFirstChild(skeleton.partB)
 
             if partA and partB then
-                local posA, visibleA =
-                    camera:WorldToViewportPoint(partA.Position)
+                local posA, visibleA, depthA =
+                    ProjectESPWorldPosition(camera, partA.Position)
 
-                local posB, visibleB =
-                    camera:WorldToViewportPoint(partB.Position)
+                local posB, visibleB, depthB =
+                    ProjectESPWorldPosition(camera, partB.Position)
 
                 if
+                    posA and
+                    posB and
                     visibleA and
                     visibleB and
-                    posA.Z > 0 and
-                    posB.Z > 0
+                    depthA > 0 and
+                    depthB > 0
                 then
                     updateScreenLine(
                         skeleton.line,
-                        Vector2.new(posA.X, posA.Y),
-                        Vector2.new(posB.X, posB.Y)
+                        posA,
+                        posB
                     )
                 else
                     skeleton.line.Visible = false
@@ -2598,7 +3166,15 @@ local function updateTargetESP(target)
     end
 end
 
-local function updateESP()
+local function updateESP(camera)
+    -- One CurrentCamera snapshot for the entire ESP frame.
+    if not camera then
+        for _, data in pairs(espData) do
+            hideTargetESP(data)
+        end
+        return
+    end
+
     -- Master Toggle: tắt thì không render bất kỳ module nào.
     if not Config.Enabled then
         for target in pairs(espData) do
@@ -2609,7 +3185,7 @@ local function updateESP()
 
     for _, target in ipairs(Players:GetPlayers()) do
         if target ~= LocalPlayer then
-            updateTargetESP(target)
+            updateTargetESP(target, camera)
         end
     end
 end
@@ -3111,25 +3687,1378 @@ end
 RefreshTeleportPlayerList()
 
 -- =========================================================
--- UNIFIED RENDER LOOP
--- One frame pipeline for AIM + FOV + ESP.
--- Bound to Enum.RenderPriority.Last.Value + 100 to guarantee
--- execution AFTER Hood Rivals updates its custom shoulder camera/scope CFrame.
+-- SETTINGS TAB / SAVE-LOAD / ESP OFFSET PROFILES
+-- Uses the existing PageManager + UI component system.
 -- =========================================================
+
+local SettingsPage = PageManager:AddPage("SETTINGS")
+
+local SettingsStatusLabel
+
+local CONFIG_FILE = "HoodRivals_Settings.json"
+local ESP_PROFILES_FILE = "HoodRivals_ESP_Offset_Profiles.json"
+
+local SessionConfigBackup = nil
+local ESPProfiles = {}
+local ProfileConnections = {}
+local ProfilePopupConnections = {}
+local ProfileNameInput
+local ProfileList
+local CurrentGameName = "Unknown"
+local CurrentPlaceId = 0
+
+local FileAPI = {
+    Available = false,
+    IsFile = nil,
+    ReadFile = nil,
+    WriteFile = nil
+}
+
 pcall(function()
-    RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
+    if type(isfile) == "function" then
+        FileAPI.IsFile = isfile
+    end
+
+    if type(readfile) == "function" then
+        FileAPI.ReadFile = readfile
+    end
+
+    if type(writefile) == "function" then
+        FileAPI.WriteFile = writefile
+    end
+
+    FileAPI.Available =
+        FileAPI.ReadFile ~= nil
+        and FileAPI.WriteFile ~= nil
 end)
 
+local function IsFiniteNumber(value)
+    return type(value) == "number"
+        and value == value
+        and value ~= math.huge
+        and value ~= -math.huge
+end
+
+local function SafeEncodeJSON(data)
+    local ok, result = pcall(function()
+        return HttpService:JSONEncode(data)
+    end)
+
+    if not ok or type(result) ~= "string" or result == "" then
+        return nil
+    end
+
+    return result
+end
+
+local function SafeDecodeJSON(raw)
+    if type(raw) ~= "string" or raw == "" then
+        return nil, "empty"
+    end
+
+    local ok, result = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+
+    if not ok or type(result) ~= "table" then
+        return nil, "invalid"
+    end
+
+    return result
+end
+
+local function FileExists(path)
+    if not FileAPI.Available then
+        return false
+    end
+
+    if FileAPI.IsFile then
+        local ok, result = pcall(FileAPI.IsFile, path)
+        if ok then
+            return result == true
+        end
+    end
+
+    local ok = pcall(FileAPI.ReadFile, path)
+    return ok
+end
+
+local function SafeReadFile(path)
+    if not FileAPI.Available or not FileExists(path) then
+        return nil, "unavailable"
+    end
+
+    local ok, result = pcall(FileAPI.ReadFile, path)
+    if not ok or type(result) ~= "string" then
+        return nil, "read_error"
+    end
+
+    return result
+end
+
+local function SafeWriteFile(path, data)
+    if not FileAPI.Available then
+        return false, "unavailable"
+    end
+
+    local ok, err = pcall(FileAPI.WriteFile, path, data)
+    if not ok then
+        return false, tostring(err)
+    end
+
+    return true
+end
+
+local function SetSettingsStatus(message)
+    if SettingsStatusLabel then
+        SettingsStatusLabel.Text = tostring(message or "")
+    end
+end
+
+local function TrimString(value)
+    if type(value) ~= "string" then
+        return ""
+    end
+
+    value = value:gsub("^%s+", "")
+    value = value:gsub("%s+$", "")
+
+    if #value > 60 then
+        value = value:sub(1, 60)
+    end
+
+    return value
+end
+
+local function GetCurrentGameMetadata()
+    local name = "Unknown"
+    local placeId = 0
+
+    pcall(function()
+        if type(game.Name) == "string" and game.Name ~= "" then
+            name = game.Name
+        end
+    end)
+
+    pcall(function()
+        if IsFiniteNumber(game.PlaceId) then
+            placeId = game.PlaceId
+        end
+    end)
+
+    return name, placeId
+end
+
+CurrentGameName, CurrentPlaceId = GetCurrentGameMetadata()
+
+local function BuildConfigPayload()
+    return {
+        version = 1,
+
+        -- AIM
+        AimEnabled = Config.AimEnabled,
+        TeamCheck = Config.TeamCheck,
+        WallCheck = Config.WallCheck,
+        IgnoreVisibility = Config.IgnoreVisibility,
+        UseFOV = Config.UseFOV,
+        FOV = Config.FOV,
+        AlwaysAim = Config.AlwaysAim,
+        AimOnFire = Config.AimOnFire,
+        AimPart = Config.AimPart,
+        Smoothness = Config.Smoothness,
+        AimMaxDistance = Config.AimMaxDistance,
+
+        -- TELEKILL
+        TelekillEnabled = Config.TelekillEnabled,
+        TelekillTarget = Config.TelekillTarget,
+        TelekillDistanceMode = Config.TelekillDistanceMode,
+        TelekillDistance = Config.TelekillDistance,
+
+        -- ESP
+        Enabled = Config.Enabled,
+        ShowEnemies = Config.ShowEnemies,
+        ShowTeammates = Config.ShowTeammates,
+        ShowName = Config.ShowName,
+        ShowTracer = Config.ShowTracer,
+        ShowSkeleton = Config.ShowSkeleton,
+        ShowHealth = Config.ShowHealth,
+        ShowDistance = Config.ShowDistance,
+        MaxDistance = Config.MaxDistance,
+        ESPHighlightEnabled = Config.ESPHighlightEnabled,
+        ESPOffsetX = Config.ESPOffsetX,
+        ESPOffsetY = Config.ESPOffsetY,
+        ESPOffsetZ = Config.ESPOffsetZ,
+
+        -- PLAYER
+        Player = {
+            CFrameSpeedEnabled = Config.Player.CFrameSpeedEnabled,
+            CFrameSpeed = Config.Player.CFrameSpeed,
+            AirFlyEnabled = Config.Player.AirFlyEnabled,
+            JumpPower = Config.Player.JumpPower,
+            JumpPowerOverrideEnabled = Config.Player.JumpPowerOverrideEnabled,
+            FlyEnabled = Config.Player.FlyEnabled,
+            FlySpeed = Config.Player.FlySpeed,
+            FullBrightEnabled = Config.Player.FullBrightEnabled,
+            NoclipEnabled = Config.Player.NoclipEnabled
+        },
+
+        -- MENU INPUT
+        ToggleKeyEnabled = Config.ToggleKeyEnabled,
+        ToggleKey = Config.ToggleKey and Config.ToggleKey.Name or nil,
+        UIScale = Config.UIScale,
+        BackgroundTransparency = Config.BackgroundTransparency
+    }
+end
+
+local function SetBooleanField(source, key, target, targetKey)
+    if type(source) ~= "table" then
+        return
+    end
+
+    if type(source[key]) == "boolean" then
+        target[targetKey or key] = source[key]
+    end
+end
+
+local function SetNumberField(source, key, target, targetKey, minValue, maxValue)
+    if type(source) ~= "table" then
+        return
+    end
+
+    local value = source[key]
+    if not IsFiniteNumber(value) then
+        return
+    end
+
+    if minValue ~= nil then
+        value = math.max(value, minValue)
+    end
+
+    if maxValue ~= nil then
+        value = math.min(value, maxValue)
+    end
+
+    target[targetKey or key] = value
+end
+
+local function ApplyConfigPayload(payload)
+    if type(payload) ~= "table" then
+        return false, "Invalid config root"
+    end
+
+    local oldFullBrightEnabled = Config.Player.FullBrightEnabled
+
+    SetBooleanField(payload, "AimEnabled", Config)
+    SetBooleanField(payload, "TeamCheck", Config)
+    SetBooleanField(payload, "WallCheck", Config)
+    SetBooleanField(payload, "IgnoreVisibility", Config)
+    SetBooleanField(payload, "UseFOV", Config)
+    SetNumberField(payload, "FOV", Config, nil, 0, 180)
+    SetBooleanField(payload, "AlwaysAim", Config)
+    SetBooleanField(payload, "AimOnFire", Config)
+
+    if type(payload.AimPart) == "string" then
+        if payload.AimPart == "Head" or payload.AimPart == "Body" then
+            Config.AimPart = payload.AimPart
+        end
+    end
+
+    SetNumberField(payload, "Smoothness", Config, nil, 0.2, 1)
+    SetNumberField(payload, "AimMaxDistance", Config, nil, 50, 10000)
+
+    SetBooleanField(payload, "TelekillEnabled", Config)
+
+    if type(payload.TelekillTarget) == "string" then
+        if payload.TelekillTarget == "Enemy"
+            or payload.TelekillTarget == "Nearest"
+            or payload.TelekillTarget == "Farthest"
+        then
+            Config.TelekillTarget = payload.TelekillTarget
+        end
+    end
+
+    if type(payload.TelekillDistanceMode) == "string" then
+        if payload.TelekillDistanceMode == "Nearest"
+            or payload.TelekillDistanceMode == "Farthest"
+        then
+            Config.TelekillDistanceMode = payload.TelekillDistanceMode
+        end
+    end
+
+    SetNumberField(
+        payload,
+        "TelekillDistance",
+        Config,
+        nil,
+        1,
+        20
+    )
+
+    if Config.AlwaysAim and Config.AimOnFire then
+        Config.AimOnFire = false
+    end
+
+    SetBooleanField(payload, "Enabled", Config)
+    SetBooleanField(payload, "ShowEnemies", Config)
+    SetBooleanField(payload, "ShowTeammates", Config)
+    SetBooleanField(payload, "ShowName", Config)
+    SetBooleanField(payload, "ShowTracer", Config)
+    SetBooleanField(payload, "ShowSkeleton", Config)
+    SetBooleanField(payload, "ShowHealth", Config)
+    SetBooleanField(payload, "ShowDistance", Config)
+    SetNumberField(payload, "MaxDistance", Config, nil, 50, 10000)
+    SetBooleanField(payload, "ESPHighlightEnabled", Config)
+    SetNumberField(payload, "ESPOffsetX", Config, nil, -200, 200)
+    SetNumberField(payload, "ESPOffsetY", Config, nil, -200, 200)
+    SetNumberField(payload, "ESPOffsetZ", Config, nil, -200, 200)
+
+    if type(payload.Player) == "table" then
+        SetBooleanField(
+            payload.Player,
+            "CFrameSpeedEnabled",
+            Config.Player
+        )
+        SetNumberField(
+            payload.Player,
+            "CFrameSpeed",
+            Config.Player,
+            nil,
+            20,
+            10000
+        )
+        SetBooleanField(
+            payload.Player,
+            "AirFlyEnabled",
+            Config.Player
+        )
+        SetNumberField(
+            payload.Player,
+            "JumpPower",
+            Config.Player,
+            nil,
+            20,
+            10000
+        )
+        SetBooleanField(
+            payload.Player,
+            "JumpPowerOverrideEnabled",
+            Config.Player
+        )
+        SetBooleanField(
+            payload.Player,
+            "FlyEnabled",
+            Config.Player
+        )
+        SetNumberField(
+            payload.Player,
+            "FlySpeed",
+            Config.Player,
+            nil,
+            0,
+            10000
+        )
+        SetBooleanField(
+            payload.Player,
+            "FullBrightEnabled",
+            Config.Player
+        )
+        SetBooleanField(
+            payload.Player,
+            "NoclipEnabled",
+            Config.Player
+        )
+    end
+
+    SetBooleanField(payload, "ToggleKeyEnabled", Config)
+    SetNumberField(payload, "UIScale", Config, nil, 0.25, 3)
+    SetNumberField(
+        payload,
+        "BackgroundTransparency",
+        Config,
+        nil,
+        0,
+        1
+    )
+
+    if type(payload.ToggleKey) == "string" then
+        pcall(function()
+            local enumItem = Enum.KeyCode[payload.ToggleKey]
+            if enumItem then
+                Config.ToggleKey = enumItem
+            end
+        end)
+    end
+
+    if oldFullBrightEnabled and not Config.Player.FullBrightEnabled then
+        RestoreFullBright()
+    elseif Config.Player.FullBrightEnabled then
+        CaptureFullBrightState()
+        ApplyFullBright()
+    end
+
+    if not Config.Player.AirFlyEnabled then
+        PlayerRuntime.AirFlyJumpRequested = false
+    end
+
+    if Config.Player.JumpPowerOverrideEnabled then
+        ApplyJumpPower(PlayerRuntime.Humanoid)
+    else
+        RestoreOriginalJumpPower(PlayerRuntime.Humanoid)
+    end
+
+    -- Apply menu-level persistent values directly after validation.
+    UIScaleObj.Scale = Config.UIScale
+    MainWindow.BackgroundTransparency =
+        Config.BackgroundTransparency
+
+    return true
+end
+
+local function SyncSettingsUI()
+    if UIRefs.Toggles.AimEnabled then
+        UIRefs.Toggles.AimEnabled.Set(Config.AimEnabled, true)
+    end
+    if UIRefs.Toggles.TeamCheck then
+        UIRefs.Toggles.TeamCheck.Set(Config.TeamCheck, true)
+    end
+    if UIRefs.Toggles.WallCheck then
+        UIRefs.Toggles.WallCheck.Set(Config.WallCheck, true)
+    end
+    if UIRefs.Toggles.IgnoreVisibility then
+        UIRefs.Toggles.IgnoreVisibility.Set(Config.IgnoreVisibility, true)
+    end
+    if UIRefs.Toggles.UseFOV then
+        UIRefs.Toggles.UseFOV.Set(Config.UseFOV, true)
+    end
+    if UIRefs.Toggles.AlwaysAim then
+        UIRefs.Toggles.AlwaysAim.Set(Config.AlwaysAim, true)
+    end
+    if UIRefs.Toggles.AimOnFire then
+        UIRefs.Toggles.AimOnFire.Set(Config.AimOnFire, true)
+    end
+
+    if UIRefs.Toggles.TelekillEnabled then
+        UIRefs.Toggles.TelekillEnabled.Set(
+            Config.TelekillEnabled,
+            true
+        )
+    end
+    if UIRefs.TelekillTargetButton then
+        UIRefs.TelekillTargetButton.Text =
+            "Target: " .. tostring(Config.TelekillTarget)
+    end
+    if UIRefs.TelekillDistanceModeButton then
+        UIRefs.TelekillDistanceModeButton.Text =
+            "Distance: " .. tostring(Config.TelekillDistanceMode)
+    end
+    if UIRefs.Sliders.TelekillDistance then
+        UIRefs.Sliders.TelekillDistance.Set(
+            Config.TelekillDistance,
+            true
+        )
+    end
+
+    if UIRefs.Sliders.FOV then
+        UIRefs.Sliders.FOV.Set(Config.FOV, true)
+    end
+    if UIRefs.Sliders.Smoothness then
+        UIRefs.Sliders.Smoothness.Set(Config.Smoothness, true)
+    end
+    if UIRefs.Textboxes.AimMaxDistance then
+        UIRefs.Textboxes.AimMaxDistance.Text =
+            tostring(Config.AimMaxDistance)
+    end
+    if AimPartButton then
+        AimPartButton.Text = "Aim Part: " .. tostring(Config.AimPart)
+    end
+
+    if UIRefs.Toggles.Enabled then
+        UIRefs.Toggles.Enabled.Set(Config.Enabled, true)
+    end
+    if UIRefs.Toggles.ShowEnemies then
+        UIRefs.Toggles.ShowEnemies.Set(Config.ShowEnemies, true)
+    end
+    if UIRefs.Toggles.ShowTeammates then
+        UIRefs.Toggles.ShowTeammates.Set(Config.ShowTeammates, true)
+    end
+    if UIRefs.Toggles.ShowName then
+        UIRefs.Toggles.ShowName.Set(Config.ShowName, true)
+    end
+    if UIRefs.Toggles.ShowTracer then
+        UIRefs.Toggles.ShowTracer.Set(Config.ShowTracer, true)
+    end
+    if UIRefs.Toggles.ShowSkeleton then
+        UIRefs.Toggles.ShowSkeleton.Set(Config.ShowSkeleton, true)
+    end
+    if UIRefs.Toggles.ShowHealth then
+        UIRefs.Toggles.ShowHealth.Set(Config.ShowHealth, true)
+    end
+    if UIRefs.Toggles.ShowDistance then
+        UIRefs.Toggles.ShowDistance.Set(Config.ShowDistance, true)
+    end
+    if UIRefs.Toggles.ESPHighlightEnabled then
+        UIRefs.Toggles.ESPHighlightEnabled.Set(
+            Config.ESPHighlightEnabled,
+            true
+        )
+    end
+    if UIRefs.Textboxes.MaxDistance then
+        UIRefs.Textboxes.MaxDistance.Text =
+            tostring(Config.MaxDistance)
+    end
+
+    if UIRefs.Sliders.ESPOffsetX then
+        UIRefs.Sliders.ESPOffsetX.Set(Config.ESPOffsetX, true)
+    end
+    if UIRefs.Sliders.ESPOffsetY then
+        UIRefs.Sliders.ESPOffsetY.Set(Config.ESPOffsetY, true)
+    end
+    if UIRefs.Sliders.ESPOffsetZ then
+        UIRefs.Sliders.ESPOffsetZ.Set(Config.ESPOffsetZ, true)
+    end
+
+    if UIRefs.Toggles.CFrameSpeedEnabled then
+        UIRefs.Toggles.CFrameSpeedEnabled.Set(
+            Config.Player.CFrameSpeedEnabled,
+            true
+        )
+    end
+    if UIRefs.Sliders.CFrameSpeed then
+        UIRefs.Sliders.CFrameSpeed.Set(
+            Config.Player.CFrameSpeed,
+            true
+        )
+    end
+    if UIRefs.Toggles.JumpPowerOverrideEnabled then
+        UIRefs.Toggles.JumpPowerOverrideEnabled.Set(
+            Config.Player.JumpPowerOverrideEnabled,
+            true
+        )
+    end
+    if UIRefs.Toggles.AirFlyEnabled then
+        UIRefs.Toggles.AirFlyEnabled.Set(
+            Config.Player.AirFlyEnabled,
+            true
+        )
+    end
+    if UIRefs.Sliders.JumpPower then
+        UIRefs.Sliders.JumpPower.Set(
+            Config.Player.JumpPower,
+            true
+        )
+    end
+    if UIRefs.Toggles.FlyEnabled then
+        UIRefs.Toggles.FlyEnabled.Set(
+            Config.Player.FlyEnabled,
+            true
+        )
+    end
+    if UIRefs.Sliders.FlySpeed then
+        UIRefs.Sliders.FlySpeed.Set(
+            Config.Player.FlySpeed,
+            true
+        )
+    end
+    if UIRefs.Toggles.FullBrightEnabled then
+        UIRefs.Toggles.FullBrightEnabled.Set(
+            Config.Player.FullBrightEnabled,
+            true
+        )
+    end
+    if UIRefs.Toggles.NoclipEnabled then
+        UIRefs.Toggles.NoclipEnabled.Set(
+            Config.Player.NoclipEnabled,
+            true
+        )
+    end
+end
+
+local function SaveSettings()
+    local payload = BuildConfigPayload()
+    SessionConfigBackup = payload
+
+    local encoded = SafeEncodeJSON(payload)
+    if not encoded then
+        SetSettingsStatus(
+            "Settings saved for this session; JSON encoding unavailable"
+        )
+        return
+    end
+
+    local ok = false
+    if FileAPI.Available then
+        ok = SafeWriteFile(CONFIG_FILE, encoded)
+    end
+
+    if ok then
+        SetSettingsStatus("Settings saved")
+    else
+        SetSettingsStatus(
+            "Settings saved for this session; filesystem unavailable or write failed"
+        )
+    end
+end
+
+local function LoadSettings()
+    local payload = nil
+
+    if FileAPI.Available and FileExists(CONFIG_FILE) then
+        local raw, readReason = SafeReadFile(CONFIG_FILE)
+
+        if not raw then
+            SetSettingsStatus("Settings load failed: " .. tostring(readReason))
+            return
+        end
+
+        local decoded, decodeReason = SafeDecodeJSON(raw)
+        if not decoded then
+            SetSettingsStatus(
+                "Settings load failed: " .. tostring(decodeReason)
+            )
+            return
+        end
+
+        payload = decoded
+    elseif SessionConfigBackup then
+        -- Session backup is also used when file persistence is unavailable
+        -- or the previous write failed.
+        payload = SessionConfigBackup
+    else
+        SetSettingsStatus("No saved settings found")
+        return
+    end
+
+    local ok, err = ApplyConfigPayload(payload)
+    if not ok then
+        SetSettingsStatus(
+            "Settings load failed: " .. tostring(err)
+        )
+        return
+    end
+
+    SyncSettingsUI()
+    SetSettingsStatus("Settings loaded")
+end
+
+local function DisconnectProfileConnections()
+    for _, conn in ipairs(ProfileConnections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+
+    table.clear(ProfileConnections)
+end
+
+local function AddProfileConnection(conn)
+    if conn then
+        table.insert(ProfileConnections, conn)
+    end
+
+    return conn
+end
+
+local function SaveESPProfiles()
+    local encoded = SafeEncodeJSON(ESPProfiles)
+
+    if not encoded then
+        SetSettingsStatus(
+            "Profile updated for this session; JSON encoding unavailable"
+        )
+        return false
+    end
+
+    if not FileAPI.Available then
+        SetSettingsStatus(
+            "Profile updated for this session; filesystem unavailable"
+        )
+        return false
+    end
+
+    local ok = SafeWriteFile(ESP_PROFILES_FILE, encoded)
+    if not ok then
+        SetSettingsStatus(
+            "Profile updated for this session; filesystem unavailable or write failed"
+        )
+        return false
+    end
+
+    return true
+end
+
+local function LoadESPProfiles()
+    if not FileAPI.Available then
+        return
+    end
+
+    if not FileExists(ESP_PROFILES_FILE) then
+        return
+    end
+
+    local raw = SafeReadFile(ESP_PROFILES_FILE)
+    if not raw then
+        SetSettingsStatus("Profile load skipped: file read failed")
+        return
+    end
+
+    local decoded = SafeDecodeJSON(raw)
+    if type(decoded) ~= "table" then
+        SetSettingsStatus("Profile load skipped: invalid profile file")
+        return
+    end
+
+    local loadedProfiles = {}
+    local names = {}
+
+    for _, profile in ipairs(decoded) do
+        if type(profile) == "table" then
+            local name = TrimString(profile.name)
+            local x = profile.x
+            local y = profile.y
+            local z = profile.z
+
+            -- Legacy profiles have only X/Y; Z defaults to 0.
+            if z == nil then
+                z = 0
+            end
+
+            if name ~= ""
+                and IsFiniteNumber(x)
+                and IsFiniteNumber(y)
+                and IsFiniteNumber(z)
+            then
+                x = math.clamp(x, -200, 200)
+                y = math.clamp(y, -200, 200)
+                z = math.clamp(z, -200, 200)
+
+                if not names[name] then
+                    local placeId = 0
+                    local gameName = "Unknown"
+
+                    if IsFiniteNumber(profile.placeId) then
+                        placeId = profile.placeId
+                    end
+
+                    if type(profile.gameName) == "string" then
+                        gameName = profile.gameName
+                    end
+
+                    local cleaned = {
+                        name = name,
+                        x = x,
+                        y = y,
+                        z = z,
+                        placeId = placeId,
+                        gameName = gameName
+                    }
+
+                    table.insert(loadedProfiles, cleaned)
+                    names[name] = true
+                end
+            end
+        end
+    end
+
+    ESPProfiles = loadedProfiles
+end
+
+local function FindProfileByName(name)
+    for _, profile in ipairs(ESPProfiles) do
+        if profile.name == name then
+            return profile
+        end
+    end
+
+    return nil
+end
+
+local function ApplyESPProfile(profile)
+    if type(profile) ~= "table" then
+        return
+    end
+
+    local x = profile.x
+    local y = profile.y
+    local z = profile.z
+
+    -- Legacy profiles implicitly use Z = 0.
+    if z == nil then
+        z = 0
+    end
+
+    if
+        not IsFiniteNumber(x)
+        or not IsFiniteNumber(y)
+        or not IsFiniteNumber(z)
+    then
+        SetSettingsStatus("Profile apply failed: invalid offset data")
+        return
+    end
+
+    x = math.clamp(x, -200, 200)
+    y = math.clamp(y, -200, 200)
+    z = math.clamp(z, -200, 200)
+
+    Config.ESPOffsetX = x
+    Config.ESPOffsetY = y
+    Config.ESPOffsetZ = z
+
+    if UIRefs.Sliders.ESPOffsetX then
+        UIRefs.Sliders.ESPOffsetX.Set(x, true)
+    end
+
+    if UIRefs.Sliders.ESPOffsetY then
+        UIRefs.Sliders.ESPOffsetY.Set(y, true)
+    end
+
+    if UIRefs.Sliders.ESPOffsetZ then
+        UIRefs.Sliders.ESPOffsetZ.Set(z, true)
+    end
+
+    SetSettingsStatus("Profile applied: " .. tostring(profile.name))
+end
+
+local function CreateProfileApplyButton(parent, profile)
+    local button = Instance.new("TextButton")
+    button.Name = "Apply"
+    button.Size = UDim2.new(0, 68, 0, 24)
+    button.Position = UDim2.new(1, -74, 0, 9)
+    button.Text = "APPLY"
+    button.TextColor3 = Config.TextColor
+    button.Font = Enum.Font.GothamMedium
+    button.TextSize = 10
+    button.BackgroundColor3 = Config.DarkBg
+    button.AutoButtonColor = false
+    button.ZIndex = 5
+    button.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 5)
+    corner.Parent = button
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Config.BorderColor
+    stroke.Thickness = 1
+    stroke.Parent = button
+
+    AddProfileConnection(
+        button.MouseButton1Click:Connect(function()
+            ApplyESPProfile(profile)
+        end)
+    )
+
+    return button
+end
+
+local function RefreshProfileList()
+    if not ProfileList then
+        return
+    end
+
+    DisconnectProfileConnections()
+
+    for _, child in ipairs(ProfileList:GetChildren()) do
+        if not child:IsA("UIListLayout")
+            and not child:IsA("UIPadding")
+        then
+            child:Destroy()
+        end
+    end
+
+    for index, profile in ipairs(ESPProfiles) do
+        local item = Instance.new("Frame")
+        item.Name = "Profile_" .. tostring(index)
+        item.Size = UDim2.new(1, -4, 0, 58)
+        item.BackgroundColor3 = Config.DarkBg
+        item.BorderSizePixel = 0
+        item.Parent = ProfileList
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 5)
+        corner.Parent = item
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Config.BorderColor
+        stroke.Thickness = 1
+        stroke.Parent = item
+
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.Size = UDim2.new(1, -86, 0, 19)
+        nameLabel.Position = UDim2.new(0, 8, 0, 5)
+        nameLabel.Text = tostring(profile.name)
+        nameLabel.TextColor3 = Config.TextColor
+        nameLabel.Font = Enum.Font.GothamBold
+        nameLabel.TextSize = 11
+        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        nameLabel.ZIndex = 4
+        nameLabel.Parent = item
+
+        local offsetLabel = Instance.new("TextLabel")
+        offsetLabel.Size = UDim2.new(1, -86, 0, 16)
+        offsetLabel.Position = UDim2.new(0, 8, 0, 25)
+        offsetLabel.Text =
+            "X: "
+            .. tostring(profile.x)
+            .. "    Y: "
+            .. tostring(profile.y)
+            .. "    Z: "
+            .. tostring(profile.z or 0)
+        offsetLabel.TextColor3 = Config.SubTextColor
+        offsetLabel.Font = Enum.Font.Gotham
+        offsetLabel.TextSize = 10
+        offsetLabel.TextXAlignment = Enum.TextXAlignment.Left
+        offsetLabel.BackgroundTransparency = 1
+        offsetLabel.ZIndex = 4
+        offsetLabel.Parent = item
+
+        local metadataLabel = Instance.new("TextLabel")
+        metadataLabel.Size = UDim2.new(1, -86, 0, 13)
+        metadataLabel.Position = UDim2.new(0, 8, 0, 41)
+        metadataLabel.Text =
+            tostring(profile.gameName or "Unknown")
+            .. " | PlaceId: "
+            .. tostring(profile.placeId or 0)
+        metadataLabel.TextColor3 = Config.SubTextColor
+        metadataLabel.Font = Enum.Font.Gotham
+        metadataLabel.TextSize = 9
+        metadataLabel.TextXAlignment = Enum.TextXAlignment.Left
+        metadataLabel.BackgroundTransparency = 1
+        metadataLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        metadataLabel.ZIndex = 4
+        metadataLabel.Parent = item
+
+        CreateProfileApplyButton(item, profile)
+    end
+
+    ProfileList.CanvasSize =
+        UDim2.new(
+            0,
+            0,
+            0,
+            #ESPProfiles * 64 + 4
+        )
+end
+
+local function DisconnectProfilePopupConnections()
+    for _, conn in ipairs(ProfilePopupConnections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+
+    table.clear(ProfilePopupConnections)
+end
+
+local function DestroyProfilePopup(popup)
+    DisconnectProfilePopupConnections()
+
+    if not popup then
+        popup = MainWindow:FindFirstChild("ESPProfileConfirmPopup")
+    end
+
+    if popup and popup.Parent then
+        popup:Destroy()
+    end
+end
+
+local function OpenProfileConfirmPopup(rawName)
+    local profileName = TrimString(rawName)
+
+    if profileName == "" then
+        SetSettingsStatus("Enter a profile name first")
+        return
+    end
+
+    DestroyProfilePopup(nil)
+
+    local popup = Instance.new("Frame")
+    popup.Name = "ESPProfileConfirmPopup"
+    popup.Size = UDim2.new(0, 300, 0, 188)
+    popup.AnchorPoint = Vector2.new(0.5, 0.5)
+    popup.Position = UDim2.new(0.5, 0, 0.5, 0)
+    popup.BackgroundColor3 = Config.CardBg
+    popup.BorderSizePixel = 0
+    popup.ZIndex = 200
+    popup.Parent = MainWindow
+
+    local pCorner = Instance.new("UICorner")
+    pCorner.CornerRadius = UDim.new(0, 8)
+    pCorner.Parent = popup
+
+    local pStroke = Instance.new("UIStroke")
+    pStroke.Color = Config.BorderColor
+    pStroke.Thickness = 1
+    pStroke.Parent = popup
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -20, 0, 24)
+    title.Position = UDim2.new(0, 10, 0, 10)
+    title.Text = "CONFIRM PROFILE"
+    title.TextColor3 = Config.TextColor
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.BackgroundTransparency = 1
+    title.ZIndex = 201
+    title.Parent = popup
+
+    local profileLabel = Instance.new("TextLabel")
+    profileLabel.Size = UDim2.new(1, -20, 0, 20)
+    profileLabel.Position = UDim2.new(0, 10, 0, 38)
+    profileLabel.Text = "Profile Name: " .. profileName
+    profileLabel.TextColor3 = Config.SubTextColor
+    profileLabel.Font = Enum.Font.Gotham
+    profileLabel.TextSize = 11
+    profileLabel.TextXAlignment = Enum.TextXAlignment.Left
+    profileLabel.BackgroundTransparency = 1
+    profileLabel.ZIndex = 201
+    profileLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    profileLabel.Parent = popup
+
+    local offsetLabel = Instance.new("TextLabel")
+    offsetLabel.Size = UDim2.new(1, -20, 0, 38)
+    offsetLabel.Position = UDim2.new(0, 10, 0, 64)
+    offsetLabel.Text =
+        "Save current ESP offset:\n"
+        .. "X: "
+        .. tostring(Config.ESPOffsetX)
+        .. "    Y: "
+        .. tostring(Config.ESPOffsetY)
+        .. "    Z: "
+        .. tostring(Config.ESPOffsetZ)
+    offsetLabel.TextColor3 = Config.TextColor
+    offsetLabel.Font = Enum.Font.GothamMedium
+    offsetLabel.TextSize = 11
+    offsetLabel.TextXAlignment = Enum.TextXAlignment.Left
+    offsetLabel.BackgroundTransparency = 1
+    offsetLabel.ZIndex = 201
+    offsetLabel.Parent = popup
+
+    local okButton = Instance.new("TextButton")
+    okButton.Size = UDim2.new(0, 120, 0, 30)
+    okButton.Position = UDim2.new(0, 18, 1, -42)
+    okButton.Text = "OK"
+    okButton.TextColor3 = Config.TextColor
+    okButton.Font = Enum.Font.GothamMedium
+    okButton.TextSize = 12
+    okButton.BackgroundColor3 = Config.DarkBg
+    okButton.AutoButtonColor = false
+    okButton.ZIndex = 202
+    okButton.Parent = popup
+
+    local okCorner = Instance.new("UICorner")
+    okCorner.CornerRadius = UDim.new(0, 5)
+    okCorner.Parent = okButton
+
+    local cancelButton = Instance.new("TextButton")
+    cancelButton.Size = UDim2.new(0, 120, 0, 30)
+    cancelButton.Position = UDim2.new(1, -138, 1, -42)
+    cancelButton.Text = "CANCEL"
+    cancelButton.TextColor3 = Config.TextColor
+    cancelButton.Font = Enum.Font.GothamMedium
+    cancelButton.TextSize = 12
+    cancelButton.BackgroundColor3 = Config.DarkBg
+    cancelButton.AutoButtonColor = false
+    cancelButton.ZIndex = 202
+    cancelButton.Parent = popup
+
+    local cancelCorner = Instance.new("UICorner")
+    cancelCorner.CornerRadius = UDim.new(0, 5)
+    cancelCorner.Parent = cancelButton
+
+    table.insert(
+        ProfilePopupConnections,
+        okButton.MouseButton1Click:Connect(function()
+            local existingProfile = FindProfileByName(profileName)
+
+            if existingProfile then
+                existingProfile.x = math.clamp(
+                    tonumber(Config.ESPOffsetX) or 0,
+                    -200,
+                    200
+                )
+                existingProfile.y = math.clamp(
+                    tonumber(Config.ESPOffsetY) or 0,
+                    -200,
+                    200
+                )
+                existingProfile.z = math.clamp(
+                    tonumber(Config.ESPOffsetZ) or 0,
+                    -200,
+                    200
+                )
+                existingProfile.placeId = CurrentPlaceId
+                existingProfile.gameName = CurrentGameName
+
+                local persisted = SaveESPProfiles()
+                RefreshProfileList()
+
+                if persisted then
+                    SetSettingsStatus("Profile updated: " .. profileName)
+                end
+            else
+                local newProfile = {
+                    name = profileName,
+                    x = math.clamp(
+                        tonumber(Config.ESPOffsetX) or 0,
+                        -200,
+                        200
+                    ),
+                    y = math.clamp(
+                        tonumber(Config.ESPOffsetY) or 0,
+                        -200,
+                        200
+                    ),
+                    z = math.clamp(
+                        tonumber(Config.ESPOffsetZ) or 0,
+                        -200,
+                        200
+                    ),
+                    placeId = CurrentPlaceId,
+                    gameName = CurrentGameName
+                }
+
+                table.insert(ESPProfiles, newProfile)
+                local persisted = SaveESPProfiles()
+                RefreshProfileList()
+
+                if persisted then
+                    SetSettingsStatus("Profile added: " .. profileName)
+                end
+            end
+
+            ProfileNameInput.Text = ""
+            DestroyProfilePopup(popup)
+        end)
+    )
+
+    table.insert(
+        ProfilePopupConnections,
+        cancelButton.MouseButton1Click:Connect(function()
+            DestroyProfilePopup(popup)
+        end)
+    )
+end
+
+local ConfigSaveLoadSec =
+    UI:CreateSection(
+        SettingsPage,
+        "CONFIG SAVE / LOAD"
+    )
+
+UI:CreateButton(
+    ConfigSaveLoadSec,
+    "SAVE SETTINGS",
+    function()
+        SaveSettings()
+    end
+)
+
+UI:CreateButton(
+    ConfigSaveLoadSec,
+    "LOAD SETTINGS",
+    function()
+        LoadSettings()
+    end
+)
+
+SettingsStatusLabel =
+    UI:CreateLabel(
+        ConfigSaveLoadSec,
+        "Ready"
+    )
+
+local ESPOffsetSec =
+    UI:CreateSection(
+        SettingsPage,
+        "ESP OFFSET"
+    )
+
+UIRefs.Sliders.ESPOffsetX =
+    UI:CreateSlider(
+        ESPOffsetSec,
+        {
+            Text = "ESP X",
+            Min = -200,
+            Max = 200,
+            Default = Config.ESPOffsetX,
+            Increment = 1,
+            EditableValue = true,
+            AllowTextInputBeyondRange = false,
+            Callback = function(value)
+                if IsFiniteNumber(value) then
+                    Config.ESPOffsetX =
+                        math.clamp(value, -200, 200)
+                end
+            end
+        }
+    )
+
+UIRefs.Sliders.ESPOffsetY =
+    UI:CreateSlider(
+        ESPOffsetSec,
+        {
+            Text = "ESP Y",
+            Min = -200,
+            Max = 200,
+            Default = Config.ESPOffsetY,
+            Increment = 1,
+            EditableValue = true,
+            AllowTextInputBeyondRange = false,
+            Callback = function(value)
+                if IsFiniteNumber(value) then
+                    Config.ESPOffsetY =
+                        math.clamp(value, -200, 200)
+                end
+            end
+        }
+    )
+
+UIRefs.Sliders.ESPOffsetZ =
+    UI:CreateSlider(
+        ESPOffsetSec,
+        {
+            Text = "ESP Z",
+            Min = -200,
+            Max = 200,
+            Default = Config.ESPOffsetZ,
+            Increment = 1,
+            EditableValue = true,
+            AllowTextInputBeyondRange = false,
+            Callback = function(value)
+                if IsFiniteNumber(value) then
+                    Config.ESPOffsetZ =
+                        math.clamp(value, -200, 200)
+                end
+            end
+        }
+    )
+
+local ESPProfileSec =
+    UI:CreateSection(
+        SettingsPage,
+        "ESP OFFSET PROFILES"
+    )
+
+local CurrentGameLabel =
+    UI:CreateLabel(
+        ESPProfileSec,
+        "Current Game: "
+            .. tostring(CurrentGameName)
+            .. "\nPlaceId: "
+            .. tostring(CurrentPlaceId)
+    )
+
+ProfileNameInput =
+    UI:CreateTextbox(
+        ESPProfileSec,
+        {
+            Text = "Profile Name",
+            Placeholder = "Nhập tên game/profile...",
+            Default = "",
+            Callback = function()
+                -- Confirmation is handled by the + button below.
+            end
+        }
+    )
+
+UI:CreateButton(
+    ESPProfileSec,
+    "[ + ]",
+    function()
+        OpenProfileConfirmPopup(ProfileNameInput.Text)
+    end
+)
+
+ProfileList =
+    Instance.new("ScrollingFrame")
+
+ProfileList.Name = "ESPProfileList"
+ProfileList.Size = UDim2.new(1, 0, 0, 190)
+ProfileList.BackgroundTransparency = 1
+ProfileList.BorderSizePixel = 0
+ProfileList.ScrollBarThickness = 3
+ProfileList.ScrollBarImageColor3 = Config.SubTextColor
+ProfileList.Parent = ESPProfileSec
+
+local ProfileListLayout =
+    Instance.new("UIListLayout")
+
+ProfileListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ProfileListLayout.Padding = UDim.new(0, 6)
+ProfileListLayout.Parent = ProfileList
+
+local ProfileListPadding =
+    Instance.new("UIPadding")
+
+ProfileListPadding.PaddingTop = UDim.new(0, 2)
+ProfileListPadding.PaddingBottom = UDim.new(0, 2)
+ProfileListPadding.Parent = ProfileList
+
+LoadESPProfiles()
+RefreshProfileList()
+
+if not FileAPI.Available then
+    SetSettingsStatus(
+        "Filesystem persistence unavailable; session-only save"
+    )
+end
+
+-- =========================================================
+-- RENDER PIPELINE
+-- Keep Player/Teleport at the existing Character stage.
+--
+-- Camera pipeline:
+--   game/weapon camera updates
+--          ↓
+--   AIM at Last - 1
+--          ↓
+--   ESP at Last
+--
+-- This makes ESP see the final same-frame camera after AIM,
+-- while AIM itself runs after the normal/custom camera changes
+-- made earlier in the frame.
+-- =========================================================
+
+pcall(function()
+    RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
+    RunService:UnbindFromRenderStep("HoodRivalsAimRender")
+    RunService:UnbindFromRenderStep("HoodRivalsESPRender")
+end)
+
+-- Existing Player + Teleport runtime remains isolated from AIM/ESP timing.
 RunService:BindToRenderStep(
     "HoodRivalsUnifiedRender",
-    Enum.RenderPriority.Last.Value + 100,
+    Enum.RenderPriority.Character.Value + 1,
     function(renderDt)
-        UpdateAim()
-        UpdateFOVCircle()
-        updateESP()
-        UpdateESPHighlight()
         UpdatePlayer(renderDt)
         UpdateTeleport()
+    end
+)
+
+-- AIM runs late enough to observe the final weapon/camera state,
+-- and one stage before ESP so ESP can project from the post-AIM camera.
+RunService:BindToRenderStep(
+    "HoodRivalsAimRender",
+    Enum.RenderPriority.Last.Value - 1,
+    function()
+        Telekill.Update()
+        UpdateAim()
+        UpdateFOVCircle()
+    end
+)
+
+-- ESP is the final projection stage and reads one CurrentCamera snapshot
+-- for the whole frame.
+RunService:BindToRenderStep(
+    "HoodRivalsESPRender",
+    Enum.RenderPriority.Last.Value,
+    function()
+        local camera = Workspace.CurrentCamera
+        updateESP(camera)
+        UpdateESPHighlight()
     end
 )
 
@@ -3152,6 +5081,10 @@ local function BindPlayerLifecycle(target)
             if CurrentAimTarget == target then
                 CurrentAimTarget = nil
             end
+
+            if Telekill.CurrentTarget == target then
+                Telekill.CurrentTarget = nil
+            end
         end)
     )
 
@@ -3162,6 +5095,10 @@ local function BindPlayerLifecycle(target)
 
             if CurrentAimTarget == target then
                 CurrentAimTarget = nil
+            end
+
+            if Telekill.CurrentTarget == target then
+                Telekill.CurrentTarget = nil
             end
         end)
     )
@@ -3193,6 +5130,10 @@ AddConnection(
 
         if CurrentAimTarget == target then
             CurrentAimTarget = nil
+        end
+
+        if Telekill.CurrentTarget == target then
+            Telekill.CurrentTarget = nil
         end
 
         RefreshTeleportPlayerList()
@@ -3240,9 +5181,12 @@ CloseBtn.MouseButton1Click:Connect(function()
 
     pcall(function()
         RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
+        RunService:UnbindFromRenderStep("HoodRivalsAimRender")
+        RunService:UnbindFromRenderStep("HoodRivalsESPRender")
     end)
 
     FOVCircle.Visible = false
+    Telekill.CurrentTarget = nil
 
     for target in pairs(espData) do
         destroyTargetESP(target)
@@ -3260,23 +5204,45 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         elseif GUIState.CurrentState == "Minimized" or GUIState.CurrentState == "Closed" then
             ScreenGui.Enabled = true
 
-            -- Rebind the single unified render callback safely.
+            -- Rebind the render pipeline safely.
             pcall(function()
                 RunService:UnbindFromRenderStep(
                     "HoodRivalsUnifiedRender"
+                )
+                RunService:UnbindFromRenderStep(
+                    "HoodRivalsAimRender"
+                )
+                RunService:UnbindFromRenderStep(
+                    "HoodRivalsESPRender"
                 )
             end)
 
             RunService:BindToRenderStep(
                 "HoodRivalsUnifiedRender",
-                Enum.RenderPriority.Last.Value + 100,
+                Enum.RenderPriority.Character.Value + 1,
                 function(renderDt)
-                    UpdateAim()
-                    UpdateFOVCircle()
-                    updateESP()
-                    UpdateESPHighlight()
                     UpdatePlayer(renderDt)
                     UpdateTeleport()
+                end
+            )
+
+            RunService:BindToRenderStep(
+                "HoodRivalsAimRender",
+                Enum.RenderPriority.Last.Value - 1,
+                function()
+                    Telekill.Update()
+                    UpdateAim()
+                    UpdateFOVCircle()
+                end
+            )
+
+            RunService:BindToRenderStep(
+                "HoodRivalsESPRender",
+                Enum.RenderPriority.Last.Value,
+                function()
+                    local camera = Workspace.CurrentCamera
+                    updateESP(camera)
+                    UpdateESPHighlight()
                 end
             )
 
@@ -3293,15 +5259,32 @@ local function CleanupFramework()
         RunService:UnbindFromRenderStep(
             "HoodRivalsUnifiedRender"
         )
+        RunService:UnbindFromRenderStep(
+            "HoodRivalsAimRender"
+        )
+        RunService:UnbindFromRenderStep(
+            "HoodRivalsESPRender"
+        )
     end)
 
     FOVCircle.Visible = false
+    Telekill.CurrentTarget = nil
 
     for target in pairs(espData) do
         destroyTargetESP(target)
     end
 
     destroyAllESPHighlights()
+
+    DisconnectProfileConnections()
+    DisconnectProfilePopupConnections()
+
+    pcall(function()
+        local popup = MainWindow:FindFirstChild("ESPProfileConfirmPopup")
+        if popup then
+            popup:Destroy()
+        end
+    end)
 
     local teleportTargetsToCleanup = {}
 
@@ -3328,6 +5311,16 @@ _G.MyGUIFramework = {
     ScreenGui = ScreenGui,
     MainWindow = MainWindow,
     Config = Config,
+
+    Settings = {
+        Page = SettingsPage,
+        Save = SaveSettings,
+        Load = LoadSettings,
+        ApplyESPProfile = ApplyESPProfile,
+        GetProfiles = function()
+            return ESPProfiles
+        end
+    },
 
     Player = {
         Cleanup = CleanupPlayerRuntime,
