@@ -1,0 +1,4 @@
+Anti-Report: Tự động đổi tên hiển thị (Display Name) hoặc làm mờ thông tin cá nhân trên màn hình để người khác không thể chụp ảnh tố cáo.
+  Server Hop / Rejoin: Nút bấm chuyển sang server khác ngay lập tức hoặc vào lại chính server hiện tại.
+    Anti-AFK: Tự động thực hiện thao tác nhỏ định kỳ để không bị hệ thống văng ra do đứng yên quá lâu.
+      
