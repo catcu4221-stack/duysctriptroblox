@@ -97,6 +97,8 @@ local Config = {
     ShowName = false,
     ShowTracer = false,
     ShowSkeleton = false,
+    ShowBox = false,
+    ShowNPC = false,
     ShowHealth = false,
     ShowDistance = false,
     MaxDistance = 2000,
@@ -119,6 +121,7 @@ local Config = {
     AimPart = "Head",
     Smoothness = 0.20,
     AimMaxDistance = 2000,
+    AimNPC = false,
 
     -- =========================================================
     -- TELEKILL CONFIGURATION
@@ -163,6 +166,22 @@ local UIRefs = {
     Toggles = {},
     Sliders = {},
     Textboxes = {}
+}
+
+-- NPC integration namespace.
+-- The existing AIM/ESP engines are extended through this single state table;
+-- no second AIM, ESP, FOV, or render engine is created.
+local NPCSystem = {
+    ValidNPCs = {},
+    NPCPredictionTime = 0.02,
+    Initialized = false,
+
+    -- One shared classification-color source for the existing ESP renderer.
+    ESPColors = {
+        Enemy = Color3.fromRGB(255, 0, 0),
+        Teammate = Color3.fromRGB(0, 255, 0),
+        NPC = Color3.fromRGB(0, 170, 255)
+    }
 }
 
 -- ==========================================
@@ -1726,6 +1745,14 @@ UIRefs.Toggles.IgnoreVisibility = UI:CreateToggle(AimMainSec, {
     end
 })
 
+UIRefs.Toggles.AimNPC = UI:CreateToggle(AimMainSec, {
+    Text = "AIM NPC",
+    Default = Config.AimNPC,
+    Callback = function(value)
+        Config.AimNPC = value
+    end
+})
+
 local AimTargetSec = UI:CreateSection(AimPage, "AIM Target")
 
 local AimPartButton
@@ -1940,6 +1967,17 @@ UIRefs.Toggles.ShowName = UI:CreateToggle(ESPVisualsSec, {
     end
 })
 
+UIRefs.Toggles.ShowBox = UI:CreateToggle(ESPVisualsSec, {
+    Text = "ESP Box",
+    Default = Config.ShowBox,
+    Callback = function(v)
+        Config.ShowBox = v
+        if not v then
+            NPCSystem.HideESPBoxes()
+        end
+    end
+})
+
 UIRefs.Toggles.ShowTracer = UI:CreateToggle(ESPVisualsSec, {
     Text = "ESP Tracer",
     Default = Config.ShowTracer,
@@ -2005,6 +2043,26 @@ ESPDistanceInput = UI:CreateTextbox(ESPSettingsSec, {
 UIRefs.Textboxes.MaxDistance = ESPDistanceInput
 
 -- =========================================================
+-- TAB: NPC
+-- Uses the existing PageManager/UI component system only.
+-- =========================================================
+PageManager:AddPage("NPC")
+
+UIRefs.Toggles.ShowNPC = UI:CreateToggle(
+    UI:CreateSection(GUIState.Pages["NPC"], "NPC"),
+    {
+        Text = "ESP NPC",
+        Default = Config.ShowNPC,
+        Callback = function(v)
+            Config.ShowNPC = v
+            if not v then
+                NPCSystem.CleanupNPCESP()
+            end
+        end
+    }
+)
+
+-- =========================================================
 -- AIM CORE
 --
 -- MENU -> CONFIG -> TARGET VALIDATION -> TARGET SELECTION
@@ -2022,8 +2080,314 @@ local Telekill = {
     CurrentTarget = nil
 }
 
+-- =========================================================
+-- NPC TARGET REGISTRY / DETECTION
+-- =========================================================
+-- NPCs are stored as Model -> state entries.  No per-NPC render loop is used.
+-- One optional Died connection per tracked NPC is used only for immediate
+-- registry cleanup; all aiming/ESP updates still run through the existing
+-- shared render stages.
+function NPCSystem.IsNPCModel(target)
+    return
+        typeof(target) == "Instance"
+        and target:IsA("Model")
+        and target:IsDescendantOf(Workspace)
+        and Players:GetPlayerFromCharacter(target) == nil
+end
+
+function NPCSystem.GetHumanoid(model)
+    if not model or not model:IsA("Model") then
+        return nil
+    end
+
+    return model:FindFirstChildOfClass("Humanoid")
+end
+
+function NPCSystem.GetTargetPart(model)
+    if not model or not model:IsA("Model") then
+        return nil
+    end
+
+    return model:FindFirstChild("Head")
+        or model:FindFirstChild("HumanoidRootPart")
+end
+
+function NPCSystem.IsValidNPC(model)
+    if not NPCSystem.IsNPCModel(model) then
+        return false
+    end
+
+    local humanoid = NPCSystem.GetHumanoid(model)
+    if not humanoid or humanoid.Health <= 0 then
+        return false
+    end
+
+    return NPCSystem.GetTargetPart(model) ~= nil
+end
+
+function NPCSystem.Unregister(model)
+    local state = NPCSystem.ValidNPCs[model]
+
+    if state and state.DiedConnection then
+        pcall(function()
+            state.DiedConnection:Disconnect()
+        end)
+    end
+
+    NPCSystem.ValidNPCs[model] = nil
+end
+
+function NPCSystem.Register(model)
+    if not NPCSystem.IsValidNPC(model) then
+        NPCSystem.Unregister(model)
+        return false
+    end
+
+    if NPCSystem.ValidNPCs[model] then
+        return true
+    end
+
+    local humanoid = NPCSystem.GetHumanoid(model)
+    if not humanoid then
+        return false
+    end
+
+    local diedConnection
+    diedConnection = humanoid.Died:Connect(function()
+        NPCSystem.Unregister(model)
+    end)
+
+    NPCSystem.ValidNPCs[model] = {
+        Humanoid = humanoid,
+        DiedConnection = diedConnection
+    }
+
+    return true
+end
+
+function NPCSystem.RegisterCandidate(instance)
+    if not instance or typeof(instance) ~= "Instance" then
+        return
+    end
+
+    local model = nil
+
+    if instance:IsA("Model") then
+        model = instance
+    else
+        model = instance:FindFirstAncestorOfClass("Model")
+    end
+
+    if model then
+        NPCSystem.Register(model)
+    end
+end
+
+function NPCSystem.Refresh()
+    local stale = {}
+
+    for model in pairs(NPCSystem.ValidNPCs) do
+        if not NPCSystem.IsValidNPC(model) then
+            table.insert(stale, model)
+        end
+    end
+
+    for _, model in ipairs(stale) do
+        NPCSystem.Unregister(model)
+    end
+
+    -- One initial/event-driven scan.  It is never run every frame.
+    for _, instance in ipairs(Workspace:GetDescendants()) do
+        if instance:IsA("Model") and NPCSystem.IsValidNPC(instance) then
+            NPCSystem.Register(instance)
+        end
+    end
+end
+
+function NPCSystem.Initialize()
+    if NPCSystem.Initialized then
+        return
+    end
+
+    NPCSystem.Initialized = true
+
+    AddConnection(
+        Workspace.DescendantAdded:Connect(function(descendant)
+            NPCSystem.RegisterCandidate(descendant)
+        end)
+    )
+
+    AddConnection(
+        Workspace.DescendantRemoving:Connect(function(descendant)
+            if typeof(descendant) ~= "Instance" then
+                return
+            end
+
+            if descendant:IsA("Model") and NPCSystem.ValidNPCs[descendant] then
+                NPCSystem.Unregister(descendant)
+                return
+            end
+
+            local model = descendant:FindFirstAncestorOfClass("Model")
+            if
+                model
+                and NPCSystem.ValidNPCs[model]
+                and not NPCSystem.IsValidNPC(model)
+            then
+                NPCSystem.Unregister(model)
+            end
+        end)
+    )
+
+    -- Keep GUI initialization ahead of the workspace-wide initial scan.
+    task.defer(function()
+        pcall(function()
+            NPCSystem.Refresh()
+        end)
+    end)
+end
+
+function NPCSystem.IsPlayer(target)
+    return
+        typeof(target) == "Instance"
+        and target:IsA("Player")
+end
+
+function NPCSystem.GetCharacter(target)
+    if NPCSystem.IsNPCModel(target) then
+        return target
+    end
+
+    if NPCSystem.IsPlayer(target) then
+        return target.Character
+    end
+
+    return nil
+end
+
+function NPCSystem.GetPredictedPosition(model, targetPart)
+    if
+        not model
+        or not model:IsA("Model")
+        or not targetPart
+        or not targetPart.Parent
+    then
+        return nil
+    end
+
+    local root = model:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return targetPart.Position
+    end
+
+    -- Preserve the supplied NPC source logic: root velocity prediction +
+    -- the current target-part offset from the root.
+    local velocity = root.Velocity
+    local predictionTime = NPCSystem.NPCPredictionTime
+    local predictedRoot = root.Position + velocity * predictionTime
+    local partOffset = targetPart.Position - root.Position
+
+    return predictedRoot + partOffset
+end
+
+function NPCSystem.GetTargetWorldPosition(target, targetPart)
+    if NPCSystem.IsNPCModel(target) then
+        return
+            NPCSystem.GetPredictedPosition(
+                target,
+                targetPart
+            )
+    end
+
+    return targetPart and targetPart.Position or nil
+end
+
+-- ---------------------------------------------------------
+-- Robust Player Team Classification
+-- ---------------------------------------------------------
+function NPCSystem.GetTeamToken(player)
+    if not NPCSystem.IsPlayer(player) then
+        return nil, nil
+    end
+
+    if player.Team ~= nil then
+        return "TEAM", player.Team
+    end
+
+    -- TeamColor is used only when the game actually exposes Teams and the
+    -- player is non-neutral, avoiding the common "all white = teammate" bug.
+    local hasTeams = false
+    pcall(function()
+        hasTeams = #game:GetService("Teams"):GetTeams() > 0
+    end)
+
+    if hasTeams and player.Neutral == false and player.TeamColor ~= nil then
+        return "TEAMCOLOR", player.TeamColor
+    end
+
+    -- Conservative fallback for games that expose custom team/faction state.
+    local attributeNames = {
+        "Team",
+        "TeamName",
+        "Faction"
+    }
+
+    for _, name in ipairs(attributeNames) do
+        local value = player:GetAttribute(name)
+        if value ~= nil then
+            return "ATTRIBUTE:" .. name, tostring(value)
+        end
+    end
+
+    local character = player.Character
+    if character then
+        for _, name in ipairs(attributeNames) do
+            local valueObject = character:FindFirstChild(name)
+            if valueObject and valueObject:IsA("StringValue") then
+                return
+                    "CHARACTER:" .. name,
+                    valueObject.Value
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+function NPCSystem.ClassifyPlayer(player)
+    if not NPCSystem.IsPlayer(player) or player == LocalPlayer then
+        return "Enemy"
+    end
+
+    local localType, localValue =
+        NPCSystem.GetTeamToken(LocalPlayer)
+
+    local targetType, targetValue =
+        NPCSystem.GetTeamToken(player)
+
+    -- Teammate is only asserted when BOTH sides expose comparable team data.
+    -- Unknown/no-team games therefore remain enemy-eligible instead of
+    -- incorrectly classifying everyone as a teammate.
+    if
+        localType
+        and targetType
+        and localType == targetType
+    then
+        if localValue == targetValue then
+            return "Teammate"
+        end
+
+        return "Enemy"
+    end
+
+    return "Enemy"
+end
+
+-- ---------------------------------------------------------
+-- Generic Aim-part helpers
+-- ---------------------------------------------------------
 local function GetAimPart(target)
-    local character = target and target.Character
+    local character = NPCSystem.GetCharacter(target)
     if not character then
         return nil
     end
@@ -2039,10 +2403,11 @@ local function GetAimPart(target)
     return character:FindFirstChild("UpperTorso")
         or character:FindFirstChild("Torso")
         or character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("Head")
 end
 
 local function GetAimRoot(target)
-    local character = target and target.Character
+    local character = NPCSystem.GetCharacter(target)
     if not character then
         return nil
     end
@@ -2055,7 +2420,7 @@ local function GetAimRoot(target)
 end
 
 local function IsAliveAimTarget(target)
-    local character = target and target.Character
+    local character = NPCSystem.GetCharacter(target)
     local humanoid =
         character and character:FindFirstChildOfClass("Humanoid")
 
@@ -2063,23 +2428,20 @@ local function IsAliveAimTarget(target)
 end
 
 local function PassesAimTeamCheck(target)
+    -- Team Check is strictly a PLAYER rule.  NPCs never become teammates
+    -- because they are Models and do not expose Player.Team.
+    if NPCSystem.IsNPCModel(target) then
+        return true
+    end
+
     if not Config.TeamCheck then
         return true
     end
 
-    -- In games without Roblox Teams, Team may be nil for both players.
-    -- Do not reject every target just because both Team values are nil.
-    local localTeam = LocalPlayer.Team
-    local targetTeam = target.Team
-
-    if localTeam and targetTeam and localTeam == targetTeam then
-        return false
-    end
-
-    return true
+    return NPCSystem.ClassifyPlayer(target) ~= "Teammate"
 end
 
-local function PassesVisibility(targetPart)
+local function PassesVisibility(targetPart, worldPosition)
     if Config.IgnoreVisibility then
         return true
     end
@@ -2094,7 +2456,10 @@ local function PassesVisibility(targetPart)
     end
 
     local origin = camera.CFrame.Position
-    local direction = targetPart.Position - origin
+    local targetPosition =
+        worldPosition
+        or targetPart.Position
+    local direction = targetPosition - origin
 
     if direction.Magnitude <= 0 then
         return true
@@ -2147,11 +2512,17 @@ local function GetAimWorldDistance(targetRoot)
     ).Magnitude
 end
 
-local function GetScreenDistance(targetPart, camera)
+local function GetScreenDistance(targetPart, camera, worldPosition)
+    local position =
+        worldPosition
+        or (targetPart and targetPart.Position)
+
+    if not position then
+        return math.huge, false, nil
+    end
+
     local screenPosition, onScreen =
-        camera:WorldToViewportPoint(
-            targetPart.Position
-        )
+        camera:WorldToViewportPoint(position)
 
     if screenPosition.Z <= 0 then
         return math.huge, false, screenPosition
@@ -2174,6 +2545,8 @@ local function GetScreenDistance(targetPart, camera)
 end
 
 -- Single validation function for AIM.
+-- It now accepts both Player and NPC Model targets while preserving the same
+-- validation chain and existing player behavior.
 local function IsValidTarget(target)
     if not Config.AimEnabled then
         return false
@@ -2183,7 +2556,18 @@ local function IsValidTarget(target)
         return false
     end
 
-    if not target:IsDescendantOf(Players) then
+    local isPlayer = NPCSystem.IsPlayer(target)
+    local isNPC = NPCSystem.IsNPCModel(target)
+
+    if not isPlayer and not isNPC then
+        return false
+    end
+
+    if isPlayer and not target:IsDescendantOf(Players) then
+        return false
+    end
+
+    if isNPC and not Config.AimNPC then
         return false
     end
 
@@ -2210,7 +2594,18 @@ local function IsValidTarget(target)
         return false
     end
 
-    if not PassesVisibility(targetPart) then
+    local targetWorldPosition =
+        NPCSystem.GetTargetWorldPosition(
+            target,
+            targetPart
+        )
+
+    if
+        not PassesVisibility(
+            targetPart,
+            targetWorldPosition
+        )
+    then
         return false
     end
 
@@ -2220,7 +2615,11 @@ local function IsValidTarget(target)
     end
 
     local screenDistance, onScreen =
-        GetScreenDistance(targetPart, camera)
+        GetScreenDistance(
+            targetPart,
+            camera,
+            targetWorldPosition
+        )
 
     if screenDistance == math.huge then
         return false
@@ -2259,7 +2658,8 @@ local function GetBestTarget()
                 local screenDistance, onScreen =
                     GetScreenDistance(
                         targetPart,
-                        camera
+                        camera,
+                        targetPart.Position
                     )
 
                 if screenDistance < math.huge then
@@ -2268,6 +2668,40 @@ local function GetBestTarget()
                             bestScreenDistance = screenDistance
                             bestTarget = target
                             bestAimPart = targetPart
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- NPC targets are evaluated by the SAME target-selection pipeline.
+    if Config.AimNPC then
+        for npc in pairs(NPCSystem.ValidNPCs) do
+            if IsValidTarget(npc) then
+                local targetPart = GetAimPart(npc)
+
+                if targetPart then
+                    local predictedPosition =
+                        NPCSystem.GetTargetWorldPosition(
+                            npc,
+                            targetPart
+                        )
+
+                    local screenDistance, onScreen =
+                        GetScreenDistance(
+                            targetPart,
+                            camera,
+                            predictedPosition
+                        )
+
+                    if screenDistance < math.huge then
+                        if (not Config.UseFOV) or onScreen then
+                            if screenDistance < bestScreenDistance then
+                                bestScreenDistance = screenDistance
+                                bestTarget = npc
+                                bestAimPart = targetPart
+                            end
                         end
                     end
                 end
@@ -2327,7 +2761,7 @@ local function IsAimAllowed()
     return false
 end
 
-local function AimAtTarget(targetPart)
+local function AimAtTarget(targetPart, targetWorldPosition)
     if not targetPart or not targetPart.Parent then
         return
     end
@@ -2337,8 +2771,11 @@ local function AimAtTarget(targetPart)
         return
     end
 
-    -- Use the CURRENT world position from the current skeleton part.
-    local targetPosition = targetPart.Position
+    -- Player targets keep the original current-part behavior.
+    -- NPC targets may supply the existing prediction result.
+    local targetPosition =
+        targetWorldPosition
+        or targetPart.Position
 
     local currentCFrame = camera.CFrame
 
@@ -2416,7 +2853,20 @@ local function UpdateAim()
     end
 
     CurrentAimTarget = target
-    AimAtTarget(currentAimPart)
+
+    local predictedPosition = nil
+    if NPCSystem.IsNPCModel(target) then
+        predictedPosition =
+            NPCSystem.GetTargetWorldPosition(
+                target,
+                currentAimPart
+            )
+    end
+
+    AimAtTarget(
+        currentAimPart,
+        predictedPosition
+    )
 end
 
 -- ---------------------------------------------------------
@@ -2732,6 +3182,28 @@ local function createScreenLine(name)
     return line
 end
 
+-- 2D screen-space rectangle used by ESP Box.
+-- It is only a GUI overlay; no Part/Highlight/physics object is created.
+function NPCSystem.CreateScreenBox()
+    local box = Instance.new("Frame")
+    box.Name = "ESPBox"
+    box.Size = UDim2.fromOffset(0, 0)
+    box.BackgroundTransparency = 1
+    box.BorderSizePixel = 0
+    box.Visible = false
+    box.ZIndex = 19
+    box.Parent = ScreenGui
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Name = "ESPBoxStroke"
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0
+    stroke.Color = Color3.fromRGB(255, 0, 0)
+    stroke.Parent = box
+
+    return box
+end
+
 local function IsFiniteESPNumber(value)
     return type(value) == "number"
         and value == value
@@ -2781,6 +3253,127 @@ local function ProjectESPWorldPosition(camera, worldPosition)
     end
 
     return Vector2.new(projected.X, projected.Y), onScreen, projected.Z
+end
+
+function NPCSystem.UpdateESPBox(box, character, camera)
+    if
+        not box
+        or not box.Parent
+        or not character
+        or not character.Parent
+        or not camera
+    then
+        if box then
+            box.Visible = false
+        end
+        return
+    end
+
+    local ok, boundsCFrame, boundsSize =
+        pcall(function()
+            return character:GetBoundingBox()
+        end)
+
+    if
+        not ok
+        or not boundsCFrame
+        or not boundsSize
+    then
+        box.Visible = false
+        return
+    end
+
+    local half = boundsSize / 2
+    local corners = {
+        Vector3.new(-half.X, -half.Y, -half.Z),
+        Vector3.new(-half.X, -half.Y,  half.Z),
+        Vector3.new(-half.X,  half.Y, -half.Z),
+        Vector3.new(-half.X,  half.Y,  half.Z),
+        Vector3.new( half.X, -half.Y, -half.Z),
+        Vector3.new( half.X, -half.Y,  half.Z),
+        Vector3.new( half.X,  half.Y, -half.Z),
+        Vector3.new( half.X,  half.Y,  half.Z)
+    }
+
+    local minX = math.huge
+    local minY = math.huge
+    local maxX = -math.huge
+    local maxY = -math.huge
+    local hasFrontPoint = false
+
+    for _, corner in ipairs(corners) do
+        local worldCorner =
+            (boundsCFrame * CFrame.new(corner)).Position
+
+        local projected, _, depth =
+            ProjectESPWorldPosition(
+                camera,
+                worldCorner
+            )
+
+        if projected and depth and depth > 0 then
+            hasFrontPoint = true
+
+            minX = math.min(minX, projected.X)
+            minY = math.min(minY, projected.Y)
+            maxX = math.max(maxX, projected.X)
+            maxY = math.max(maxY, projected.Y)
+        end
+    end
+
+    if
+        not hasFrontPoint
+        or not IsFiniteESPNumber(minX)
+        or not IsFiniteESPNumber(minY)
+        or not IsFiniteESPNumber(maxX)
+        or not IsFiniteESPNumber(maxY)
+    then
+        box.Visible = false
+        return
+    end
+
+    local viewport = camera.ViewportSize
+
+    -- Hide only when the whole projected rectangle is outside the viewport.
+    if
+        maxX < 0
+        or maxY < 0
+        or minX > viewport.X
+        or minY > viewport.Y
+    then
+        box.Visible = false
+        return
+    end
+
+    local position =
+        ApplyESPScreenOffset(
+            Vector2.new(minX, minY)
+        )
+
+    local width = math.max(maxX - minX, 1)
+    local height = math.max(maxY - minY, 1)
+
+    box.Position =
+        UDim2.fromOffset(
+            position.X,
+            position.Y
+        )
+
+    box.Size =
+        UDim2.fromOffset(
+            width,
+            height
+        )
+
+    box.Visible = true
+end
+
+function NPCSystem.HideESPBoxes()
+    for _, data in pairs(espData) do
+        if data.box then
+            data.box.Visible = false
+        end
+    end
 end
 
 local function updateScreenLine(line, from, to)
@@ -2903,9 +3496,15 @@ end
 local function createTargetESP(target)
     local data = {}
 
-    data.character = target.Character
+    data.kind =
+        NPCSystem.IsNPCModel(target)
+        and "NPC"
+        or "Player"
+
+    data.character = NPCSystem.GetCharacter(target)
     data.info = createInfo()
     data.tracer = createScreenLine("ESPTracer")
+    data.box = NPCSystem.CreateScreenBox()
     data.skeleton = {}
 
     EnsureSkeletonLines(data, data.character)
@@ -2926,6 +3525,10 @@ local function destroyTargetESP(target)
 
     if data.tracer then
         data.tracer:Destroy()
+    end
+
+    if data.box then
+        data.box:Destroy()
     end
 
     for _, skeleton in ipairs(data.skeleton or {}) do
@@ -2950,9 +3553,24 @@ local function hideTargetESP(data)
         data.tracer.Visible = false
     end
 
+    if data.box then
+        data.box.Visible = false
+    end
+
     for _, skeleton in ipairs(data.skeleton or {}) do
         if skeleton.line then
             skeleton.line.Visible = false
+        end
+    end
+end
+
+function NPCSystem.CleanupNPCESP()
+    for target, data in pairs(espData) do
+        if data and data.kind == "NPC" then
+            if data.box then
+                data.box.Visible = false
+            end
+            destroyTargetESP(target)
         end
     end
 end
@@ -2967,38 +3585,86 @@ local function updateTargetESP(target, camera)
         return
     end
 
-    -- Resolve the CURRENT target character and CURRENT parts every frame.
-    local character = target.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    local head = character and character:FindFirstChild("Head")
+    local isNPC = NPCSystem.IsNPCModel(target)
+    local isPlayer = NPCSystem.IsPlayer(target)
 
-    if not character or not humanoid or humanoid.Health <= 0 or not root then
+    if not isNPC and not isPlayer then
         destroyTargetESP(target)
         return
     end
 
-    -- Team / Enemy hoàn toàn độc lập với Aim.
-    local hasTeams = LocalPlayer.Team ~= nil and target.Team ~= nil
-    local isTeammate = hasTeams and (target.Team == LocalPlayer.Team)
-    local isEnemy = not isTeammate
+    -- Resolve the CURRENT target character and CURRENT parts every frame.
+    local character = NPCSystem.GetCharacter(target)
+    local humanoid =
+        character and
+        character:FindFirstChildOfClass("Humanoid")
+    local root =
+        character and
+        character:FindFirstChild("HumanoidRootPart")
+    local head =
+        character and
+        character:FindFirstChild("Head")
 
-    if isEnemy then
-        if not Config.ShowEnemies then
+    local displayPart = head or root
+
+    if
+        not character
+        or not humanoid
+        or humanoid.Health <= 0
+        or not displayPart
+    then
+        destroyTargetESP(target)
+        return
+    end
+
+    local classification = "NPC"
+    local targetColor = NPCSystem.ESPColors.NPC
+
+    if isNPC then
+        classification = "NPC"
+
+        if not Config.ShowNPC then
             destroyTargetESP(target)
             return
         end
-    elseif isTeammate then
-        if not Config.ShowTeammates then
-            destroyTargetESP(target)
-            return
+
+        -- NPC is always visually distinct from Player Enemy/Teammate.
+        targetColor = NPCSystem.ESPColors.NPC
+    else
+        classification =
+            NPCSystem.ClassifyPlayer(target)
+
+        if classification == "Teammate" then
+            if not Config.ShowTeammates then
+                destroyTargetESP(target)
+                return
+            end
+
+            targetColor =
+                NPCSystem.ESPColors.Teammate
+        else
+            classification = "Enemy"
+
+            if not Config.ShowEnemies then
+                destroyTargetESP(target)
+                return
+            end
+
+            targetColor =
+                NPCSystem.ESPColors.Enemy
         end
     end
 
     local data = espData[target]
 
-    -- Respawn: discard the old character-backed ESP and rebuild for the new character.
-    if data and data.character ~= character then
+    -- Respawn/rebuild: discard old character-backed ESP.
+    if
+        data
+        and (
+            data.character ~= character
+            or data.kind ~= (isNPC and "NPC" or "Player")
+        )
+    then
         destroyTargetESP(target)
         data = nil
     end
@@ -3010,57 +3676,113 @@ local function updateTargetESP(target, camera)
         EnsureSkeletonLines(data, character)
     end
 
-    -- Distance uses CURRENT root positions.
+    -- Distance uses CURRENT root/display-part positions.
     local myRoot =
         LocalPlayer.Character and
-        LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        (
+            LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            or LocalPlayer.Character.PrimaryPart
+            or LocalPlayer.Character:FindFirstChild("UpperTorso")
+            or LocalPlayer.Character:FindFirstChild("Torso")
+            or LocalPlayer.Character:FindFirstChild("Head")
+        )
 
     local distance =
-        myRoot and
-        (myRoot.Position - root.Position).Magnitude or
-        math.huge
+        myRoot
+        and displayPart
+        and (myRoot.Position - displayPart.Position).Magnitude
+        or math.huge
 
-    if distance > Config.MaxDistance or not Config.Enabled then
+    if
+        distance > Config.MaxDistance
+        or not Config.Enabled
+    then
         hideTargetESP(data)
         return
     end
 
+    -- Apply the same classification color to all 2D ESP visuals.
+    if data.tracer then
+        data.tracer.BackgroundColor3 = targetColor
+    end
+
+    if data.box then
+        local boxStroke =
+            data.box:FindFirstChild("ESPBoxStroke")
+
+        if boxStroke and boxStroke:IsA("UIStroke") then
+            boxStroke.Color = targetColor
+        end
+
+        if Config.ShowBox then
+            NPCSystem.UpdateESPBox(
+                data.box,
+                character,
+                camera
+            )
+        else
+            data.box.Visible = false
+        end
+    end
+
+    for _, skeleton in ipairs(data.skeleton or {}) do
+        if skeleton.line then
+            skeleton.line.BackgroundColor3 = targetColor
+        end
+    end
+
     -- CURRENT world positions -> the SAME camera snapshot -> projection.
-    local rootScreen, rootOnScreen, rootDepth =
-        ProjectESPWorldPosition(camera, root.Position)
+    local rootScreen, rootOnScreen, rootDepth
+    if root then
+        rootScreen, rootOnScreen, rootDepth =
+            ProjectESPWorldPosition(
+                camera,
+                root.Position
+            )
+    end
 
     local headScreen, headOnScreen, headDepth
-
     if head then
         headScreen, headOnScreen, headDepth =
-            ProjectESPWorldPosition(camera, head.Position)
+            ProjectESPWorldPosition(
+                camera,
+                head.Position
+            )
     end
+
+    local displayScreen, displayOnScreen, displayDepth =
+        ProjectESPWorldPosition(
+            camera,
+            displayPart.Position
+        )
 
     -- NAME / HEALTH / DISTANCE
     local showInfo =
-        Config.ShowName or
-        Config.ShowHealth or
-        Config.ShowDistance
+        Config.ShowName
+        or Config.ShowHealth
+        or Config.ShowDistance
 
     if
-        showInfo and
-        headScreen and
-        headOnScreen and
-        headDepth > 0
+        showInfo
+        and displayScreen
+        and displayOnScreen
+        and displayDepth > 0
     then
         local info = data.info
 
-        local infoPosition = ApplyESPScreenOffset(
-            Vector2.new(
-                headScreen.X,
-                headScreen.Y - 8
+        local infoPosition =
+            ApplyESPScreenOffset(
+                Vector2.new(
+                    displayScreen.X,
+                    displayScreen.Y - 8
+                )
             )
-        )
 
-        info.Position = UDim2.fromOffset(
-            infoPosition.X,
-            infoPosition.Y
-        )
+        info.Position =
+            UDim2.fromOffset(
+                infoPosition.X,
+                infoPosition.Y
+            )
 
         info.Visible = true
 
@@ -3070,32 +3792,45 @@ local function updateTargetESP(target, camera)
 
         if nameLabel then
             nameLabel.Visible = Config.ShowName
-            nameLabel.Text =
-                target.DisplayName ..
-                "  @" ..
-                target.Name
+
+            if isNPC then
+                -- NPCs intentionally use a stable generic label.
+                nameLabel.Text = "NPC"
+            else
+                nameLabel.Text =
+                    target.DisplayName
+                    .. "  @"
+                    .. target.Name
+            end
+
+            -- All ESP visuals use the same classification color.
+            nameLabel.TextColor3 = targetColor
         end
 
         if healthLabel then
             healthLabel.Visible = Config.ShowHealth
 
-            local currentHP = math.floor(humanoid.Health)
-            local maxHP = math.floor(humanoid.MaxHealth)
+            local currentHP =
+                math.floor(humanoid.Health)
+            local maxHP =
+                math.floor(humanoid.MaxHealth)
 
             if maxHP <= 0 then
                 maxHP = 100
             end
 
             healthLabel.Text =
-                "HP: " ..
-                currentHP ..
-                " / " ..
-                maxHP
+                "HP: "
+                .. currentHP
+                .. " / "
+                .. maxHP
         end
 
         if distanceLabel then
             distanceLabel.Visible = Config.ShowDistance
-            distanceLabel.Text = math.floor(distance) .. " studs"
+            distanceLabel.Text =
+                math.floor(distance)
+                .. " studs"
         end
     else
         data.info.Visible = false
@@ -3103,10 +3838,10 @@ local function updateTargetESP(target, camera)
 
     -- TRACER
     if
-        Config.ShowTracer and
-        rootScreen and
-        rootOnScreen and
-        rootDepth > 0
+        Config.ShowTracer
+        and rootScreen
+        and rootOnScreen
+        and rootDepth > 0
     then
         local from =
             Vector2.new(
@@ -3129,23 +3864,35 @@ local function updateTargetESP(target, camera)
     if Config.ShowSkeleton then
         -- Each endpoint re-reads the CURRENT part.Position every frame.
         for _, skeleton in ipairs(data.skeleton) do
-            local partA = character:FindFirstChild(skeleton.partA)
-            local partB = character:FindFirstChild(skeleton.partB)
+            local partA =
+                character:FindFirstChild(
+                    skeleton.partA
+                )
+            local partB =
+                character:FindFirstChild(
+                    skeleton.partB
+                )
 
             if partA and partB then
                 local posA, visibleA, depthA =
-                    ProjectESPWorldPosition(camera, partA.Position)
+                    ProjectESPWorldPosition(
+                        camera,
+                        partA.Position
+                    )
 
                 local posB, visibleB, depthB =
-                    ProjectESPWorldPosition(camera, partB.Position)
+                    ProjectESPWorldPosition(
+                        camera,
+                        partB.Position
+                    )
 
                 if
-                    posA and
-                    posB and
-                    visibleA and
-                    visibleB and
-                    depthA > 0 and
-                    depthB > 0
+                    posA
+                    and posB
+                    and visibleA
+                    and visibleB
+                    and depthA > 0
+                    and depthB > 0
                 then
                     updateScreenLine(
                         skeleton.line,
@@ -3183,10 +3930,26 @@ local function updateESP(camera)
         return
     end
 
+    -- First remove NPC ESP entries whose models have already left the registry.
+    for target, data in pairs(espData) do
+        if
+            data
+            and data.kind == "NPC"
+            and not NPCSystem.ValidNPCs[target]
+        then
+            destroyTargetESP(target)
+        end
+    end
+
     for _, target in ipairs(Players:GetPlayers()) do
         if target ~= LocalPlayer then
             updateTargetESP(target, camera)
         end
+    end
+
+    -- NPC ESP uses the same renderer and same frame/camera snapshot.
+    for npc in pairs(NPCSystem.ValidNPCs) do
+        updateTargetESP(npc, camera)
     end
 end
 
@@ -3265,23 +4028,21 @@ local function IsESPHighlightTargetValid(target)
         return false
     end
 
-    -- Match the existing ESP team/enemy classification.
-    local hasTeams =
-        LocalPlayer.Team ~= nil
-        and target.Team ~= nil
+    -- Reuse the same robust Player classification used by the main ESP
+    -- renderer, so Highlight cannot disagree with Name/Box/Skeleton/Tracer.
+    local classification =
+        NPCSystem.ClassifyPlayer(target)
 
-    local isTeammate =
-        hasTeams
-        and target.Team == LocalPlayer.Team
+    if classification == "Teammate" then
+        if not Config.ShowTeammates then
+            return false
+        end
+    else
+        classification = "Enemy"
 
-    local isEnemy = not isTeammate
-
-    if isEnemy and not Config.ShowEnemies then
-        return false
-    end
-
-    if isTeammate and not Config.ShowTeammates then
-        return false
+        if not Config.ShowEnemies then
+            return false
+        end
     end
 
     local myRoot =
@@ -3301,18 +4062,11 @@ local function IsESPHighlightTargetValid(target)
 end
 
 local function UpdateESPHighlight()
-    if not Config.ESPHighlightEnabled then
+    -- ESP Highlight follows the existing Master ESP switch too.
+    if not Config.Enabled or not Config.ESPHighlightEnabled then
         destroyAllESPHighlights()
         return
     end
-
-    -- One shared rainbow state for ALL highlight instances.
-    local rainbowColor =
-        Color3.fromHSV(
-            (os.clock() * 0.20) % 1,
-            1,
-            1
-        )
 
     for _, target in ipairs(Players:GetPlayers()) do
         if target ~= LocalPlayer then
@@ -3322,6 +4076,14 @@ local function UpdateESPHighlight()
             if not valid then
                 destroyESPHighlight(target)
             else
+                local classification =
+                    NPCSystem.ClassifyPlayer(target)
+
+                local highlightColor =
+                    classification == "Teammate"
+                    and NPCSystem.ESPColors.Teammate
+                    or NPCSystem.ESPColors.Enemy
+
                 local data = espHighlightData[target]
 
                 if data and data.character ~= character then
@@ -3351,8 +4113,8 @@ local function UpdateESPHighlight()
                     and data.highlight.Parent
                 then
                     data.highlight.Adornee = character
-                    data.highlight.FillColor = rainbowColor
-                    data.highlight.OutlineColor = rainbowColor
+                    data.highlight.FillColor = highlightColor
+                    data.highlight.OutlineColor = highlightColor
                 end
             end
         end
@@ -3853,7 +4615,7 @@ CurrentGameName, CurrentPlaceId = GetCurrentGameMetadata()
 
 local function BuildConfigPayload()
     return {
-        version = 1,
+        version = 2,
 
         -- AIM
         AimEnabled = Config.AimEnabled,
@@ -3867,6 +4629,7 @@ local function BuildConfigPayload()
         AimPart = Config.AimPart,
         Smoothness = Config.Smoothness,
         AimMaxDistance = Config.AimMaxDistance,
+        AimNPC = Config.AimNPC,
 
         -- TELEKILL
         TelekillEnabled = Config.TelekillEnabled,
@@ -3881,6 +4644,8 @@ local function BuildConfigPayload()
         ShowName = Config.ShowName,
         ShowTracer = Config.ShowTracer,
         ShowSkeleton = Config.ShowSkeleton,
+        ShowBox = Config.ShowBox,
+        ShowNPC = Config.ShowNPC,
         ShowHealth = Config.ShowHealth,
         ShowDistance = Config.ShowDistance,
         MaxDistance = Config.MaxDistance,
@@ -3965,6 +4730,7 @@ local function ApplyConfigPayload(payload)
 
     SetNumberField(payload, "Smoothness", Config, nil, 0.2, 1)
     SetNumberField(payload, "AimMaxDistance", Config, nil, 50, 10000)
+    SetBooleanField(payload, "AimNPC", Config)
 
     SetBooleanField(payload, "TelekillEnabled", Config)
 
@@ -4004,6 +4770,8 @@ local function ApplyConfigPayload(payload)
     SetBooleanField(payload, "ShowName", Config)
     SetBooleanField(payload, "ShowTracer", Config)
     SetBooleanField(payload, "ShowSkeleton", Config)
+    SetBooleanField(payload, "ShowBox", Config)
+    SetBooleanField(payload, "ShowNPC", Config)
     SetBooleanField(payload, "ShowHealth", Config)
     SetBooleanField(payload, "ShowDistance", Config)
     SetNumberField(payload, "MaxDistance", Config, nil, 50, 10000)
@@ -4127,6 +4895,9 @@ local function SyncSettingsUI()
     if UIRefs.Toggles.IgnoreVisibility then
         UIRefs.Toggles.IgnoreVisibility.Set(Config.IgnoreVisibility, true)
     end
+    if UIRefs.Toggles.AimNPC then
+        UIRefs.Toggles.AimNPC.Set(Config.AimNPC, true)
+    end
     if UIRefs.Toggles.UseFOV then
         UIRefs.Toggles.UseFOV.Set(Config.UseFOV, true)
     end
@@ -4183,6 +4954,12 @@ local function SyncSettingsUI()
     end
     if UIRefs.Toggles.ShowName then
         UIRefs.Toggles.ShowName.Set(Config.ShowName, true)
+    end
+    if UIRefs.Toggles.ShowBox then
+        UIRefs.Toggles.ShowBox.Set(Config.ShowBox, true)
+    end
+    if UIRefs.Toggles.ShowNPC then
+        UIRefs.Toggles.ShowNPC.Set(Config.ShowNPC, true)
     end
     if UIRefs.Toggles.ShowTracer then
         UIRefs.Toggles.ShowTracer.Set(Config.ShowTracer, true)
@@ -5006,6 +5783,9 @@ if not FileAPI.Available then
     )
 end
 
+-- Initialize NPC detection after the GUI/settings framework is ready.
+NPCSystem.Initialize()
+
 -- =========================================================
 -- RENDER PIPELINE
 -- Keep Player/Teleport at the existing Character stage.
@@ -5276,6 +6056,12 @@ local function CleanupFramework()
 
     destroyAllESPHighlights()
 
+    for model in pairs(NPCSystem.ValidNPCs) do
+        NPCSystem.Unregister(model)
+    end
+
+    NPCSystem.Initialized = false
+
     DisconnectProfileConnections()
     DisconnectProfilePopupConnections()
 
@@ -5335,6 +6121,8 @@ _G.MyGUIFramework = {
             return CurrentAimTarget
         end
     },
+
+    NPC = NPCSystem,
 
     Cleanup = CleanupFramework
 }
