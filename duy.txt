@@ -1,4 +1,10 @@
-Anti-Report: Tự động đổi tên hiển thị (Display Name) hoặc làm mờ thông tin cá nhân trên màn hình để người khác không thể chụp ảnh tố cáo.
-  Server Hop / Rejoin: Nút bấm chuyển sang server khác ngay lập tức hoặc vào lại chính server hiện tại.
-    Anti-AFK: Tự động thực hiện thao tác nhỏ định kỳ để không bị hệ thống văng ra do đứng yên quá lâu.
-      
+anti-afk
+loại bỏ copy oufit  
+xóa ifinite yield
+ xóa anti-local anti cheat
+
+thêm tab có tên "sctript" ở trang này chỉ có nút bấm mở khi mở là hiện icon hình tròn một menu khác , và cũng có nút tắt mở như menu chính , khi mở icon lên thì xuất hiện menu gồm 3 tab là: sctript và loading sctrip ,tab sctript có chức năng như lưu scrtript và không bao giờ mất đi trừ khi xóa , giao diện của tab này gồm 3 nút chính +sctrip, khi ấn vào nó hiện lên gui nhỏ trong đó gồm 2 ô để mình nhập, ô đầu là nhập sctript và ô 2 là nhập tên và có nút lưu 
+sau khi lưu nó sẽ hiện như  menu1                                   [thực hiện] [xóa bỏ]
+đấy là nội dung chính của tab sctript
+tiếp theo là tab loading sctrip, tab này chủ yếu để test sctript trước giao diện gồm một ô có ghi sctript trên và mấy nút bên dưới gồm dán , clear, run 
+và đặc biệt code kiểu gì cho nó chạy được sctript nha
