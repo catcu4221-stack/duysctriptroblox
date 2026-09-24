@@ -71,8 +71,8 @@ end
 -- 2. CONFIGURATION & STATE
 -- ==========================================
 local Config = {
-    Title = "[UPD] Hood Rivals",
-    Author = "Made By @rullzsy_",
+    Title = "[VIP] PDuyz",
+    Author = "Made By Pduyor_AI_",
     ToggleKey = Enum.KeyCode.RightControl,
     ToggleKeyEnabled = true,
     UIScale = 1.0,
@@ -519,10 +519,10 @@ FloatingBtn.Size = UDim2.fromOffset(48, 48)
 FloatingBtn.Position = UDim2.new(1, -68, 1, -68)
 FloatingBtn.BackgroundColor3 = Config.DarkBg
 FloatingBtn.BackgroundTransparency = 0.35
-FloatingBtn.Text = "HR"
+FloatingBtn.Text = "Menu"
 FloatingBtn.TextColor3 = Config.TextColor
 FloatingBtn.Font = Enum.Font.GothamBold
-FloatingBtn.TextSize = 13
+FloatingBtn.TextSize = 15
 FloatingBtn.AutoButtonColor = false
 FloatingBtn.Visible = false
 FloatingBtn.Parent = ScreenGui
@@ -653,7 +653,7 @@ local ExtraFeatures = {
         Initialized = false
     },
 
-    NotificationText = "NHẬP THÔNG BÁO Ở ĐÂY",
+    NotificationText = "Thông báo cái con Cặc, tự mò mà chơi",
     NotificationView = nil,
     NotificationPreviousPage = nil
 }
@@ -9082,7 +9082,7 @@ UI:CreateButton(
         GUIState.Pages["KHÁC"],
         "SERVER"
     ),
-    "↻  Đổi Server",
+    "🗿  Đổi Server",
     function()
         OtherSystem.RunServerAction("Change")
     end
@@ -9092,7 +9092,7 @@ UI:CreateButton(
     GUIState.Pages["KHÁC"]:FindFirstChild(
         "SERVERSection"
     ),
-    "⌁  Ping Thấp",
+    "⚡️  Ping Thấp",
     function()
         OtherSystem.RunServerAction("Ping")
     end
@@ -9102,7 +9102,7 @@ UI:CreateButton(
     GUIState.Pages["KHÁC"]:FindFirstChild(
         "SERVERSection"
     ),
-    "↓  Ít Người",
+    "🫃  Ít Người",
     function()
         OtherSystem.RunServerAction("Small")
     end
