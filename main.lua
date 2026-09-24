@@ -94,6 +94,12 @@ local Config = {
     ThirdPersonLock = false,
     XRayEnabled = false,
     XRayTransparency = 0.5,
+    CopyPlayerOutfitEnabled = false,
+    CopyPlayerOutfitKey = Enum.KeyCode.LeftAlt,
+    InfiniteYieldEnabled = false,
+    AntiLocalEnabled = false,
+    HoldToSpamEnabled = false,
+    HoldToSpamKey = Enum.KeyCode.E,
 
     -- ESP Core Configuration
     Enabled = false,
@@ -108,9 +114,6 @@ local Config = {
     ShowDistance = false,
     MaxDistance = 2000,
     ESPHighlightEnabled = false,
-    ESPOffsetX = 0,
-    ESPOffsetY = 0,
-    ESPOffsetZ = 0,
 
     -- =========================================================
     -- AIM CONFIGURATION
@@ -127,6 +130,8 @@ local Config = {
     Smoothness = 0.20,
     AimMaxDistance = 2000,
     AimNPC = false,
+    HitboxExpanderEnabled = false,
+    HitboxSize = 0,
 
     -- =========================================================
     -- TELEKILL CONFIGURATION
@@ -392,8 +397,8 @@ TitleLabel.BackgroundTransparency = 1
 TitleLabel.Parent = Header
 
 local ControlButtons = Instance.new("Frame")
-ControlButtons.Size = UDim2.new(0, 60, 1, 0)
-ControlButtons.Position = UDim2.new(1, -65, 0, 0)
+ControlButtons.Size = UDim2.new(0, 90, 1, 0)
+ControlButtons.Position = UDim2.new(1, -95, 0, 0)
 ControlButtons.BackgroundTransparency = 1
 ControlButtons.Parent = Header
 
@@ -413,10 +418,26 @@ local MinCorner = Instance.new("UICorner")
 MinCorner.CornerRadius = UDim.new(0, 4)
 MinCorner.Parent = MinimizeBtn
 
+UIRefs.NotificationButton = Instance.new("TextButton")
+UIRefs.NotificationButton.Name = "Notification"
+UIRefs.NotificationButton.Size = UDim2.new(0, 25, 0, 25)
+UIRefs.NotificationButton.Position = UDim2.new(0, 30, 0.5, -12)
+UIRefs.NotificationButton.Text = "🔔"
+UIRefs.NotificationButton.TextColor3 = Config.SubTextColor
+UIRefs.NotificationButton.TextSize = 13
+UIRefs.NotificationButton.Font = Enum.Font.GothamBold
+UIRefs.NotificationButton.BackgroundColor3 = Config.SidebarBg
+UIRefs.NotificationButton.AutoButtonColor = false
+UIRefs.NotificationButton.Parent = ControlButtons
+
+local NotificationCorner = Instance.new("UICorner")
+NotificationCorner.CornerRadius = UDim.new(0, 4)
+NotificationCorner.Parent = UIRefs.NotificationButton
+
 local CloseBtn = Instance.new("TextButton")
 CloseBtn.Name = "Close"
 CloseBtn.Size = UDim2.new(0, 25, 0, 25)
-CloseBtn.Position = UDim2.new(0, 30, 0.5, -12)
+CloseBtn.Position = UDim2.new(0, 60, 0.5, -12)
 CloseBtn.Text = "X"
 CloseBtn.TextColor3 = Config.SubTextColor
 CloseBtn.TextSize = 13
@@ -529,6 +550,879 @@ local OtherSystem = {
     ConsumeNextToggleInput = false,
     Generation = 0
 }
+
+local ExtraFeatures = {
+    CopyOutfitKeyHeld = false,
+    CopyOutfitListening = false,
+    CopyOutfitKeyBox = nil,
+
+    HitboxCache = {},
+    HitboxAccumulator = 0,
+
+    InfiniteYield = {
+        Loaded = false,
+        Enabled = false,
+        Runtime = nil,
+        OwnedInstances = {},
+        SourceUrl = "https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source"
+    },
+
+    AntiLocal = {
+        Enabled = false,
+        Cache = {},
+        PlayerScriptsConnection = nil,
+        CharacterConnection = nil,
+        CharacterAddedConnection = nil
+    },
+
+    GamePass = {
+        Active = false,
+        TargetFunction = nil,
+        OriginalFunction = nil
+    },
+
+    HoldSpamKeyHeld = false,
+    HoldSpamRightHeld = false,
+    HoldSpamListening = false,
+    HoldSpamKeyBox = nil,
+    HoldSpamAccumulator = 0,
+    HoldSpamInterval = 0.12,
+    HoldSpamInput = nil,
+
+    NotificationText = "NHẬP THÔNG BÁO Ở ĐÂY",
+    NotificationView = nil,
+    NotificationPreviousPage = nil
+}
+
+function ExtraFeatures.GetClickedPlayer()
+    local targetPart = Mouse and Mouse.Target
+    if not targetPart then
+        return nil
+    end
+
+    local character = targetPart:FindFirstAncestorOfClass("Model")
+    if not character then
+        return nil
+    end
+
+    local player = Players:GetPlayerFromCharacter(character)
+    if not player or player == LocalPlayer then
+        return nil
+    end
+
+    return player
+end
+
+function ExtraFeatures.CopyPlayerOutfit()
+    if not Config.CopyPlayerOutfitEnabled
+        or not ExtraFeatures.CopyOutfitKeyHeld
+    then
+        return
+    end
+
+    local targetPlayer = ExtraFeatures.GetClickedPlayer()
+
+    if not targetPlayer then
+        return
+    end
+
+    local localCharacter = LocalPlayer.Character
+    local humanoid = localCharacter
+        and localCharacter:FindFirstChildOfClass("Humanoid")
+
+    if not humanoid then
+        return
+    end
+
+    pcall(function()
+        local description =
+            Players:GetHumanoidDescriptionFromUserIdAsync(
+                targetPlayer.UserId
+            )
+
+        if description then
+            pcall(function()
+                humanoid:ApplyDescription(description)
+            end)
+        end
+    end)
+end
+
+function ExtraFeatures.StyleKeyButton(button)
+    if not button then
+        return
+    end
+
+    button.TextColor3 = Config.TextColor
+    button.Font = Enum.Font.GothamMedium
+    button.TextSize = 12
+    button.BackgroundColor3 = Config.DarkBg
+    button.AutoButtonColor = false
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 5)
+    corner.Parent = button
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Config.BorderColor
+    stroke.Thickness = 1
+    stroke.Parent = button
+end
+
+function ExtraFeatures.RestoreHitboxPart(part)
+    local original = ExtraFeatures.HitboxCache[part]
+    if not original then
+        return
+    end
+
+    ExtraFeatures.HitboxCache[part] = nil
+
+    if part and part.Parent then
+        pcall(function()
+            part.Size = original.Size
+            part.Transparency = original.Transparency
+            part.CanCollide = original.CanCollide
+        end)
+    end
+end
+
+function ExtraFeatures.RestoreAllHitboxes()
+    local parts = {}
+
+    for part in pairs(ExtraFeatures.HitboxCache) do
+        table.insert(parts, part)
+    end
+
+    for _, part in ipairs(parts) do
+        ExtraFeatures.RestoreHitboxPart(part)
+    end
+
+    table.clear(ExtraFeatures.HitboxCache)
+    ExtraFeatures.HitboxAccumulator = 0
+end
+
+function ExtraFeatures.ApplyHitboxPart(part)
+    if not part
+        or typeof(part) ~= "Instance"
+        or not part:IsA("BasePart")
+        or not part.Parent
+    then
+        return
+    end
+
+    if not ExtraFeatures.HitboxCache[part] then
+        ExtraFeatures.HitboxCache[part] = {
+            Size = part.Size,
+            Transparency = part.Transparency,
+            CanCollide = part.CanCollide
+        }
+    end
+
+    local original = ExtraFeatures.HitboxCache[part]
+    local amount = math.clamp(
+        tonumber(Config.HitboxSize) or 0,
+        0,
+        10
+    )
+
+    if not Config.HitboxExpanderEnabled or amount <= 0 then
+        ExtraFeatures.RestoreHitboxPart(part)
+        return
+    end
+
+    pcall(function()
+        part.Size =
+            original.Size
+            + Vector3.new(amount, amount, amount)
+        part.Transparency =
+            math.max(original.Transparency, 0.8)
+        part.CanCollide = false
+    end)
+end
+
+function ExtraFeatures.UpdateHitboxes(dt, force)
+    if not Config.HitboxExpanderEnabled
+        or (tonumber(Config.HitboxSize) or 0) <= 0
+    then
+        if next(ExtraFeatures.HitboxCache) ~= nil then
+            ExtraFeatures.RestoreAllHitboxes()
+        end
+        return
+    end
+
+    ExtraFeatures.HitboxAccumulator =
+        ExtraFeatures.HitboxAccumulator
+        + (tonumber(dt) or 0)
+
+    if not force
+        and ExtraFeatures.HitboxAccumulator < 0.25
+    then
+        return
+    end
+
+    ExtraFeatures.HitboxAccumulator = 0
+
+    local seen = {}
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= LocalPlayer then
+            local character = target.Character
+            local root =
+                character
+                and character:FindFirstChild("HumanoidRootPart")
+
+            if root and root:IsA("BasePart") then
+                seen[root] = true
+                ExtraFeatures.ApplyHitboxPart(root)
+            end
+        end
+    end
+
+    for model in pairs(NPCSystem.ValidNPCs) do
+        if model and model.Parent then
+            local root =
+                model:FindFirstChild("HumanoidRootPart")
+
+            if root and root:IsA("BasePart") then
+                seen[root] = true
+                ExtraFeatures.ApplyHitboxPart(root)
+            end
+        end
+    end
+
+    local stale = {}
+
+    for part in pairs(ExtraFeatures.HitboxCache) do
+        if not seen[part] or not part or not part.Parent then
+            table.insert(stale, part)
+        end
+    end
+
+    for _, part in ipairs(stale) do
+        ExtraFeatures.RestoreHitboxPart(part)
+    end
+end
+
+function ExtraFeatures.SetHitboxEnabled(enabled)
+    Config.HitboxExpanderEnabled = enabled == true
+
+    if not Config.HitboxExpanderEnabled then
+        ExtraFeatures.RestoreAllHitboxes()
+        return
+    end
+
+    ExtraFeatures.UpdateHitboxes(0, true)
+end
+
+function ExtraFeatures.CaptureGuiRoots()
+    local snapshot = {}
+
+    local function capture(parent)
+        if not parent then
+            return
+        end
+
+        for _, child in ipairs(parent:GetChildren()) do
+            snapshot[child] = true
+        end
+    end
+
+    capture(TargetParent)
+
+    if CoreGui and CoreGui ~= TargetParent then
+        capture(CoreGui)
+    end
+
+    return snapshot
+end
+
+function ExtraFeatures.TrackNewGuiRoots(before)
+    local state = ExtraFeatures.InfiniteYield
+
+    local function capture(parent)
+        if not parent then
+            return
+        end
+
+        for _, child in ipairs(parent:GetChildren()) do
+            if not before[child] then
+                state.OwnedInstances[child] = true
+            end
+        end
+    end
+
+    capture(TargetParent)
+
+    if CoreGui and CoreGui ~= TargetParent then
+        capture(CoreGui)
+    end
+end
+
+function ExtraFeatures.SetInfiniteYieldGuiVisible(visible)
+    for instance in pairs(
+        ExtraFeatures.InfiniteYield.OwnedInstances
+    ) do
+        if not instance or not instance.Parent then
+            ExtraFeatures.InfiniteYield.OwnedInstances[instance] = nil
+        else
+            pcall(function()
+                if instance:IsA("ScreenGui") then
+                    instance.Enabled = visible == true
+                elseif instance:IsA("GuiObject") then
+                    instance.Visible = visible == true
+                end
+            end)
+        end
+    end
+end
+
+function ExtraFeatures.CallInfiniteYieldRuntime(methodNames)
+    local runtime = ExtraFeatures.InfiniteYield.Runtime
+
+    if type(runtime) ~= "table" then
+        return false
+    end
+
+    for _, methodName in ipairs(methodNames) do
+        local method = runtime[methodName]
+
+        if type(method) == "function" then
+            local ok = pcall(method, runtime)
+
+            if ok then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+function ExtraFeatures.SetInfiniteYield(enabled)
+    local state = ExtraFeatures.InfiniteYield
+    enabled = enabled == true
+
+    if not enabled then
+        Config.InfiniteYieldEnabled = false
+        state.Enabled = false
+
+        local runtimeDisabled =
+            ExtraFeatures.CallInfiniteYieldRuntime({
+                "Disable",
+                "Pause",
+                "Hide"
+            })
+
+        ExtraFeatures.SetInfiniteYieldGuiVisible(false)
+
+        if ExtraFeatures.SetStatus then
+            if runtimeDisabled then
+                ExtraFeatures.SetStatus(
+                    "Infinite Yield disabled"
+                )
+            elseif state.Loaded then
+                ExtraFeatures.SetStatus(
+                    "Infinite Yield UI disabled; external runtime has no verified shutdown API"
+                )
+            end
+        end
+
+        return true
+    end
+
+    if state.Loaded then
+        state.Enabled = true
+        Config.InfiniteYieldEnabled = true
+
+        ExtraFeatures.CallInfiniteYieldRuntime({
+            "Enable",
+            "Resume",
+            "Show"
+        })
+        ExtraFeatures.SetInfiniteYieldGuiVisible(true)
+
+        return true
+    end
+
+    if type(loadstring) ~= "function" then
+        Config.InfiniteYieldEnabled = false
+
+        if ExtraFeatures.SetStatus then
+            ExtraFeatures.SetStatus(
+                "Infinite Yield unavailable: loadstring is not supported"
+            )
+        end
+
+        return false
+    end
+
+    local source = OtherSystem.Request(state.SourceUrl)
+
+    if type(source) ~= "string" or source == "" then
+        Config.InfiniteYieldEnabled = false
+
+        if ExtraFeatures.SetStatus then
+            ExtraFeatures.SetStatus(
+                "Infinite Yield load failed: source unavailable"
+            )
+        end
+
+        return false
+    end
+
+    local before = ExtraFeatures.CaptureGuiRoots()
+    local compileOk, compileResult =
+        pcall(function()
+            return loadstring(source)
+        end)
+
+    if not compileOk
+        or type(compileResult) ~= "function"
+    then
+        Config.InfiniteYieldEnabled = false
+
+        if ExtraFeatures.SetStatus then
+            ExtraFeatures.SetStatus(
+                "Infinite Yield load failed: compile error"
+            )
+        end
+
+        return false
+    end
+
+    local runOk, runtime =
+        pcall(function()
+            return compileResult()
+        end)
+
+    if not runOk then
+        Config.InfiniteYieldEnabled = false
+
+        if ExtraFeatures.SetStatus then
+            ExtraFeatures.SetStatus(
+                "Infinite Yield load failed: runtime error"
+            )
+        end
+
+        return false
+    end
+
+    state.Loaded = true
+    state.Enabled = true
+    state.Runtime = runtime
+    Config.InfiniteYieldEnabled = true
+
+    ExtraFeatures.TrackNewGuiRoots(before)
+
+    if ExtraFeatures.SetStatus then
+        ExtraFeatures.SetStatus("Infinite Yield loaded")
+    end
+
+    return true
+end
+
+function ExtraFeatures.CleanupInfiniteYield()
+    local state = ExtraFeatures.InfiniteYield
+
+    ExtraFeatures.CallInfiniteYieldRuntime({
+        "Cleanup",
+        "Unload",
+        "Destroy",
+        "Disable"
+    })
+
+    for instance in pairs(state.OwnedInstances) do
+        if instance and instance.Parent then
+            pcall(function()
+                instance:Destroy()
+            end)
+        end
+    end
+
+    table.clear(state.OwnedInstances)
+
+    state.Enabled = false
+    state.Loaded = false
+    state.Runtime = nil
+    Config.InfiniteYieldEnabled = false
+end
+
+function ExtraFeatures.IsSuspiciousLocal(instance)
+    if not instance
+        or typeof(instance) ~= "Instance"
+        or not instance:IsA("LocalScript")
+    then
+        return false
+    end
+
+    local normalized =
+        string.lower(instance.Name)
+        :gsub("[%W_]+", "")
+
+    return normalized == "ac"
+        or normalized:find("anticheat", 1, true) ~= nil
+        or normalized:find("antiexploit", 1, true) ~= nil
+        or normalized:find("clientwatcher", 1, true) ~= nil
+        or normalized:find("speedcheck", 1, true) ~= nil
+        or normalized:find("flycheck", 1, true) ~= nil
+end
+
+function ExtraFeatures.IsLocalClientContainer(instance)
+    if not instance then
+        return false
+    end
+
+    local playerScripts =
+        LocalPlayer:FindFirstChild("PlayerScripts")
+
+    if playerScripts
+        and instance:IsDescendantOf(playerScripts)
+    then
+        return true
+    end
+
+    local character = LocalPlayer.Character
+
+    return (
+        character
+        and instance:IsDescendantOf(character)
+    ) == true
+end
+
+function ExtraFeatures.ApplyAntiLocalInstance(instance)
+    local state = ExtraFeatures.AntiLocal
+
+    if not state.Enabled
+        or not ExtraFeatures.IsSuspiciousLocal(instance)
+        or not ExtraFeatures.IsLocalClientContainer(instance)
+    then
+        return
+    end
+
+    if state.Cache[instance] == nil then
+        state.Cache[instance] = instance.Disabled
+    end
+
+    pcall(function()
+        instance.Disabled = true
+    end)
+end
+
+function ExtraFeatures.DisconnectAntiLocal()
+    local state = ExtraFeatures.AntiLocal
+
+    for _, key in ipairs({
+        "PlayerScriptsConnection",
+        "CharacterConnection",
+        "CharacterAddedConnection"
+    }) do
+        local conn = state[key]
+
+        if conn then
+            pcall(function()
+                conn:Disconnect()
+            end)
+        end
+
+        state[key] = nil
+    end
+end
+
+function ExtraFeatures.RestoreAntiLocal()
+    local state = ExtraFeatures.AntiLocal
+
+    for instance, originalDisabled in pairs(state.Cache) do
+        if instance and instance.Parent then
+            pcall(function()
+                instance.Disabled = originalDisabled
+            end)
+        end
+    end
+
+    table.clear(state.Cache)
+end
+
+function ExtraFeatures.BindAntiLocalCharacter(character)
+    local state = ExtraFeatures.AntiLocal
+
+    if state.CharacterConnection then
+        pcall(function()
+            state.CharacterConnection:Disconnect()
+        end)
+        state.CharacterConnection = nil
+    end
+
+    if not character or not state.Enabled then
+        return
+    end
+
+    for _, instance in ipairs(character:GetDescendants()) do
+        ExtraFeatures.ApplyAntiLocalInstance(instance)
+    end
+
+    state.CharacterConnection =
+        character.DescendantAdded:Connect(function(instance)
+            ExtraFeatures.ApplyAntiLocalInstance(instance)
+        end)
+end
+
+function ExtraFeatures.SetAntiLocal(enabled)
+    local state = ExtraFeatures.AntiLocal
+    enabled = enabled == true
+
+    ExtraFeatures.DisconnectAntiLocal()
+
+    state.Enabled = enabled
+    Config.AntiLocalEnabled = enabled
+
+    if not enabled then
+        ExtraFeatures.RestoreAntiLocal()
+        return
+    end
+
+    local playerScripts =
+        LocalPlayer:FindFirstChild("PlayerScripts")
+
+    if playerScripts then
+        for _, instance in ipairs(playerScripts:GetDescendants()) do
+            ExtraFeatures.ApplyAntiLocalInstance(instance)
+        end
+
+        state.PlayerScriptsConnection =
+            playerScripts.DescendantAdded:Connect(function(instance)
+                ExtraFeatures.ApplyAntiLocalInstance(instance)
+            end)
+    end
+
+    ExtraFeatures.BindAntiLocalCharacter(
+        LocalPlayer.Character
+    )
+
+    state.CharacterAddedConnection =
+        LocalPlayer.CharacterAdded:Connect(function(character)
+            ExtraFeatures.BindAntiLocalCharacter(character)
+        end)
+end
+
+function ExtraFeatures.EnableGamePassSpoofer()
+    local state = ExtraFeatures.GamePass
+
+    if state.Active then
+        if ExtraFeatures.SetStatus then
+            ExtraFeatures.SetStatus(
+                "Game Pass Spoofer is already active (client-side only)"
+            )
+        end
+        return true
+    end
+
+    if type(hookfunction) ~= "function" then
+        if ExtraFeatures.SetStatus then
+            ExtraFeatures.SetStatus(
+                "Game Pass Spoofer unavailable: hookfunction is not supported"
+            )
+        end
+        return false
+    end
+
+    local marketplace =
+        game:GetService("MarketplaceService")
+
+    local original
+
+    local ok, result =
+        pcall(function()
+            original =
+                hookfunction(
+                    marketplace.UserOwnsGamePassAsync,
+                    function(self, userId, gamePassId)
+                        if tonumber(userId) == LocalPlayer.UserId then
+                            return true
+                        end
+
+                        return original(
+                            self,
+                            userId,
+                            gamePassId
+                        )
+                    end
+                )
+
+            return original
+        end)
+
+    if not ok or type(result) ~= "function" then
+        if ExtraFeatures.SetStatus then
+            ExtraFeatures.SetStatus(
+                "Game Pass Spoofer unavailable in this environment"
+            )
+        end
+        return false
+    end
+
+    state.Active = true
+    state.TargetFunction =
+        marketplace.UserOwnsGamePassAsync
+    state.OriginalFunction = result
+
+    if ExtraFeatures.SetStatus then
+        ExtraFeatures.SetStatus(
+            "Game Pass Spoofer active (client-side only; server ownership unchanged)"
+        )
+    end
+
+    return true
+end
+
+function ExtraFeatures.RestoreGamePassSpoofer()
+    local state = ExtraFeatures.GamePass
+
+    if state.Active
+        and type(hookfunction) == "function"
+        and type(state.TargetFunction) == "function"
+        and type(state.OriginalFunction) == "function"
+    then
+        pcall(function()
+            hookfunction(
+                state.TargetFunction,
+                state.OriginalFunction
+            )
+        end)
+    end
+
+    state.Active = false
+    state.TargetFunction = nil
+    state.OriginalFunction = nil
+end
+
+function ExtraFeatures.TriggerHoldSpamClick()
+    if type(mouse1click) == "function" then
+        local ok = pcall(mouse1click)
+
+        if ok then
+            return true
+        end
+    end
+
+    if type(mouse1press) == "function"
+        and type(mouse1release) == "function"
+    then
+        local ok = pcall(function()
+            mouse1press()
+            mouse1release()
+        end)
+
+        if ok then
+            return true
+        end
+    end
+
+    if not ExtraFeatures.HoldSpamInput then
+        pcall(function()
+            ExtraFeatures.HoldSpamInput =
+                game:GetService("VirtualInputManager")
+        end)
+    end
+
+    local inputManager =
+        ExtraFeatures.HoldSpamInput
+
+    if not inputManager then
+        return false
+    end
+
+    local position =
+        UserInputService:GetMouseLocation()
+
+    local ok =
+        pcall(function()
+            inputManager:SendMouseButtonEvent(
+                position.X,
+                position.Y,
+                0,
+                true,
+                game,
+                0
+            )
+
+            inputManager:SendMouseButtonEvent(
+                position.X,
+                position.Y,
+                0,
+                false,
+                game,
+                0
+            )
+        end)
+
+    return ok
+end
+
+function ExtraFeatures.UpdateHoldSpam(dt)
+    if not Config.HoldToSpamEnabled
+        or not ExtraFeatures.HoldSpamKeyHeld
+        or not ExtraFeatures.HoldSpamRightHeld
+    then
+        ExtraFeatures.HoldSpamAccumulator = 0
+        return
+    end
+
+    ExtraFeatures.HoldSpamAccumulator =
+        ExtraFeatures.HoldSpamAccumulator
+        + (tonumber(dt) or 0)
+
+    if ExtraFeatures.HoldSpamAccumulator
+        < ExtraFeatures.HoldSpamInterval
+    then
+        return
+    end
+
+    ExtraFeatures.HoldSpamAccumulator = 0
+
+    if not ExtraFeatures.TriggerHoldSpamClick() then
+        Config.HoldToSpamEnabled = false
+        ExtraFeatures.HoldSpamKeyHeld = false
+        ExtraFeatures.HoldSpamRightHeld = false
+
+        if UIRefs.Toggles.HoldToSpam then
+            UIRefs.Toggles.HoldToSpam.Set(false, true)
+        end
+
+        if ExtraFeatures.SetStatus then
+            ExtraFeatures.SetStatus(
+                "Hold to Spam unavailable: no supported click input API"
+            )
+        end
+    end
+end
+
+function ExtraFeatures.Cleanup()
+    ExtraFeatures.CopyOutfitKeyHeld = false
+    ExtraFeatures.CopyOutfitListening = false
+    ExtraFeatures.CopyOutfitKeyBox = nil
+
+    ExtraFeatures.HoldSpamKeyHeld = false
+    ExtraFeatures.HoldSpamRightHeld = false
+    ExtraFeatures.HoldSpamListening = false
+    ExtraFeatures.HoldSpamKeyBox = nil
+    ExtraFeatures.HoldSpamAccumulator = 0
+
+    ExtraFeatures.RestoreAllHitboxes()
+
+    ExtraFeatures.SetAntiLocal(false)
+    ExtraFeatures.CleanupInfiniteYield()
+    ExtraFeatures.RestoreGamePassSpoofer()
+
+    ExtraFeatures.NotificationPreviousPage = nil
+
+    if ExtraFeatures.NotificationView
+        and ExtraFeatures.NotificationView.Parent
+    then
+        ExtraFeatures.NotificationView:Destroy()
+    end
+
+    ExtraFeatures.NotificationView = nil
+end
 
 function OtherSystem.IsCharacterPart(part)
     if not part or typeof(part) ~= "Instance" then
@@ -1136,6 +2030,103 @@ function PageManager:ShowPage(pageName)
         end
     end
 end
+
+function ExtraFeatures.BuildNotificationView()
+    if ExtraFeatures.NotificationView
+        and ExtraFeatures.NotificationView.Parent
+    then
+        return ExtraFeatures.NotificationView
+    end
+
+    local view = Instance.new("Frame")
+    view.Name = "NotificationInternalView"
+    view.Size = UDim2.new(1, 0, 1, 0)
+    view.BackgroundTransparency = 1
+    view.Visible = false
+    view.Parent = ContentArea
+
+    local backButton = Instance.new("TextButton")
+    backButton.Name = "Back"
+    backButton.Size = UDim2.new(0, 38, 0, 28)
+    backButton.Position = UDim2.new(0, 12, 0, 10)
+    backButton.Text = "←"
+    backButton.TextColor3 = Config.TextColor
+    backButton.TextSize = 18
+    backButton.Font = Enum.Font.GothamBold
+    backButton.BackgroundColor3 = Config.CardBg
+    backButton.AutoButtonColor = false
+    backButton.Parent = view
+
+    local backCorner = Instance.new("UICorner")
+    backCorner.CornerRadius = UDim.new(0, 6)
+    backCorner.Parent = backButton
+
+    local backStroke = Instance.new("UIStroke")
+    backStroke.Color = Config.BorderColor
+    backStroke.Thickness = 1
+    backStroke.Parent = backButton
+
+    local messageLabel = Instance.new("TextLabel")
+    messageLabel.Name = "NotificationText"
+    messageLabel.Size = UDim2.new(1, -24, 1, -58)
+    messageLabel.Position = UDim2.new(0, 12, 0, 48)
+    messageLabel.BackgroundColor3 = Config.CardBg
+    messageLabel.BorderSizePixel = 0
+    messageLabel.Text = ExtraFeatures.NotificationText
+    messageLabel.TextColor3 = Config.TextColor
+    messageLabel.TextSize = 13
+    messageLabel.Font = Enum.Font.Gotham
+    messageLabel.TextWrapped = true
+    messageLabel.TextXAlignment = Enum.TextXAlignment.Left
+    messageLabel.TextYAlignment = Enum.TextYAlignment.Top
+    messageLabel.Parent = view
+
+    local messageCorner = Instance.new("UICorner")
+    messageCorner.CornerRadius = UDim.new(0, 6)
+    messageCorner.Parent = messageLabel
+
+    local messagePadding = Instance.new("UIPadding")
+    messagePadding.PaddingTop = UDim.new(0, 12)
+    messagePadding.PaddingLeft = UDim.new(0, 12)
+    messagePadding.PaddingRight = UDim.new(0, 12)
+    messagePadding.PaddingBottom = UDim.new(0, 12)
+    messagePadding.Parent = messageLabel
+
+    AddConnection(backButton.MouseButton1Click:Connect(function()
+        view.Visible = false
+        local previousPage = ExtraFeatures.NotificationPreviousPage
+        ExtraFeatures.NotificationPreviousPage = nil
+
+        if previousPage and GUIState.Pages[previousPage] then
+            PageManager:ShowPage(previousPage)
+        elseif Config.StartPage and GUIState.Pages[Config.StartPage] then
+            PageManager:ShowPage(Config.StartPage)
+        end
+    end))
+
+    ExtraFeatures.NotificationView = view
+    return view
+end
+
+function ExtraFeatures.OpenNotificationView()
+    local view = ExtraFeatures.BuildNotificationView()
+    ExtraFeatures.NotificationPreviousPage = GUIState.ActivePage
+
+    for _, page in pairs(GUIState.Pages) do
+        page.Visible = false
+    end
+
+    local messageLabel = view:FindFirstChild("NotificationText")
+    if messageLabel then
+        messageLabel.Text = ExtraFeatures.NotificationText
+    end
+
+    view.Visible = true
+end
+
+AddConnection(UIRefs.NotificationButton.MouseButton1Click:Connect(function()
+    ExtraFeatures.OpenNotificationView()
+end))
 
 -- ==========================================
 -- 7. COMPONENT ENGINE (MODULAR BUILDER)
@@ -2260,6 +3251,98 @@ UIRefs.Toggles.NoclipEnabled = UI:CreateToggle(PlayerCharacterSec, {
     end
 })
 
+local PlayerOutfitSec =
+    UI:CreateSection(
+        PlayerPage,
+        "OUTFIT"
+    )
+
+UIRefs.Toggles.CopyPlayerOutfit =
+    UI:CreateToggle(
+        PlayerOutfitSec,
+        {
+            Text = "Copy Player Outfit",
+            Default =
+                Config.CopyPlayerOutfitEnabled,
+            Callback = function(value)
+                Config.CopyPlayerOutfitEnabled =
+                    value
+
+                ExtraFeatures.CopyOutfitKeyHeld =
+                    false
+            end
+        }
+    )
+
+UIRefs.CopyPlayerOutfitKeyBox =
+    Instance.new("TextButton")
+
+UIRefs.CopyPlayerOutfitKeyBox.Name =
+    "CopyPlayerOutfitKeyBox"
+UIRefs.CopyPlayerOutfitKeyBox.Size =
+    UDim2.new(1, 0, 0, 30)
+UIRefs.CopyPlayerOutfitKeyBox.Text =
+    "Copy Outfit Key: "
+    .. Config.CopyPlayerOutfitKey.Name
+UIRefs.CopyPlayerOutfitKeyBox.TextColor3 =
+    Config.TextColor
+UIRefs.CopyPlayerOutfitKeyBox.Font =
+    Enum.Font.GothamMedium
+UIRefs.CopyPlayerOutfitKeyBox.TextSize = 12
+UIRefs.CopyPlayerOutfitKeyBox.BackgroundColor3 =
+    Config.DarkBg
+UIRefs.CopyPlayerOutfitKeyBox.AutoButtonColor =
+    false
+UIRefs.CopyPlayerOutfitKeyBox.Parent =
+    PlayerOutfitSec
+
+local OutfitKeyCorner = Instance.new("UICorner")
+OutfitKeyCorner.CornerRadius =
+    UDim.new(0, 5)
+OutfitKeyCorner.Parent =
+    UIRefs.CopyPlayerOutfitKeyBox
+
+local OutfitKeyStroke = Instance.new("UIStroke")
+OutfitKeyStroke.Color =
+    Config.BorderColor
+OutfitKeyStroke.Thickness = 1
+OutfitKeyStroke.Parent =
+    UIRefs.CopyPlayerOutfitKeyBox
+
+AddConnection(
+    UIRefs.CopyPlayerOutfitKeyBox.MouseButton1Click:Connect(
+        function()
+            if ExtraFeatures.CopyOutfitListening then
+                ExtraFeatures.CopyOutfitListening = false
+                ExtraFeatures.CopyOutfitKeyBox = nil
+
+                UIRefs.CopyPlayerOutfitKeyBox.Text =
+                    "Copy Outfit Key: "
+                    .. Config.CopyPlayerOutfitKey.Name
+                return
+            end
+
+            ExtraFeatures.CopyOutfitListening = true
+            ExtraFeatures.CopyOutfitKeyBox =
+                UIRefs.CopyPlayerOutfitKeyBox
+
+            if ExtraFeatures.HoldSpamListening then
+                ExtraFeatures.HoldSpamListening = false
+                ExtraFeatures.HoldSpamKeyBox = nil
+
+                if UIRefs.HoldToSpamKeyBox then
+                    UIRefs.HoldToSpamKeyBox.Text =
+                        "Hold to Spam Key: "
+                        .. Config.HoldToSpamKey.Name
+                end
+            end
+
+            UIRefs.CopyPlayerOutfitKeyBox.Text =
+                "Press Key..."
+        end
+    )
+)
+
 -- =========================================================
 -- TAB: AIM
 -- Created exactly once in the existing PageManager.
@@ -2415,6 +3498,52 @@ UIRefs.Sliders.Smoothness = UI:CreateSlider(AimSettingsSec, {
         Config.Smoothness = math.clamp(value, 0.2, 1)
     end
 })
+
+UIRefs.HitboxSection =
+    UI:CreateSection(
+        AimPage,
+        "HITBOX EXPANDER"
+    )
+
+UIRefs.Toggles.HitboxExpander =
+    UI:CreateToggle(
+        UIRefs.HitboxSection,
+        {
+            Text = "Hitbox Expander",
+            Default = Config.HitboxExpanderEnabled,
+            Callback = function(value)
+                ExtraFeatures.SetHitboxEnabled(value)
+            end
+        }
+    )
+
+UIRefs.Sliders.HitboxSize =
+    UI:CreateSlider(
+        UIRefs.HitboxSection,
+        {
+            Text = "Hitbox Size",
+            Min = 0,
+            Max = 10,
+            Default = Config.HitboxSize,
+            Increment = 1,
+            EditableValue = true,
+            AllowTextInputBeyondRange = false,
+            Callback = function(value)
+                Config.HitboxSize =
+                    math.clamp(
+                        tonumber(value) or 0,
+                        0,
+                        10
+                    )
+
+                if Config.HitboxSize <= 0 then
+                    ExtraFeatures.RestoreAllHitboxes()
+                elseif Config.HitboxExpanderEnabled then
+                    ExtraFeatures.UpdateHitboxes(0, true)
+                end
+            end
+        }
+    )
 
 -- =========================================================
 -- TELEKILL
@@ -3772,14 +4901,9 @@ local function ApplyESPScreenOffset(position)
         return nil
     end
 
-    local offsetX = tonumber(Config.ESPOffsetX) or 0
-    local offsetY = tonumber(Config.ESPOffsetY) or 0
-
-    -- X positive = right / negative = left.
-    -- Y positive = up / negative = down.
     return Vector2.new(
-        position.X + offsetX,
-        position.Y - offsetY
+        position.X,
+        position.Y
     )
 end
 
@@ -3790,13 +4914,7 @@ local function ProjectESPWorldPosition(camera, worldPosition)
         return nil, false, nil
     end
 
-    local zOffset = tonumber(Config.ESPOffsetZ) or 0
-
-    -- Config +Z = closer to the camera, -Z = farther away.
-    -- Roblox Camera.LookVector points forward into the scene, so subtracting
-    -- it makes positive Z move the ESP projection toward the camera.
-    local adjustedWorldPosition =
-        worldPosition - camera.CFrame.LookVector * zOffset
+    local adjustedWorldPosition = worldPosition
 
     local projected, onScreen =
         camera:WorldToViewportPoint(adjustedWorldPosition)
@@ -5005,7 +6123,7 @@ end
 RefreshTeleportPlayerList()
 
 -- =========================================================
--- SETTINGS TAB / SAVE-LOAD / ESP OFFSET PROFILES
+-- SETTINGS TAB / SAVE-LOAD / MENU PROFILES
 -- Uses the existing PageManager + UI component system.
 -- =========================================================
 
@@ -5014,14 +6132,8 @@ local SettingsPage = PageManager:AddPage("SETTINGS")
 local SettingsStatusLabel
 
 local CONFIG_FILE = "HoodRivals_Settings.json"
-local ESP_PROFILES_FILE = "HoodRivals_ESP_Offset_Profiles.json"
 
 local SessionConfigBackup = nil
-local ESPProfiles = {}
-local ProfileConnections = {}
-local ProfilePopupConnections = {}
-local ProfileNameInput
-local ProfileList
 local CurrentGameName = "Unknown"
 local CurrentPlaceId = 0
 
@@ -5133,6 +6245,10 @@ local function SetSettingsStatus(message)
     end
 end
 
+ExtraFeatures.SetStatus = function(message)
+    SetSettingsStatus(message)
+end
+
 local function TrimString(value)
     if type(value) ~= "string" then
         return ""
@@ -5186,6 +6302,8 @@ local function BuildConfigPayload()
         Smoothness = Config.Smoothness,
         AimMaxDistance = Config.AimMaxDistance,
         AimNPC = Config.AimNPC,
+        HitboxExpanderEnabled = Config.HitboxExpanderEnabled,
+        HitboxSize = Config.HitboxSize,
 
         -- TELEKILL
         TelekillEnabled = Config.TelekillEnabled,
@@ -5206,9 +6324,6 @@ local function BuildConfigPayload()
         ShowDistance = Config.ShowDistance,
         MaxDistance = Config.MaxDistance,
         ESPHighlightEnabled = Config.ESPHighlightEnabled,
-        ESPOffsetX = Config.ESPOffsetX,
-        ESPOffsetY = Config.ESPOffsetY,
-        ESPOffsetZ = Config.ESPOffsetZ,
 
         -- PLAYER
         Player = {
@@ -5229,6 +6344,12 @@ local function BuildConfigPayload()
         ThirdPersonLock = Config.ThirdPersonLock,
         XRayEnabled = Config.XRayEnabled,
         XRayTransparency = Config.XRayTransparency,
+        CopyPlayerOutfitEnabled = Config.CopyPlayerOutfitEnabled,
+        CopyPlayerOutfitKey = Config.CopyPlayerOutfitKey and Config.CopyPlayerOutfitKey.Name or nil,
+        InfiniteYieldEnabled = Config.InfiniteYieldEnabled,
+        AntiLocalEnabled = Config.AntiLocalEnabled,
+        HoldToSpamEnabled = Config.HoldToSpamEnabled,
+        HoldToSpamKey = Config.HoldToSpamKey and Config.HoldToSpamKey.Name or nil,
         UIScale = Config.UIScale,
         BackgroundTransparency = Config.BackgroundTransparency
     }
@@ -5290,6 +6411,8 @@ local function ApplyConfigPayload(payload)
     SetNumberField(payload, "Smoothness", Config, nil, 0.2, 1)
     SetNumberField(payload, "AimMaxDistance", Config, nil, 50, 10000)
     SetBooleanField(payload, "AimNPC", Config)
+    SetBooleanField(payload, "HitboxExpanderEnabled", Config)
+    SetNumberField(payload, "HitboxSize", Config, nil, 0, 10)
 
     SetBooleanField(payload, "TelekillEnabled", Config)
 
@@ -5335,10 +6458,6 @@ local function ApplyConfigPayload(payload)
     SetBooleanField(payload, "ShowDistance", Config)
     SetNumberField(payload, "MaxDistance", Config, nil, 50, 10000)
     SetBooleanField(payload, "ESPHighlightEnabled", Config)
-    SetNumberField(payload, "ESPOffsetX", Config, nil, -200, 200)
-    SetNumberField(payload, "ESPOffsetY", Config, nil, -200, 200)
-    SetNumberField(payload, "ESPOffsetZ", Config, nil, -200, 200)
-
     if type(payload.Player) == "table" then
         SetBooleanField(
             payload.Player,
@@ -5407,6 +6526,36 @@ local function ApplyConfigPayload(payload)
         0.3,
         1.0
     )
+    SetBooleanField(
+        payload,
+        "CopyPlayerOutfitEnabled",
+        Config
+    )
+
+    if type(payload.CopyPlayerOutfitKey) == "string" then
+        pcall(function()
+            local enumItem =
+                Enum.KeyCode[payload.CopyPlayerOutfitKey]
+            if enumItem then
+                Config.CopyPlayerOutfitKey = enumItem
+            end
+        end)
+    end
+
+    SetBooleanField(payload, "InfiniteYieldEnabled", Config)
+    SetBooleanField(payload, "AntiLocalEnabled", Config)
+    SetBooleanField(payload, "HoldToSpamEnabled", Config)
+
+    if type(payload.HoldToSpamKey) == "string" then
+        pcall(function()
+            local enumItem =
+                Enum.KeyCode[payload.HoldToSpamKey]
+            if enumItem then
+                Config.HoldToSpamKey = enumItem
+            end
+        end)
+    end
+
     SetNumberField(payload, "UIScale", Config, nil, 0.25, 3)
     SetNumberField(
         payload,
@@ -5447,6 +6596,25 @@ local function ApplyConfigPayload(payload)
     OtherSystem.SetXRay(Config.XRayEnabled)
     OtherSystem.UpdateXRayTransparency()
 
+    ExtraFeatures.SetHitboxEnabled(
+        Config.HitboxExpanderEnabled
+    )
+    ExtraFeatures.SetAntiLocal(
+        Config.AntiLocalEnabled
+    )
+
+    if not ExtraFeatures.SetInfiniteYield(
+        Config.InfiniteYieldEnabled
+    ) then
+        Config.InfiniteYieldEnabled = false
+    end
+
+    if not Config.HoldToSpamEnabled then
+        ExtraFeatures.HoldSpamKeyHeld = false
+        ExtraFeatures.HoldSpamRightHeld = false
+        ExtraFeatures.HoldSpamAccumulator = 0
+    end
+
     -- Apply menu-level persistent values directly after validation.
     UIScaleObj.Scale = Config.UIScale
     MainWindow.BackgroundTransparency =
@@ -5470,6 +6638,18 @@ local function SyncSettingsUI()
     end
     if UIRefs.Toggles.AimNPC then
         UIRefs.Toggles.AimNPC.Set(Config.AimNPC, true)
+    end
+    if UIRefs.Toggles.HitboxExpander then
+        UIRefs.Toggles.HitboxExpander.Set(
+            Config.HitboxExpanderEnabled,
+            true
+        )
+    end
+    if UIRefs.Sliders.HitboxSize then
+        UIRefs.Sliders.HitboxSize.Set(
+            Config.HitboxSize,
+            true
+        )
     end
     if UIRefs.Toggles.UseFOV then
         UIRefs.Toggles.UseFOV.Set(Config.UseFOV, true)
@@ -5557,16 +6737,6 @@ local function SyncSettingsUI()
             tostring(Config.MaxDistance)
     end
 
-    if UIRefs.Sliders.ESPOffsetX then
-        UIRefs.Sliders.ESPOffsetX.Set(Config.ESPOffsetX, true)
-    end
-    if UIRefs.Sliders.ESPOffsetY then
-        UIRefs.Sliders.ESPOffsetY.Set(Config.ESPOffsetY, true)
-    end
-    if UIRefs.Sliders.ESPOffsetZ then
-        UIRefs.Sliders.ESPOffsetZ.Set(Config.ESPOffsetZ, true)
-    end
-
     if UIRefs.Toggles.CFrameSpeedEnabled then
         UIRefs.Toggles.CFrameSpeedEnabled.Set(
             Config.Player.CFrameSpeedEnabled,
@@ -5643,6 +6813,46 @@ local function SyncSettingsUI()
         )
     end
 
+    if UIRefs.Toggles.CopyPlayerOutfit then
+        UIRefs.Toggles.CopyPlayerOutfit.Set(
+            Config.CopyPlayerOutfitEnabled,
+            true
+        )
+    end
+
+    if UIRefs.CopyPlayerOutfitKeyBox then
+        UIRefs.CopyPlayerOutfitKeyBox.Text =
+            "Copy Outfit Key: "
+            .. Config.CopyPlayerOutfitKey.Name
+    end
+
+    if UIRefs.Toggles.InfiniteYield then
+        UIRefs.Toggles.InfiniteYield.Set(
+            Config.InfiniteYieldEnabled,
+            true
+        )
+    end
+
+    if UIRefs.Toggles.AntiLocal then
+        UIRefs.Toggles.AntiLocal.Set(
+            Config.AntiLocalEnabled,
+            true
+        )
+    end
+
+    if UIRefs.Toggles.HoldToSpam then
+        UIRefs.Toggles.HoldToSpam.Set(
+            Config.HoldToSpamEnabled,
+            true
+        )
+    end
+
+    if UIRefs.HoldToSpamKeyBox then
+        UIRefs.HoldToSpamKeyBox.Text =
+            "Hold to Spam Key: "
+            .. Config.HoldToSpamKey.Name
+    end
+
     if UIRefs.OtherToggleKeyBox then
         UIRefs.OtherToggleKeyBox.Text =
             Config.ToggleKey.Name
@@ -5716,45 +6926,56 @@ local function LoadSettings()
     SetSettingsStatus("Settings loaded")
 end
 
-local function DisconnectProfileConnections()
-    for _, conn in ipairs(ProfileConnections) do
+
+local MenuProfilesFile = "HoodRivals_MenuProfiles.json"
+local MenuProfiles = {}
+local MenuProfileConnections = {}
+local MenuProfilePopupConnections = {}
+local MenuProfileList
+local MenuProfilePopup
+
+local function DisconnectMenuProfileConnections()
+    for _, conn in ipairs(MenuProfileConnections) do
         pcall(function()
             conn:Disconnect()
         end)
     end
 
-    table.clear(ProfileConnections)
+    table.clear(MenuProfileConnections)
 end
 
-local function AddProfileConnection(conn)
-    if conn then
-        table.insert(ProfileConnections, conn)
+local function DisconnectMenuProfilePopupConnections()
+    for _, conn in ipairs(MenuProfilePopupConnections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
     end
 
-    return conn
+    table.clear(MenuProfilePopupConnections)
 end
 
-local function SaveESPProfiles()
-    local encoded = SafeEncodeJSON(ESPProfiles)
+local function SaveMenuProfiles()
+    local encoded = SafeEncodeJSON(MenuProfiles)
 
     if not encoded then
         SetSettingsStatus(
-            "Profile updated for this session; JSON encoding unavailable"
+            "Profiles kept for this session; JSON unavailable"
         )
         return false
     end
 
     if not FileAPI.Available then
         SetSettingsStatus(
-            "Profile updated for this session; filesystem unavailable"
+            "Profiles kept for this session; filesystem unavailable"
         )
         return false
     end
 
-    local ok = SafeWriteFile(ESP_PROFILES_FILE, encoded)
+    local ok = SafeWriteFile(MenuProfilesFile, encoded)
+
     if not ok then
         SetSettingsStatus(
-            "Profile updated for this session; filesystem unavailable or write failed"
+            "Profiles kept for this session; write failed"
         )
         return false
     end
@@ -5762,85 +6983,130 @@ local function SaveESPProfiles()
     return true
 end
 
-local function LoadESPProfiles()
+local function LoadMenuProfiles()
+    MenuProfiles = {}
+
     if not FileAPI.Available then
         return
     end
 
-    if not FileExists(ESP_PROFILES_FILE) then
+    if not FileExists(MenuProfilesFile) then
         return
     end
 
-    local raw = SafeReadFile(ESP_PROFILES_FILE)
+    local raw = SafeReadFile(MenuProfilesFile)
+
     if not raw then
-        SetSettingsStatus("Profile load skipped: file read failed")
+        SetSettingsStatus(
+            "Profile load skipped: file read failed"
+        )
         return
     end
 
     local decoded = SafeDecodeJSON(raw)
+
     if type(decoded) ~= "table" then
-        SetSettingsStatus("Profile load skipped: invalid profile file")
+        SetSettingsStatus(
+            "Profile load skipped: invalid file"
+        )
         return
     end
 
-    local loadedProfiles = {}
+    local cleaned = {}
     local names = {}
 
     for _, profile in ipairs(decoded) do
         if type(profile) == "table" then
-            local name = TrimString(profile.name)
-            local x = profile.x
-            local y = profile.y
-            local z = profile.z
+            local rawName =
+                type(profile.ProfileName) == "string"
+                and profile.ProfileName
+                or profile.name
 
-            -- Legacy profiles have only X/Y; Z defaults to 0.
-            if z == nil then
-                z = 0
-            end
+            local rawConfig =
+                type(profile.ConfigData) == "table"
+                and profile.ConfigData
+                or profile.config
 
-            if name ~= ""
-                and IsFiniteNumber(x)
-                and IsFiniteNumber(y)
-                and IsFiniteNumber(z)
+            if type(rawName) == "string"
+                and type(rawConfig) == "table"
             then
-                x = math.clamp(x, -200, 200)
-                y = math.clamp(y, -200, 200)
-                z = math.clamp(z, -200, 200)
+                local name = TrimString(rawName)
+                local gameName =
+                    type(profile.GameName) == "string"
+                    and profile.GameName
+                    or (
+                        type(profile.gameName) == "string"
+                        and profile.gameName
+                        or "Unknown"
+                    )
 
-                if not names[name] then
-                    local placeId = 0
-                    local gameName = "Unknown"
+                local placeId =
+                    IsFiniteNumber(profile.PlaceId)
+                    and profile.PlaceId
+                    or (
+                        IsFiniteNumber(profile.placeId)
+                        and profile.placeId
+                        or 0
+                    )
 
-                    if IsFiniteNumber(profile.placeId) then
-                        placeId = profile.placeId
-                    end
+                local version =
+                    IsFiniteNumber(profile.Version)
+                    and profile.Version
+                    or (
+                        IsFiniteNumber(profile.version)
+                        and profile.version
+                        or 1
+                    )
 
-                    if type(profile.gameName) == "string" then
-                        gameName = profile.gameName
-                    end
+                local createdAt =
+                    IsFiniteNumber(profile.CreatedAt)
+                    and profile.CreatedAt
+                    or (
+                        IsFiniteNumber(profile.createdAt)
+                        and profile.createdAt
+                        or 0
+                    )
 
-                    local cleaned = {
+                local profileKey =
+                    tostring(placeId)
+                    .. "|"
+                    .. tostring(gameName)
+                    .. "|"
+                    .. name
+
+                if name ~= "" and not names[profileKey] then
+                    table.insert(cleaned, {
+                        ProfileName = name,
+                        GameName = gameName,
+                        PlaceId = placeId,
+                        Version = version,
+                        CreatedAt = createdAt,
+                        ConfigData = rawConfig,
+
+                        -- Legacy aliases kept for old code/profile compatibility.
                         name = name,
-                        x = x,
-                        y = y,
-                        z = z,
+                        gameName = gameName,
                         placeId = placeId,
-                        gameName = gameName
-                    }
+                        version = version,
+                        createdAt = createdAt,
+                        config = rawConfig
+                    })
 
-                    table.insert(loadedProfiles, cleaned)
-                    names[name] = true
+                    names[profileKey] = true
                 end
             end
         end
     end
 
-    ESPProfiles = loadedProfiles
+    MenuProfiles = cleaned
 end
 
-local function FindProfileByName(name)
-    for _, profile in ipairs(ESPProfiles) do
-        if profile.name == name then
+local function FindMenuProfile(name)
+    for _, profile in ipairs(MenuProfiles) do
+        if profile.name == name
+            and profile.placeId == CurrentPlaceId
+            and profile.gameName == CurrentGameName
+        then
             return profile
         end
     end
@@ -5848,92 +7114,77 @@ local function FindProfileByName(name)
     return nil
 end
 
-local function ApplyESPProfile(profile)
-    if type(profile) ~= "table" then
-        return
-    end
-
-    local x = profile.x
-    local y = profile.y
-    local z = profile.z
-
-    -- Legacy profiles implicitly use Z = 0.
-    if z == nil then
-        z = 0
-    end
-
-    if
-        not IsFiniteNumber(x)
-        or not IsFiniteNumber(y)
-        or not IsFiniteNumber(z)
+local function ApplyMenuProfile(profile)
+    if type(profile) ~= "table"
+        or type(profile.config) ~= "table"
     then
-        SetSettingsStatus("Profile apply failed: invalid offset data")
+        SetSettingsStatus(
+            "Profile apply failed: invalid profile"
+        )
         return
     end
 
-    x = math.clamp(x, -200, 200)
-    y = math.clamp(y, -200, 200)
-    z = math.clamp(z, -200, 200)
+    local ok, err =
+        ApplyConfigPayload(profile.config)
 
-    Config.ESPOffsetX = x
-    Config.ESPOffsetY = y
-    Config.ESPOffsetZ = z
-
-    if UIRefs.Sliders.ESPOffsetX then
-        UIRefs.Sliders.ESPOffsetX.Set(x, true)
+    if not ok then
+        SetSettingsStatus(
+            "Profile apply failed: "
+            .. tostring(err)
+        )
+        return
     end
 
-    if UIRefs.Sliders.ESPOffsetY then
-        UIRefs.Sliders.ESPOffsetY.Set(y, true)
-    end
-
-    if UIRefs.Sliders.ESPOffsetZ then
-        UIRefs.Sliders.ESPOffsetZ.Set(z, true)
-    end
-
-    SetSettingsStatus("Profile applied: " .. tostring(profile.name))
-end
-
-local function CreateProfileApplyButton(parent, profile)
-    local button = Instance.new("TextButton")
-    button.Name = "Apply"
-    button.Size = UDim2.new(0, 68, 0, 24)
-    button.Position = UDim2.new(1, -74, 0, 9)
-    button.Text = "APPLY"
-    button.TextColor3 = Config.TextColor
-    button.Font = Enum.Font.GothamMedium
-    button.TextSize = 10
-    button.BackgroundColor3 = Config.DarkBg
-    button.AutoButtonColor = false
-    button.ZIndex = 5
-    button.Parent = parent
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 5)
-    corner.Parent = button
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Config.BorderColor
-    stroke.Thickness = 1
-    stroke.Parent = button
-
-    AddProfileConnection(
-        button.MouseButton1Click:Connect(function()
-            ApplyESPProfile(profile)
-        end)
+    SyncSettingsUI()
+    SetSettingsStatus(
+        "Profile loaded: "
+        .. tostring(profile.name)
     )
-
-    return button
 end
 
-local function RefreshProfileList()
-    if not ProfileList then
+local function DeleteMenuProfile(profileName)
+    local indexToRemove
+
+    for index, profile in ipairs(MenuProfiles) do
+        if profile.name == profileName
+            and profile.placeId == CurrentPlaceId
+            and profile.gameName == CurrentGameName
+        then
+            indexToRemove = index
+            break
+        end
+    end
+
+    if not indexToRemove then
+        return false
+    end
+
+    table.remove(MenuProfiles, indexToRemove)
+    SaveMenuProfiles()
+
+    return true
+end
+
+local function DestroyMenuProfilePopup()
+    DisconnectMenuProfilePopupConnections()
+
+    if MenuProfilePopup
+        and MenuProfilePopup.Parent
+    then
+        MenuProfilePopup:Destroy()
+    end
+
+    MenuProfilePopup = nil
+end
+
+local function RefreshMenuProfileList()
+    if not MenuProfileList then
         return
     end
 
-    DisconnectProfileConnections()
+    DisconnectMenuProfileConnections()
 
-    for _, child in ipairs(ProfileList:GetChildren()) do
+    for _, child in ipairs(MenuProfileList:GetChildren()) do
         if not child:IsA("UIListLayout")
             and not child:IsA("UIPadding")
         then
@@ -5941,291 +7192,411 @@ local function RefreshProfileList()
         end
     end
 
-    for index, profile in ipairs(ESPProfiles) do
+    local visibleProfiles = {}
+
+    for _, profile in ipairs(MenuProfiles) do
+        if profile.placeId == CurrentPlaceId
+            and profile.gameName == CurrentGameName
+        then
+            table.insert(
+                visibleProfiles,
+                profile
+            )
+        end
+    end
+
+    for index, profile in ipairs(visibleProfiles) do
         local item = Instance.new("Frame")
-        item.Name = "Profile_" .. tostring(index)
-        item.Size = UDim2.new(1, -4, 0, 58)
+        item.Name =
+            "MenuProfile_" .. tostring(index)
+        item.Size =
+            UDim2.new(1, -4, 0, 56)
         item.BackgroundColor3 = Config.DarkBg
         item.BorderSizePixel = 0
-        item.Parent = ProfileList
+        item.Parent = MenuProfileList
 
         local corner = Instance.new("UICorner")
         corner.CornerRadius = UDim.new(0, 5)
         corner.Parent = item
 
-        local stroke = Instance.new("UIStroke")
-        stroke.Color = Config.BorderColor
-        stroke.Thickness = 1
-        stroke.Parent = item
-
         local nameLabel = Instance.new("TextLabel")
-        nameLabel.Size = UDim2.new(1, -86, 0, 19)
-        nameLabel.Position = UDim2.new(0, 8, 0, 5)
-        nameLabel.Text = tostring(profile.name)
+        nameLabel.Size =
+            UDim2.new(1, -155, 0, 22)
+        nameLabel.Position =
+            UDim2.new(0, 8, 0, 5)
+        nameLabel.Text = profile.name
         nameLabel.TextColor3 = Config.TextColor
         nameLabel.Font = Enum.Font.GothamBold
         nameLabel.TextSize = 11
-        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        nameLabel.TextXAlignment =
+            Enum.TextXAlignment.Left
+        nameLabel.TextTruncate =
+            Enum.TextTruncate.AtEnd
         nameLabel.BackgroundTransparency = 1
-        nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        nameLabel.ZIndex = 4
         nameLabel.Parent = item
 
-        local offsetLabel = Instance.new("TextLabel")
-        offsetLabel.Size = UDim2.new(1, -86, 0, 16)
-        offsetLabel.Position = UDim2.new(0, 8, 0, 25)
-        offsetLabel.Text =
-            "X: "
-            .. tostring(profile.x)
-            .. "    Y: "
-            .. tostring(profile.y)
-            .. "    Z: "
-            .. tostring(profile.z or 0)
-        offsetLabel.TextColor3 = Config.SubTextColor
-        offsetLabel.Font = Enum.Font.Gotham
-        offsetLabel.TextSize = 10
-        offsetLabel.TextXAlignment = Enum.TextXAlignment.Left
-        offsetLabel.BackgroundTransparency = 1
-        offsetLabel.ZIndex = 4
-        offsetLabel.Parent = item
-
-        local metadataLabel = Instance.new("TextLabel")
-        metadataLabel.Size = UDim2.new(1, -86, 0, 13)
-        metadataLabel.Position = UDim2.new(0, 8, 0, 41)
-        metadataLabel.Text =
-            tostring(profile.gameName or "Unknown")
+        local gameLabel = Instance.new("TextLabel")
+        gameLabel.Size =
+            UDim2.new(1, -155, 0, 18)
+        gameLabel.Position =
+            UDim2.new(0, 8, 0, 28)
+        gameLabel.Text =
+            tostring(profile.gameName)
             .. " | PlaceId: "
-            .. tostring(profile.placeId or 0)
-        metadataLabel.TextColor3 = Config.SubTextColor
-        metadataLabel.Font = Enum.Font.Gotham
-        metadataLabel.TextSize = 9
-        metadataLabel.TextXAlignment = Enum.TextXAlignment.Left
-        metadataLabel.BackgroundTransparency = 1
-        metadataLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        metadataLabel.ZIndex = 4
-        metadataLabel.Parent = item
+            .. tostring(profile.placeId)
+        gameLabel.TextColor3 =
+            Config.SubTextColor
+        gameLabel.Font = Enum.Font.Gotham
+        gameLabel.TextSize = 9
+        gameLabel.TextXAlignment =
+            Enum.TextXAlignment.Left
+        gameLabel.TextTruncate =
+            Enum.TextTruncate.AtEnd
+        gameLabel.BackgroundTransparency = 1
+        gameLabel.Parent = item
 
-        CreateProfileApplyButton(item, profile)
+        local runButton =
+            UI:CreateButton(
+                item,
+                "RUN",
+                function()
+                    ApplyMenuProfile(profile)
+                end
+            )
+
+        runButton.Size =
+            UDim2.new(0, 58, 0, 24)
+        runButton.Position =
+            UDim2.new(1, -132, 0, 16)
+
+        local deleteButton =
+            UI:CreateButton(
+                item,
+                "DELETE",
+                function()
+                    if DeleteMenuProfile(profile.name) then
+                        RefreshMenuProfileList()
+                        SetSettingsStatus(
+                            "Profile deleted: "
+                            .. tostring(profile.name)
+                        )
+                    end
+                end
+            )
+
+        deleteButton.Size =
+            UDim2.new(0, 66, 0, 24)
+        deleteButton.Position =
+            UDim2.new(1, -70, 0, 16)
+
+        
     end
 
-    ProfileList.CanvasSize =
+    MenuProfileList.CanvasSize =
         UDim2.new(
             0,
             0,
             0,
-            #ESPProfiles * 64 + 4
+            #visibleProfiles * 62 + 4
         )
 end
 
-local function DisconnectProfilePopupConnections()
-    for _, conn in ipairs(ProfilePopupConnections) do
-        pcall(function()
-            conn:Disconnect()
-        end)
-    end
-
-    table.clear(ProfilePopupConnections)
-end
-
-local function DestroyProfilePopup(popup)
-    DisconnectProfilePopupConnections()
-
-    if not popup then
-        popup = MainWindow:FindFirstChild("ESPProfileConfirmPopup")
-    end
-
-    if popup and popup.Parent then
-        popup:Destroy()
-    end
-end
-
-local function OpenProfileConfirmPopup(rawName)
-    local profileName = TrimString(rawName)
-
-    if profileName == "" then
-        SetSettingsStatus("Enter a profile name first")
-        return
-    end
-
-    DestroyProfilePopup(nil)
+local function OpenSaveMenuProfilePopup()
+    DestroyMenuProfilePopup()
 
     local popup = Instance.new("Frame")
-    popup.Name = "ESPProfileConfirmPopup"
-    popup.Size = UDim2.new(0, 300, 0, 188)
-    popup.AnchorPoint = Vector2.new(0.5, 0.5)
-    popup.Position = UDim2.new(0.5, 0, 0.5, 0)
-    popup.BackgroundColor3 = Config.CardBg
+    MenuProfilePopup = popup
+    popup.Name =
+        "SaveMenuProfilePopup"
+    popup.Size =
+        UDim2.new(0, 300, 0, 150)
+    popup.AnchorPoint =
+        Vector2.new(0.5, 0.5)
+    popup.Position =
+        UDim2.new(0.5, 0, 0.5, 0)
+    popup.BackgroundColor3 =
+        Config.CardBg
     popup.BorderSizePixel = 0
     popup.ZIndex = 200
     popup.Parent = MainWindow
 
-    local pCorner = Instance.new("UICorner")
-    pCorner.CornerRadius = UDim.new(0, 8)
-    pCorner.Parent = popup
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = popup
 
-    local pStroke = Instance.new("UIStroke")
-    pStroke.Color = Config.BorderColor
-    pStroke.Thickness = 1
-    pStroke.Parent = popup
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Config.BorderColor
+    stroke.Thickness = 1
+    stroke.Parent = popup
 
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -20, 0, 24)
-    title.Position = UDim2.new(0, 10, 0, 10)
-    title.Text = "CONFIRM PROFILE"
-    title.TextColor3 = Config.TextColor
+    title.Size =
+        UDim2.new(1, -20, 0, 24)
+    title.Position =
+        UDim2.new(0, 10, 0, 9)
+    title.Text = "SAVE MENU"
+    title.TextColor3 =
+        Config.TextColor
     title.Font = Enum.Font.GothamBold
     title.TextSize = 12
-    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextXAlignment =
+        Enum.TextXAlignment.Left
     title.BackgroundTransparency = 1
     title.ZIndex = 201
     title.Parent = popup
 
-    local profileLabel = Instance.new("TextLabel")
-    profileLabel.Size = UDim2.new(1, -20, 0, 20)
-    profileLabel.Position = UDim2.new(0, 10, 0, 38)
-    profileLabel.Text = "Profile Name: " .. profileName
-    profileLabel.TextColor3 = Config.SubTextColor
-    profileLabel.Font = Enum.Font.Gotham
-    profileLabel.TextSize = 11
-    profileLabel.TextXAlignment = Enum.TextXAlignment.Left
-    profileLabel.BackgroundTransparency = 1
-    profileLabel.ZIndex = 201
-    profileLabel.TextTruncate = Enum.TextTruncate.AtEnd
-    profileLabel.Parent = popup
+    local nameBox = Instance.new("TextBox")
+    nameBox.Size =
+        UDim2.new(1, -20, 0, 32)
+    nameBox.Position =
+        UDim2.new(0, 10, 0, 38)
+    nameBox.PlaceholderText =
+        "Nhập tên profile..."
+    nameBox.Text = ""
+    nameBox.TextColor3 =
+        Config.TextColor
+    nameBox.PlaceholderColor3 =
+        Config.SubTextColor
+    nameBox.Font = Enum.Font.Gotham
+    nameBox.TextSize = 12
+    nameBox.BackgroundColor3 =
+        Config.DarkBg
+    nameBox.BorderSizePixel = 0
+    nameBox.ClearTextOnFocus = false
+    nameBox.ZIndex = 201
+    nameBox.Parent = popup
 
-    local offsetLabel = Instance.new("TextLabel")
-    offsetLabel.Size = UDim2.new(1, -20, 0, 38)
-    offsetLabel.Position = UDim2.new(0, 10, 0, 64)
-    offsetLabel.Text =
-        "Save current ESP offset:\n"
-        .. "X: "
-        .. tostring(Config.ESPOffsetX)
-        .. "    Y: "
-        .. tostring(Config.ESPOffsetY)
-        .. "    Z: "
-        .. tostring(Config.ESPOffsetZ)
-    offsetLabel.TextColor3 = Config.TextColor
-    offsetLabel.Font = Enum.Font.GothamMedium
-    offsetLabel.TextSize = 11
-    offsetLabel.TextXAlignment = Enum.TextXAlignment.Left
-    offsetLabel.BackgroundTransparency = 1
-    offsetLabel.ZIndex = 201
-    offsetLabel.Parent = popup
+    local boxCorner = Instance.new("UICorner")
+    boxCorner.CornerRadius =
+        UDim.new(0, 5)
+    boxCorner.Parent = nameBox
 
-    local okButton = Instance.new("TextButton")
-    okButton.Size = UDim2.new(0, 120, 0, 30)
-    okButton.Position = UDim2.new(0, 18, 1, -42)
-    okButton.Text = "OK"
-    okButton.TextColor3 = Config.TextColor
-    okButton.Font = Enum.Font.GothamMedium
-    okButton.TextSize = 12
-    okButton.BackgroundColor3 = Config.DarkBg
-    okButton.AutoButtonColor = false
-    okButton.ZIndex = 202
-    okButton.Parent = popup
+    local saveButton =
+        UI:CreateButton(
+            popup,
+            "SAVE",
+            function()
+                local profileName =
+                    TrimString(nameBox.Text)
 
-    local okCorner = Instance.new("UICorner")
-    okCorner.CornerRadius = UDim.new(0, 5)
-    okCorner.Parent = okButton
+                if profileName == "" then
+                    SetSettingsStatus(
+                        "Enter a profile name first"
+                    )
+                    return
+                end
 
-    local cancelButton = Instance.new("TextButton")
-    cancelButton.Size = UDim2.new(0, 120, 0, 30)
-    cancelButton.Position = UDim2.new(1, -138, 1, -42)
-    cancelButton.Text = "CANCEL"
-    cancelButton.TextColor3 = Config.TextColor
-    cancelButton.Font = Enum.Font.GothamMedium
-    cancelButton.TextSize = 12
-    cancelButton.BackgroundColor3 = Config.DarkBg
-    cancelButton.AutoButtonColor = false
-    cancelButton.ZIndex = 202
-    cancelButton.Parent = popup
+                local profile =
+                    FindMenuProfile(profileName)
+                local payload =
+                    BuildConfigPayload()
 
-    local cancelCorner = Instance.new("UICorner")
-    cancelCorner.CornerRadius = UDim.new(0, 5)
-    cancelCorner.Parent = cancelButton
+                if profile then
+                    SetSettingsStatus(
+                        "Profile already exists in this game. DELETE it first or use another name."
+                    )
+                    return
+                end
+
+                table.insert(
+                    MenuProfiles,
+                    {
+                        ProfileName = profileName,
+                        GameName = CurrentGameName,
+                        PlaceId = CurrentPlaceId,
+                        ConfigData = payload,
+                        Version = 1,
+                        CreatedAt = os.time(),
+
+                        -- Compatibility aliases for older profile readers.
+                        name = profileName,
+                        gameName = CurrentGameName,
+                        placeId = CurrentPlaceId,
+                        config = payload,
+                        version = 1,
+                        createdAt = os.time()
+                    }
+                )
+
+                SaveMenuProfiles()
+                RefreshMenuProfileList()
+                DestroyMenuProfilePopup()
+
+                SetSettingsStatus(
+                    "Profile saved: "
+                    .. profileName
+                )
+            end
+        )
+
+    saveButton.Size =
+        UDim2.new(0, 120, 0, 30)
+    saveButton.Position =
+        UDim2.new(0, 18, 1, -40)
+
+    local cancelButton =
+        UI:CreateButton(
+            popup,
+            "CANCEL",
+            function()
+                DestroyMenuProfilePopup()
+            end
+        )
+
+    cancelButton.Size =
+        UDim2.new(0, 120, 0, 30)
+    cancelButton.Position =
+        UDim2.new(1, -138, 1, -40)
 
     table.insert(
-        ProfilePopupConnections,
-        okButton.MouseButton1Click:Connect(function()
-            local existingProfile = FindProfileByName(profileName)
-
-            if existingProfile then
-                existingProfile.x = math.clamp(
-                    tonumber(Config.ESPOffsetX) or 0,
-                    -200,
-                    200
-                )
-                existingProfile.y = math.clamp(
-                    tonumber(Config.ESPOffsetY) or 0,
-                    -200,
-                    200
-                )
-                existingProfile.z = math.clamp(
-                    tonumber(Config.ESPOffsetZ) or 0,
-                    -200,
-                    200
-                )
-                existingProfile.placeId = CurrentPlaceId
-                existingProfile.gameName = CurrentGameName
-
-                local persisted = SaveESPProfiles()
-                RefreshProfileList()
-
-                if persisted then
-                    SetSettingsStatus("Profile updated: " .. profileName)
+        MenuProfilePopupConnections,
+        nameBox.FocusLost:Connect(
+            function(enterPressed)
+                if enterPressed then
+                    saveButton:Activate()
                 end
-            else
-                local newProfile = {
-                    name = profileName,
-                    x = math.clamp(
-                        tonumber(Config.ESPOffsetX) or 0,
-                        -200,
-                        200
-                    ),
-                    y = math.clamp(
-                        tonumber(Config.ESPOffsetY) or 0,
-                        -200,
-                        200
-                    ),
-                    z = math.clamp(
-                        tonumber(Config.ESPOffsetZ) or 0,
-                        -200,
-                        200
-                    ),
-                    placeId = CurrentPlaceId,
-                    gameName = CurrentGameName
-                }
+            end
+        )
+    )
 
-                table.insert(ESPProfiles, newProfile)
-                local persisted = SaveESPProfiles()
-                RefreshProfileList()
+    pcall(function()
+        nameBox:CaptureFocus()
+    end)
+end
 
-                if persisted then
-                    SetSettingsStatus("Profile added: " .. profileName)
+LoadMenuProfiles()
+
+UIRefs.ExtraSettingsSection =
+    UI:CreateSection(
+        SettingsPage,
+        "FEATURE SETTINGS"
+    )
+
+UIRefs.Toggles.InfiniteYield =
+    UI:CreateToggle(
+        UIRefs.ExtraSettingsSection,
+        {
+            Text = "Infinite Yield",
+            Default = Config.InfiniteYieldEnabled,
+            Callback = function(value)
+                local ok =
+                    ExtraFeatures.SetInfiniteYield(value)
+
+                if value and not ok
+                    and UIRefs.Toggles.InfiniteYield
+                then
+                    UIRefs.Toggles.InfiniteYield.Set(
+                        false,
+                        true
+                    )
+                end
+            end
+        }
+    )
+
+UIRefs.Toggles.AntiLocal =
+    UI:CreateToggle(
+        UIRefs.ExtraSettingsSection,
+        {
+            Text = "Anti-Local Anti-Cheat",
+            Default = Config.AntiLocalEnabled,
+            Callback = function(value)
+                ExtraFeatures.SetAntiLocal(value)
+            end
+        }
+    )
+
+UIRefs.GamePassSpooferButton =
+    UI:CreateButton(
+        UIRefs.ExtraSettingsSection,
+        "Game Pass Spoofer",
+        function()
+            ExtraFeatures.EnableGamePassSpoofer()
+        end
+    )
+
+UI:CreateLabel(
+    UIRefs.ExtraSettingsSection,
+    "Game Pass Spoofer is client-side only; server ownership is unchanged."
+)
+
+UIRefs.Toggles.HoldToSpam =
+    UI:CreateToggle(
+        UIRefs.ExtraSettingsSection,
+        {
+            Text = "Hold to Spam",
+            Default = Config.HoldToSpamEnabled,
+            Callback = function(value)
+                Config.HoldToSpamEnabled =
+                    value == true
+
+                if not Config.HoldToSpamEnabled then
+                    ExtraFeatures.HoldSpamKeyHeld = false
+                    ExtraFeatures.HoldSpamRightHeld = false
+                    ExtraFeatures.HoldSpamAccumulator = 0
+                end
+            end
+        }
+    )
+
+UIRefs.HoldToSpamKeyBox =
+    Instance.new("TextButton")
+UIRefs.HoldToSpamKeyBox.Name =
+    "HoldToSpamKeyBox"
+UIRefs.HoldToSpamKeyBox.Size =
+    UDim2.new(1, 0, 0, 30)
+UIRefs.HoldToSpamKeyBox.Text =
+    "Hold to Spam Key: "
+    .. Config.HoldToSpamKey.Name
+UIRefs.HoldToSpamKeyBox.Parent =
+    UIRefs.ExtraSettingsSection
+
+ExtraFeatures.StyleKeyButton(
+    UIRefs.HoldToSpamKeyBox
+)
+
+AddConnection(
+    UIRefs.HoldToSpamKeyBox.MouseButton1Click:Connect(
+        function()
+            if ExtraFeatures.HoldSpamListening then
+                ExtraFeatures.HoldSpamListening = false
+                ExtraFeatures.HoldSpamKeyBox = nil
+
+                UIRefs.HoldToSpamKeyBox.Text =
+                    "Hold to Spam Key: "
+                    .. Config.HoldToSpamKey.Name
+                return
+            end
+
+            ExtraFeatures.HoldSpamListening = true
+            ExtraFeatures.HoldSpamKeyBox =
+                UIRefs.HoldToSpamKeyBox
+
+            if ExtraFeatures.CopyOutfitListening then
+                ExtraFeatures.CopyOutfitListening = false
+                ExtraFeatures.CopyOutfitKeyBox = nil
+
+                if UIRefs.CopyPlayerOutfitKeyBox then
+                    UIRefs.CopyPlayerOutfitKeyBox.Text =
+                        "Copy Outfit Key: "
+                        .. Config.CopyPlayerOutfitKey.Name
                 end
             end
 
-            ProfileNameInput.Text = ""
-            DestroyProfilePopup(popup)
-        end)
+            UIRefs.HoldToSpamKeyBox.Text =
+                "Press Key..."
+        end
     )
+)
 
-    table.insert(
-        ProfilePopupConnections,
-        cancelButton.MouseButton1Click:Connect(function()
-            DestroyProfilePopup(popup)
-        end)
-    )
-end
-
-local ConfigSaveLoadSec =
+UIRefs.ConfigSaveLoadSec =
     UI:CreateSection(
         SettingsPage,
         "CONFIG SAVE / LOAD"
     )
 
 UI:CreateButton(
-    ConfigSaveLoadSec,
+    UIRefs.ConfigSaveLoadSec,
     "SAVE SETTINGS",
     function()
         SaveSettings()
@@ -6233,7 +7604,7 @@ UI:CreateButton(
 )
 
 UI:CreateButton(
-    ConfigSaveLoadSec,
+    UIRefs.ConfigSaveLoadSec,
     "LOAD SETTINGS",
     function()
         LoadSettings()
@@ -6242,145 +7613,75 @@ UI:CreateButton(
 
 SettingsStatusLabel =
     UI:CreateLabel(
-        ConfigSaveLoadSec,
+        UIRefs.ConfigSaveLoadSec,
         "Ready"
     )
 
-local ESPOffsetSec =
+
+UIRefs.MenuProfileSec =
     UI:CreateSection(
         SettingsPage,
-        "ESP OFFSET"
+        "SAVE / LOAD MENU"
     )
 
-UIRefs.Sliders.ESPOffsetX =
-    UI:CreateSlider(
-        ESPOffsetSec,
-        {
-            Text = "ESP X",
-            Min = -200,
-            Max = 200,
-            Default = Config.ESPOffsetX,
-            Increment = 1,
-            EditableValue = true,
-            AllowTextInputBeyondRange = false,
-            Callback = function(value)
-                if IsFiniteNumber(value) then
-                    Config.ESPOffsetX =
-                        math.clamp(value, -200, 200)
-                end
-            end
-        }
-    )
-
-UIRefs.Sliders.ESPOffsetY =
-    UI:CreateSlider(
-        ESPOffsetSec,
-        {
-            Text = "ESP Y",
-            Min = -200,
-            Max = 200,
-            Default = Config.ESPOffsetY,
-            Increment = 1,
-            EditableValue = true,
-            AllowTextInputBeyondRange = false,
-            Callback = function(value)
-                if IsFiniteNumber(value) then
-                    Config.ESPOffsetY =
-                        math.clamp(value, -200, 200)
-                end
-            end
-        }
-    )
-
-UIRefs.Sliders.ESPOffsetZ =
-    UI:CreateSlider(
-        ESPOffsetSec,
-        {
-            Text = "ESP Z",
-            Min = -200,
-            Max = 200,
-            Default = Config.ESPOffsetZ,
-            Increment = 1,
-            EditableValue = true,
-            AllowTextInputBeyondRange = false,
-            Callback = function(value)
-                if IsFiniteNumber(value) then
-                    Config.ESPOffsetZ =
-                        math.clamp(value, -200, 200)
-                end
-            end
-        }
-    )
-
-local ESPProfileSec =
-    UI:CreateSection(
-        SettingsPage,
-        "ESP OFFSET PROFILES"
-    )
-
-local CurrentGameLabel =
-    UI:CreateLabel(
-        ESPProfileSec,
-        "Current Game: "
-            .. tostring(CurrentGameName)
-            .. "\nPlaceId: "
-            .. tostring(CurrentPlaceId)
-    )
-
-ProfileNameInput =
-    UI:CreateTextbox(
-        ESPProfileSec,
-        {
-            Text = "Profile Name",
-            Placeholder = "Nhập tên game/profile...",
-            Default = "",
-            Callback = function()
-                -- Confirmation is handled by the + button below.
-            end
-        }
-    )
+UI:CreateLabel(
+    UIRefs.MenuProfileSec,
+    "Current Game: "
+        .. tostring(CurrentGameName)
+        .. "\nPlaceId: "
+        .. tostring(CurrentPlaceId)
+)
 
 UI:CreateButton(
-    ESPProfileSec,
-    "[ + ]",
+    UIRefs.MenuProfileSec,
+    "SAVE MENU",
     function()
-        OpenProfileConfirmPopup(ProfileNameInput.Text)
+        OpenSaveMenuProfilePopup()
     end
 )
 
-ProfileList =
+MenuProfileList =
     Instance.new("ScrollingFrame")
 
-ProfileList.Name = "ESPProfileList"
-ProfileList.Size = UDim2.new(1, 0, 0, 190)
-ProfileList.BackgroundTransparency = 1
-ProfileList.BorderSizePixel = 0
-ProfileList.ScrollBarThickness = 3
-ProfileList.ScrollBarImageColor3 = Config.SubTextColor
-ProfileList.Parent = ESPProfileSec
+MenuProfileList.Name =
+    "MenuProfileList"
+MenuProfileList.Size =
+    UDim2.new(1, 0, 0, 190)
+MenuProfileList.BackgroundTransparency = 1
+MenuProfileList.BorderSizePixel = 0
+MenuProfileList.ScrollBarThickness = 3
+MenuProfileList.ScrollBarImageColor3 =
+    Config.SubTextColor
+MenuProfileList.Parent = UIRefs.MenuProfileSec
 
-local ProfileListLayout =
+UIRefs.MenuProfileListLayout =
     Instance.new("UIListLayout")
 
-ProfileListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-ProfileListLayout.Padding = UDim.new(0, 6)
-ProfileListLayout.Parent = ProfileList
+UIRefs.MenuProfileListLayout.SortOrder =
+    Enum.SortOrder.LayoutOrder
+UIRefs.MenuProfileListLayout.Padding =
+    UDim.new(0, 6)
+UIRefs.MenuProfileListLayout.Parent =
+    MenuProfileList
 
-local ProfileListPadding =
+UIRefs.MenuProfileListPadding =
     Instance.new("UIPadding")
 
-ProfileListPadding.PaddingTop = UDim.new(0, 2)
-ProfileListPadding.PaddingBottom = UDim.new(0, 2)
-ProfileListPadding.Parent = ProfileList
+UIRefs.MenuProfileListPadding.PaddingTop =
+    UDim.new(0, 2)
+UIRefs.MenuProfileListPadding.PaddingBottom =
+    UDim.new(0, 2)
+UIRefs.MenuProfileListPadding.Parent =
+    MenuProfileList
 
-LoadESPProfiles()
-RefreshProfileList()
+RefreshMenuProfileList()
 
 if not FileAPI.Available then
     SetSettingsStatus(
-        "Filesystem persistence unavailable; session-only save"
+        "Filesystem persistence unavailable; session-only profiles"
     )
 end
+
 
 -- =========================================================
 -- TAB: KHÁC
@@ -6570,6 +7871,8 @@ RunService:BindToRenderStep(
     function(renderDt)
         UpdatePlayer(renderDt)
         UpdateTeleport()
+        ExtraFeatures.UpdateHitboxes(renderDt, false)
+        ExtraFeatures.UpdateHoldSpam(renderDt)
         OtherSystem.UpdateMenuInput()
     end
 )
@@ -6719,6 +8022,10 @@ CloseBtn.MouseButton1Click:Connect(function()
     SetMenuState("Closed")
 
     CleanupPlayerRuntime()
+    ExtraFeatures.RestoreAllHitboxes()
+    ExtraFeatures.HoldSpamKeyHeld = false
+    ExtraFeatures.HoldSpamRightHeld = false
+    ExtraFeatures.HoldSpamAccumulator = 0
 
     pcall(function()
         RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
@@ -6744,6 +8051,83 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 
     if OtherSystem.KeybindListening then
+        return
+    end
+
+    if ExtraFeatures.CopyOutfitListening then
+        if input.UserInputType ~= Enum.UserInputType.Keyboard
+            or input.KeyCode == Enum.KeyCode.Unknown
+        then
+            return
+        end
+
+        Config.CopyPlayerOutfitKey = input.KeyCode
+        ExtraFeatures.CopyOutfitListening = false
+
+        if ExtraFeatures.CopyOutfitKeyBox
+            and ExtraFeatures.CopyOutfitKeyBox.Parent
+        then
+            ExtraFeatures.CopyOutfitKeyBox.Text =
+                "Copy Outfit Key: "
+                .. Config.CopyPlayerOutfitKey.Name
+        end
+
+        ExtraFeatures.CopyOutfitKeyBox = nil
+        return
+    end
+
+    if ExtraFeatures.HoldSpamListening then
+        if input.UserInputType ~= Enum.UserInputType.Keyboard
+            or input.KeyCode == Enum.KeyCode.Unknown
+        then
+            return
+        end
+
+        Config.HoldToSpamKey = input.KeyCode
+        ExtraFeatures.HoldSpamListening = false
+
+        if ExtraFeatures.HoldSpamKeyBox
+            and ExtraFeatures.HoldSpamKeyBox.Parent
+        then
+            ExtraFeatures.HoldSpamKeyBox.Text =
+                "Hold to Spam Key: "
+                .. Config.HoldToSpamKey.Name
+        end
+
+        ExtraFeatures.HoldSpamKeyBox = nil
+        return
+    end
+
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        if input.KeyCode == Config.CopyPlayerOutfitKey
+            and Config.CopyPlayerOutfitEnabled
+        then
+            ExtraFeatures.CopyOutfitKeyHeld = true
+        end
+
+        if input.KeyCode == Config.HoldToSpamKey
+            and Config.HoldToSpamEnabled
+        then
+            ExtraFeatures.HoldSpamKeyHeld = true
+        end
+    elseif input.UserInputType == Enum.UserInputType.MouseButton2
+        and Config.HoldToSpamEnabled
+    then
+        ExtraFeatures.HoldSpamRightHeld = true
+    end
+
+    if input.UserInputType == Enum.UserInputType.Keyboard
+        and (
+            (
+                Config.CopyPlayerOutfitEnabled
+                and input.KeyCode == Config.CopyPlayerOutfitKey
+            )
+            or (
+                Config.HoldToSpamEnabled
+                and input.KeyCode == Config.HoldToSpamKey
+            )
+        )
+    then
         return
     end
 
@@ -6773,6 +8157,8 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
                 function(renderDt)
                     UpdatePlayer(renderDt)
                     UpdateTeleport()
+                    ExtraFeatures.UpdateHitboxes(renderDt, false)
+                    ExtraFeatures.UpdateHoldSpam(renderDt)
                     OtherSystem.UpdateMenuInput()
                 end
             )
@@ -6801,6 +8187,30 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         end
     end
 end))
+
+AddConnection(
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            if input.KeyCode == Config.CopyPlayerOutfitKey then
+                ExtraFeatures.CopyOutfitKeyHeld = false
+            end
+
+            if input.KeyCode == Config.HoldToSpamKey then
+                ExtraFeatures.HoldSpamKeyHeld = false
+                ExtraFeatures.HoldSpamAccumulator = 0
+            end
+        elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+            ExtraFeatures.HoldSpamRightHeld = false
+            ExtraFeatures.HoldSpamAccumulator = 0
+        end
+    end)
+)
+
+AddConnection(
+    Mouse.Button1Down:Connect(function()
+        ExtraFeatures.CopyPlayerOutfit()
+    end)
+)
 
 -- Expose UI Framework global variable
 local function CleanupFramework()
@@ -6834,15 +8244,10 @@ local function CleanupFramework()
 
     NPCSystem.Initialized = false
 
-    DisconnectProfileConnections()
-    DisconnectProfilePopupConnections()
-
-    pcall(function()
-        local popup = MainWindow:FindFirstChild("ESPProfileConfirmPopup")
-        if popup then
-            popup:Destroy()
-        end
-    end)
+    DisconnectMenuProfileConnections()
+    DisconnectMenuProfilePopupConnections()
+    DestroyMenuProfilePopup()
+    ExtraFeatures.Cleanup()
 
     local teleportTargetsToCleanup = {}
 
@@ -6874,9 +8279,9 @@ _G.MyGUIFramework = {
         Page = SettingsPage,
         Save = SaveSettings,
         Load = LoadSettings,
-        ApplyESPProfile = ApplyESPProfile,
+        SaveProfile = OpenSaveMenuProfilePopup,
         GetProfiles = function()
-            return ESPProfiles
+            return MenuProfiles
         end
     },
 
@@ -6896,7 +8301,36 @@ _G.MyGUIFramework = {
 
     NPC = NPCSystem,
 
+    Notification = {
+        Open = ExtraFeatures.OpenNotificationView,
+        GetText = function()
+            return ExtraFeatures.NotificationText
+        end
+    },
+
     Cleanup = CleanupFramework
 }
+
+AddConnection(
+    UserInputService.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Keyboard
+            and input.KeyCode == Enum.KeyCode.F4
+        then
+            if type(CleanupFramework) == "function" then
+                CleanupFramework()
+            end
+
+            GUIState.CurrentState = "Closed"
+
+            pcall(function()
+                if ScreenGui then
+                    ScreenGui:Destroy()
+                end
+            end)
+
+            _G.MyGUIFramework = nil
+        end
+    end)
+)
 
 print("[Hood Rivals Framework & ESP Integrated Successfully!]")
