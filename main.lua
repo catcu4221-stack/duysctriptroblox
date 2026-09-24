@@ -90,6 +90,11 @@ local Config = {
 
     StartPage = "ESP",
 
+    -- OTHER TAB
+    ThirdPersonLock = false,
+    XRayEnabled = false,
+    XRayTransparency = 0.5,
+
     -- ESP Core Configuration
     Enabled = false,
     ShowEnemies = false,
@@ -161,6 +166,8 @@ local GUIState = {
     Pages = {},
     TabButtons = {}
 }
+
+local SetMenuState
 
 local UIRefs = {
     Toggles = {},
@@ -508,6 +515,555 @@ FloatStroke.Thickness = 1.5
 FloatStroke.Parent = FloatingBtn
 
 local isFloatDragged = MakeDraggable(FloatingBtn, FloatingBtn)
+
+-- =========================================================
+-- OTHER TAB SYSTEM
+-- Only the seven requested features live here.
+-- =========================================================
+local OtherSystem = {
+    XRayCache = {},
+    ServerActionBusy = false,
+    MenuMouseState = nil,
+    KeybindListening = false,
+    KeybindBox = nil,
+    ConsumeNextToggleInput = false,
+    Generation = 0
+}
+
+function OtherSystem.IsCharacterPart(part)
+    if not part or typeof(part) ~= "Instance" then
+        return true
+    end
+
+    local model = part:FindFirstAncestorOfClass("Model")
+    if not model then
+        return false
+    end
+
+    if Players:GetPlayerFromCharacter(model) then
+        return true
+    end
+
+    if LocalPlayer.Character and model == LocalPlayer.Character then
+        return true
+    end
+
+    return model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+function OtherSystem.ApplyXRayPart(part)
+    if
+        not Config.XRayEnabled
+        or not part
+        or typeof(part) ~= "Instance"
+        or not part:IsA("BasePart")
+        or not part:IsDescendantOf(Workspace)
+        or OtherSystem.IsCharacterPart(part)
+    then
+        return
+    end
+
+    if OtherSystem.XRayCache[part] == nil then
+        OtherSystem.XRayCache[part] = part.Transparency
+    end
+
+    local originalTransparency = OtherSystem.XRayCache[part]
+    part.Transparency =
+        math.max(originalTransparency, Config.XRayTransparency)
+end
+
+function OtherSystem.EnableXRay()
+    Config.XRayEnabled = true
+
+    for _, instance in ipairs(Workspace:GetDescendants()) do
+        if instance:IsA("BasePart") then
+            OtherSystem.ApplyXRayPart(instance)
+        end
+    end
+end
+
+function OtherSystem.DisableXRay()
+    Config.XRayEnabled = false
+
+    for part, originalTransparency in pairs(OtherSystem.XRayCache) do
+        if part and part.Parent then
+            pcall(function()
+                part.Transparency = originalTransparency
+            end)
+        end
+    end
+
+    table.clear(OtherSystem.XRayCache)
+end
+
+function OtherSystem.UpdateXRayTransparency()
+    if not Config.XRayEnabled then
+        return
+    end
+
+    for part, originalTransparency in pairs(OtherSystem.XRayCache) do
+        if part and part.Parent then
+            pcall(function()
+                part.Transparency =
+                    math.max(
+                        originalTransparency,
+                        Config.XRayTransparency
+                    )
+            end)
+        end
+    end
+end
+
+function OtherSystem.SetXRay(enabled)
+    enabled = enabled == true
+
+    if enabled then
+        if not Config.XRayEnabled then
+            OtherSystem.EnableXRay()
+        else
+            OtherSystem.UpdateXRayTransparency()
+        end
+    else
+        if Config.XRayEnabled then
+            OtherSystem.DisableXRay()
+        else
+            Config.XRayEnabled = false
+        end
+    end
+end
+
+function OtherSystem.SetThirdPerson(enabled)
+    enabled = enabled == true
+    Config.ThirdPersonLock = enabled
+
+    if enabled then
+        if not OtherSystem.ThirdPersonOriginal then
+            OtherSystem.ThirdPersonOriginal = {
+                CameraMode = LocalPlayer.CameraMode,
+                CameraMinZoomDistance = LocalPlayer.CameraMinZoomDistance,
+                CameraMaxZoomDistance = LocalPlayer.CameraMaxZoomDistance
+            }
+        end
+
+        pcall(function()
+            LocalPlayer.CameraMode = Enum.CameraMode.Classic
+
+            local maximumZoom =
+                math.max(
+                    tonumber(LocalPlayer.CameraMaxZoomDistance) or 10,
+                    0.5
+                )
+
+            LocalPlayer.CameraMinZoomDistance =
+                math.min(10, maximumZoom)
+
+            if LocalPlayer.CameraMaxZoomDistance
+                < LocalPlayer.CameraMinZoomDistance
+            then
+                LocalPlayer.CameraMaxZoomDistance =
+                    LocalPlayer.CameraMinZoomDistance
+            end
+        end)
+    else
+        local original = OtherSystem.ThirdPersonOriginal
+        if not original then
+            return
+        end
+
+        OtherSystem.ThirdPersonOriginal = nil
+
+        pcall(function()
+            LocalPlayer.CameraMode = original.CameraMode
+            LocalPlayer.CameraMinZoomDistance =
+                original.CameraMinZoomDistance
+            LocalPlayer.CameraMaxZoomDistance =
+                original.CameraMaxZoomDistance
+        end)
+    end
+end
+
+function OtherSystem.SetMenuMouseState(menuOpen)
+    if menuOpen then
+        if not OtherSystem.MenuMouseState then
+            OtherSystem.MenuMouseState = {
+                MouseBehavior = UserInputService.MouseBehavior,
+                MouseIconEnabled = UserInputService.MouseIconEnabled
+            }
+        end
+
+        pcall(function()
+            UserInputService.MouseBehavior =
+                Enum.MouseBehavior.Default
+            UserInputService.MouseIconEnabled = true
+        end)
+        return
+    end
+
+    local original = OtherSystem.MenuMouseState
+    if not original then
+        return
+    end
+
+    OtherSystem.MenuMouseState = nil
+
+    pcall(function()
+        UserInputService.MouseBehavior = original.MouseBehavior
+        UserInputService.MouseIconEnabled =
+            original.MouseIconEnabled
+    end)
+end
+
+function OtherSystem.UpdateMenuInput()
+    if GUIState.CurrentState == "Open" then
+        OtherSystem.SetMenuMouseState(true)
+    end
+end
+
+function OtherSystem.BeginKeybindCapture(box)
+    if OtherSystem.KeybindListening then
+        OtherSystem.KeybindListening = false
+        OtherSystem.KeybindBox = nil
+
+        if box and box.Parent then
+            box.Text = Config.ToggleKey.Name
+        end
+        return
+    end
+
+    OtherSystem.KeybindListening = true
+    OtherSystem.KeybindBox = box
+
+    if box and box.Parent then
+        box.Text = "Press Key"
+    end
+end
+
+function OtherSystem.HandleKeybindInput(input)
+    if not OtherSystem.KeybindListening then
+        return false
+    end
+
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then
+        return true
+    end
+
+    if input.KeyCode == Enum.KeyCode.Unknown then
+        return true
+    end
+
+    Config.ToggleKey = input.KeyCode
+    OtherSystem.KeybindListening = false
+    OtherSystem.ConsumeNextToggleInput = true
+
+    if OtherSystem.KeybindBox
+        and OtherSystem.KeybindBox.Parent
+    then
+        OtherSystem.KeybindBox.Text = Config.ToggleKey.Name
+    end
+
+    OtherSystem.KeybindBox = nil
+
+    return true
+end
+
+function OtherSystem.Request(url)
+    local requestFn
+
+    if type(request) == "function" then
+        requestFn = request
+    elseif type(http_request) == "function" then
+        requestFn = http_request
+    elseif type(syn) == "table"
+        and type(syn.request) == "function"
+    then
+        requestFn = syn.request
+    elseif type(http) == "table"
+        and type(http.request) == "function"
+    then
+        requestFn = http.request
+    end
+
+    if requestFn then
+        local ok, response = pcall(function()
+            return requestFn({
+                Url = url,
+                Method = "GET"
+            })
+        end)
+
+        if ok
+            and type(response) == "table"
+            and type(response.Body) == "string"
+            and (
+                response.StatusCode == nil
+                or response.StatusCode == 200
+            )
+        then
+            return response.Body
+        end
+    end
+
+    local ok, body = pcall(function()
+        return HttpService:GetAsync(url)
+    end)
+
+    if ok and type(body) == "string" then
+        return body
+    end
+
+    return nil
+end
+
+function OtherSystem.GetPublicServers(maxPages)
+    maxPages =
+        math.clamp(
+            math.floor(tonumber(maxPages) or 3),
+            1,
+            3
+        )
+
+    local servers = {}
+    local cursor = nil
+
+    for _ = 1, maxPages do
+        local url =
+            "https://games.roblox.com/v1/games/"
+            .. tostring(game.PlaceId)
+            .. "/servers/Public?sortOrder=Asc&limit=100"
+
+        if cursor and cursor ~= "" then
+            local encodedCursor = cursor
+            pcall(function()
+                encodedCursor = HttpService:UrlEncode(cursor)
+            end)
+
+            url = url
+                .. "&cursor="
+                .. tostring(encodedCursor)
+        end
+
+        local body = OtherSystem.Request(url)
+        if not body then
+            break
+        end
+
+        local ok, data = pcall(function()
+            return HttpService:JSONDecode(body)
+        end)
+
+        if not ok or type(data) ~= "table" then
+            break
+        end
+
+        if type(data.data) == "table" then
+            for _, server in ipairs(data.data) do
+                if
+                    type(server) == "table"
+                    and type(server.id) == "string"
+                    and server.id ~= ""
+                then
+                    table.insert(servers, server)
+                end
+            end
+        end
+
+        cursor = data.nextPageCursor
+        if type(cursor) ~= "string" or cursor == "" then
+            break
+        end
+    end
+
+    return servers
+end
+
+function OtherSystem.IsUsablePublicServer(server)
+    if type(server) ~= "table" then
+        return false
+    end
+
+    if type(server.id) ~= "string"
+        or server.id == ""
+        or server.id == game.JobId
+    then
+        return false
+    end
+
+    local playing = tonumber(server.playing)
+    local maxPlayers = tonumber(server.maxPlayers)
+
+    if not playing or not maxPlayers then
+        return false
+    end
+
+    return playing < maxPlayers
+end
+
+function OtherSystem.TeleportToServer(serverId)
+    if type(serverId) ~= "string" or serverId == "" then
+        return false
+    end
+
+    local teleportService =
+        game:GetService("TeleportService")
+
+    local teleportOptions
+    local asyncOk = pcall(function()
+        teleportOptions =
+            Instance.new("TeleportOptions")
+
+        teleportOptions.ServerInstanceId = serverId
+
+        teleportService:TeleportAsync(
+            game.PlaceId,
+            {LocalPlayer},
+            teleportOptions
+        )
+    end)
+
+    if teleportOptions then
+        pcall(function()
+            teleportOptions:Destroy()
+        end)
+    end
+
+    if asyncOk then
+        return true
+    end
+
+    local legacyOk = pcall(function()
+        teleportService:TeleportToPlaceInstance(
+            game.PlaceId,
+            serverId,
+            LocalPlayer
+        )
+    end)
+
+    return legacyOk
+end
+
+function OtherSystem.RunServerAction(action)
+    if OtherSystem.ServerActionBusy then
+        return
+    end
+
+    OtherSystem.ServerActionBusy = true
+    local generation = OtherSystem.Generation
+
+    task.spawn(function()
+        pcall(function()
+            local servers =
+                OtherSystem.GetPublicServers(3)
+
+            if generation ~= OtherSystem.Generation then
+                return
+            end
+
+            local selectedServer = nil
+
+            if action == "Change" then
+                for _, server in ipairs(servers) do
+                    if OtherSystem.IsUsablePublicServer(server) then
+                        selectedServer = server
+                        break
+                    end
+                end
+            elseif action == "Small" then
+                local bestPlaying = math.huge
+
+                for _, server in ipairs(servers) do
+                    if
+                        OtherSystem.IsUsablePublicServer(server)
+                    then
+                        local playing = tonumber(server.playing)
+
+                        if
+                            playing
+                            and playing < bestPlaying
+                        then
+                            bestPlaying = playing
+                            selectedServer = server
+                        end
+                    end
+                end
+            elseif action == "Ping" then
+                local bestPing = math.huge
+
+                for _, server in ipairs(servers) do
+                    if
+                        OtherSystem.IsUsablePublicServer(server)
+                    then
+                        local ping = tonumber(server.ping)
+
+                        if
+                            ping
+                            and ping >= 0
+                            and ping < bestPing
+                        then
+                            bestPing = ping
+                            selectedServer = server
+                        end
+                    end
+                end
+            end
+
+            if selectedServer then
+                OtherSystem.TeleportToServer(
+                    selectedServer.id
+                )
+            end
+        end)
+
+        OtherSystem.ServerActionBusy = false
+    end)
+end
+
+function OtherSystem.Rejoin()
+    if type(game.JobId) ~= "string"
+        or game.JobId == ""
+    then
+        return false
+    end
+
+    return OtherSystem.TeleportToServer(game.JobId)
+end
+
+function OtherSystem.OnWorkspaceDescendantAdded(instance)
+    if Config.XRayEnabled
+        and instance
+        and typeof(instance) == "Instance"
+        and instance:IsA("BasePart")
+    then
+        OtherSystem.ApplyXRayPart(instance)
+    end
+end
+
+function OtherSystem.Cleanup()
+    OtherSystem.Generation =
+        OtherSystem.Generation + 1
+
+    OtherSystem.KeybindListening = false
+    OtherSystem.KeybindBox = nil
+    OtherSystem.ConsumeNextToggleInput = false
+    OtherSystem.ServerActionBusy = false
+
+    OtherSystem.DisableXRay()
+    OtherSystem.SetThirdPerson(false)
+    OtherSystem.SetMenuMouseState(false)
+
+    table.clear(OtherSystem.XRayCache)
+end
+
+AddConnection(
+    Workspace.DescendantAdded:Connect(function(instance)
+        OtherSystem.OnWorkspaceDescendantAdded(instance)
+    end)
+)
+
+AddConnection(
+    UserInputService.InputBegan:Connect(function(input)
+        OtherSystem.HandleKeybindInput(input)
+    end)
+)
 
 -- ==========================================
 -- 6. PAGE MANAGER & TAB SYSTEM
@@ -4670,6 +5226,9 @@ local function BuildConfigPayload()
         -- MENU INPUT
         ToggleKeyEnabled = Config.ToggleKeyEnabled,
         ToggleKey = Config.ToggleKey and Config.ToggleKey.Name or nil,
+        ThirdPersonLock = Config.ThirdPersonLock,
+        XRayEnabled = Config.XRayEnabled,
+        XRayTransparency = Config.XRayTransparency,
         UIScale = Config.UIScale,
         BackgroundTransparency = Config.BackgroundTransparency
     }
@@ -4838,6 +5397,16 @@ local function ApplyConfigPayload(payload)
     end
 
     SetBooleanField(payload, "ToggleKeyEnabled", Config)
+    SetBooleanField(payload, "ThirdPersonLock", Config)
+    SetBooleanField(payload, "XRayEnabled", Config)
+    SetNumberField(
+        payload,
+        "XRayTransparency",
+        Config,
+        nil,
+        0.3,
+        1.0
+    )
     SetNumberField(payload, "UIScale", Config, nil, 0.25, 3)
     SetNumberField(
         payload,
@@ -4873,6 +5442,10 @@ local function ApplyConfigPayload(payload)
     else
         RestoreOriginalJumpPower(PlayerRuntime.Humanoid)
     end
+
+    OtherSystem.SetThirdPerson(Config.ThirdPersonLock)
+    OtherSystem.SetXRay(Config.XRayEnabled)
+    OtherSystem.UpdateXRayTransparency()
 
     -- Apply menu-level persistent values directly after validation.
     UIScaleObj.Scale = Config.UIScale
@@ -5047,6 +5620,32 @@ local function SyncSettingsUI()
             Config.Player.NoclipEnabled,
             true
         )
+    end
+
+    if UIRefs.Toggles.ThirdPersonLock then
+        UIRefs.Toggles.ThirdPersonLock.Set(
+            Config.ThirdPersonLock,
+            true
+        )
+    end
+
+    if UIRefs.Toggles.XRayEnabled then
+        UIRefs.Toggles.XRayEnabled.Set(
+            Config.XRayEnabled,
+            true
+        )
+    end
+
+    if UIRefs.Sliders.XRayTransparency then
+        UIRefs.Sliders.XRayTransparency.Set(
+            Config.XRayTransparency,
+            true
+        )
+    end
+
+    if UIRefs.OtherToggleKeyBox then
+        UIRefs.OtherToggleKeyBox.Text =
+            Config.ToggleKey.Name
     end
 end
 
@@ -5783,6 +6382,162 @@ if not FileAPI.Available then
     )
 end
 
+-- =========================================================
+-- TAB: KHÁC
+-- Exactly the seven requested features only.
+-- =========================================================
+PageManager:AddPage("KHÁC")
+
+UIRefs.Toggles.ThirdPersonLock =
+    UI:CreateToggle(
+        UI:CreateSection(
+            GUIState.Pages["KHÁC"],
+            "CAMERA / VISUAL"
+        ),
+        {
+            Text = "Third Person Lock",
+            Default = Config.ThirdPersonLock,
+            Callback = function(value)
+                OtherSystem.SetThirdPerson(value)
+            end
+        }
+    )
+
+UIRefs.Toggles.XRayEnabled =
+    UI:CreateToggle(
+        GUIState.Pages["KHÁC"]:FindFirstChild(
+            "CAMERA / VISUALSection"
+        ),
+        {
+            Text = "X-Ray",
+            Default = Config.XRayEnabled,
+            Callback = function(value)
+                OtherSystem.SetXRay(value)
+            end
+        }
+    )
+
+UIRefs.Sliders.XRayTransparency =
+    UI:CreateSlider(
+        GUIState.Pages["KHÁC"]:FindFirstChild(
+            "CAMERA / VISUALSection"
+        ),
+        {
+            Text = "X-Ray Transparency",
+            Min = 0.3,
+            Max = 1.0,
+            Default = Config.XRayTransparency,
+            Increment = 0.01,
+            EditableValue = true,
+            AllowTextInputBeyondRange = false,
+            Callback = function(value)
+                Config.XRayTransparency =
+                    math.clamp(value, 0.3, 1.0)
+                OtherSystem.UpdateXRayTransparency()
+            end
+        }
+    )
+
+UI:CreateButton(
+    UI:CreateSection(
+        GUIState.Pages["KHÁC"],
+        "SERVER"
+    ),
+    "↻  Đổi Server",
+    function()
+        OtherSystem.RunServerAction("Change")
+    end
+)
+
+UI:CreateButton(
+    GUIState.Pages["KHÁC"]:FindFirstChild(
+        "SERVERSection"
+    ),
+    "⌁  Ping Thấp",
+    function()
+        OtherSystem.RunServerAction("Ping")
+    end
+)
+
+UI:CreateButton(
+    GUIState.Pages["KHÁC"]:FindFirstChild(
+        "SERVERSection"
+    ),
+    "↓  Ít Người",
+    function()
+        OtherSystem.RunServerAction("Small")
+    end
+)
+
+UI:CreateButton(
+    UI:CreateSection(
+        GUIState.Pages["KHÁC"],
+        "REJOIN / MENU"
+    ),
+    "↩  Rejoin",
+    function()
+        OtherSystem.Rejoin()
+    end
+)
+
+UIRefs.OtherHideRow = Instance.new("Frame")
+UIRefs.OtherHideRow.Size = UDim2.new(1, 0, 0, 30)
+UIRefs.OtherHideRow.BackgroundTransparency = 1
+UIRefs.OtherHideRow.Parent =
+    GUIState.Pages["KHÁC"]:FindFirstChild(
+        "REJOIN / MENUSection"
+    )
+
+UIRefs.OtherHideButton =
+    UI:CreateButton(
+        UIRefs.OtherHideRow,
+        "Hide GUI",
+        function()
+            if SetMenuState then
+                SetMenuState("Minimized")
+            end
+        end
+    )
+
+UIRefs.OtherHideButton.TextXAlignment =
+    Enum.TextXAlignment.Left
+
+UIRefs.OtherToggleKeyBox = Instance.new("TextButton")
+UIRefs.OtherToggleKeyBox.Name = "ToggleKeyBox"
+UIRefs.OtherToggleKeyBox.Size = UDim2.new(0, 105, 0, 24)
+UIRefs.OtherToggleKeyBox.Position =
+    UDim2.new(1, -110, 0.5, -12)
+UIRefs.OtherToggleKeyBox.Text =
+    Config.ToggleKey.Name
+UIRefs.OtherToggleKeyBox.TextColor3 = Config.TextColor
+UIRefs.OtherToggleKeyBox.Font = Enum.Font.Gotham
+UIRefs.OtherToggleKeyBox.TextSize = 11
+UIRefs.OtherToggleKeyBox.BackgroundColor3 = Config.DarkBg
+UIRefs.OtherToggleKeyBox.AutoButtonColor = false
+UIRefs.OtherToggleKeyBox.ZIndex = 3
+UIRefs.OtherToggleKeyBox.Parent = UIRefs.OtherHideRow
+
+UIRefs.OtherKeybindCorner =
+    Instance.new("UICorner")
+UIRefs.OtherKeybindCorner.CornerRadius = UDim.new(0, 5)
+UIRefs.OtherKeybindCorner.Parent = UIRefs.OtherToggleKeyBox
+
+UIRefs.OtherKeybindStroke =
+    Instance.new("UIStroke")
+UIRefs.OtherKeybindStroke.Color = Config.BorderColor
+UIRefs.OtherKeybindStroke.Thickness = 1
+UIRefs.OtherKeybindStroke.Parent = UIRefs.OtherToggleKeyBox
+
+AddConnection(
+    UIRefs.OtherToggleKeyBox.MouseButton1Click:Connect(
+        function()
+            OtherSystem.BeginKeybindCapture(
+                UIRefs.OtherToggleKeyBox
+            )
+        end
+    )
+)
+
 -- Initialize NPC detection after the GUI/settings framework is ready.
 NPCSystem.Initialize()
 
@@ -5815,6 +6570,7 @@ RunService:BindToRenderStep(
     function(renderDt)
         UpdatePlayer(renderDt)
         UpdateTeleport()
+        OtherSystem.UpdateMenuInput()
     end
 )
 
@@ -5928,16 +6684,21 @@ PageManager:ShowPage(Config.StartPage)
 -- 10. EVENT CONTROLS & MINIMIZE / CLOSE
 -- ==========================================
 
-local function SetMenuState(newState)
+SetMenuState = function(newState)
     GUIState.CurrentState = newState
+
     if newState == "Open" then
+        ScreenGui.Enabled = true
         MainWindow.Visible = true
         FloatingBtn.Visible = false
+        OtherSystem.SetMenuMouseState(true)
     elseif newState == "Minimized" then
         MainWindow.Visible = false
         FloatingBtn.Visible = true
+        OtherSystem.SetMenuMouseState(false)
     elseif newState == "Closed" then
         ScreenGui.Enabled = false
+        OtherSystem.SetMenuMouseState(false)
     end
 end
 
@@ -5977,6 +6738,15 @@ end)
 
 -- Keybind Event (RightControl)
 AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if OtherSystem.ConsumeNextToggleInput then
+        OtherSystem.ConsumeNextToggleInput = false
+        return
+    end
+
+    if OtherSystem.KeybindListening then
+        return
+    end
+
     if gameProcessed then return end
     if Config.ToggleKeyEnabled and input.KeyCode == Config.ToggleKey then
         if GUIState.CurrentState == "Open" then
@@ -6003,6 +6773,7 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
                 function(renderDt)
                     UpdatePlayer(renderDt)
                     UpdateTeleport()
+                    OtherSystem.UpdateMenuInput()
                 end
             )
 
@@ -6034,6 +6805,7 @@ end))
 -- Expose UI Framework global variable
 local function CleanupFramework()
     CleanupPlayerRuntime()
+    OtherSystem.Cleanup()
 
     pcall(function()
         RunService:UnbindFromRenderStep(
