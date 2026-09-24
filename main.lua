@@ -26,7 +26,6 @@ pcall(function()
 end)
 
 local LocalPlayer = Players.LocalPlayer
-local Mouse = LocalPlayer:GetMouse()
 
 -- Xác định container chứa GUI (Ưu tiên CoreGui, fallback PlayerGui)
 local TargetParent = LocalPlayer:WaitForChild("PlayerGui")
@@ -90,16 +89,15 @@ local Config = {
 
     StartPage = "ESP",
 
-    -- OTHER TAB
+    -- OTHER / SETTINGS
     ThirdPersonLock = false,
     XRayEnabled = false,
     XRayTransparency = 0.5,
-    CopyPlayerOutfitEnabled = false,
-    CopyPlayerOutfitKey = Enum.KeyCode.LeftAlt,
-    InfiniteYieldEnabled = false,
-    AntiLocalEnabled = false,
     HoldToSpamEnabled = false,
     HoldToSpamKey = Enum.KeyCode.E,
+    AntiAFKEnabled = false,
+    VirtualPetEnabled = true,
+    SnowfallEnabled = true,
 
     -- ESP Core Configuration
     Enabled = false,
@@ -130,8 +128,9 @@ local Config = {
     Smoothness = 0.20,
     AimMaxDistance = 2000,
     AimNPC = false,
-    HitboxExpanderEnabled = false,
-    HitboxSize = 0,
+    TargetAssistEnabled = false,
+    HeadHitboxEnabled = false,
+    HeadHitboxSize = 0,
 
     -- =========================================================
     -- TELEKILL CONFIGURATION
@@ -516,23 +515,26 @@ ContentArea.Parent = MainWindow
 -- Floating Open Button
 local FloatingBtn = Instance.new("TextButton")
 FloatingBtn.Name = "FloatingOpenButton"
-FloatingBtn.Size = UDim2.new(0, 75, 0, 35)
-FloatingBtn.Position = UDim2.new(1, -95, 1, -55)
+FloatingBtn.Size = UDim2.fromOffset(48, 48)
+FloatingBtn.Position = UDim2.new(1, -68, 1, -68)
 FloatingBtn.BackgroundColor3 = Config.DarkBg
-FloatingBtn.Text = "Open"
+FloatingBtn.BackgroundTransparency = 0.35
+FloatingBtn.Text = "HR"
 FloatingBtn.TextColor3 = Config.TextColor
 FloatingBtn.Font = Enum.Font.GothamBold
 FloatingBtn.TextSize = 13
+FloatingBtn.AutoButtonColor = false
 FloatingBtn.Visible = false
 FloatingBtn.Parent = ScreenGui
 
 local FloatCorner = Instance.new("UICorner")
-FloatCorner.CornerRadius = UDim.new(0, 6)
+FloatCorner.CornerRadius = UDim.new(1, 0)
 FloatCorner.Parent = FloatingBtn
 
 local FloatStroke = Instance.new("UIStroke")
 FloatStroke.Color = Config.AccentColor
 FloatStroke.Thickness = 1.5
+FloatStroke.Transparency = 0.12
 FloatStroke.Parent = FloatingBtn
 
 local isFloatDragged = MakeDraggable(FloatingBtn, FloatingBtn)
@@ -552,27 +554,16 @@ local OtherSystem = {
 }
 
 local ExtraFeatures = {
-    CopyOutfitKeyHeld = false,
-    CopyOutfitListening = false,
-    CopyOutfitKeyBox = nil,
+    HeadHitboxCache = {},
+    HeadHitboxAccumulator = 0,
 
-    HitboxCache = {},
-    HitboxAccumulator = 0,
-
-    InfiniteYield = {
-        Loaded = false,
-        Enabled = false,
-        Runtime = nil,
-        OwnedInstances = {},
-        SourceUrl = "https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source"
+    TargetAssist = {
+        CurrentTarget = nil
     },
 
-    AntiLocal = {
-        Enabled = false,
-        Cache = {},
-        PlayerScriptsConnection = nil,
-        CharacterConnection = nil,
-        CharacterAddedConnection = nil
+    AntiAFK = {
+        Connection = nil,
+        VirtualUser = nil
     },
 
     GamePass = {
@@ -589,63 +580,598 @@ local ExtraFeatures = {
     HoldSpamInterval = 0.12,
     HoldSpamInput = nil,
 
+    UIEffects = {
+        VirtualPet = {
+            Enabled = false,
+            Instance = nil,
+            Image = nil,
+            Fallback = nil,
+            State = "Idle",
+            Generation = 0,
+            Tween = nil,
+            LastInput = os.clock(),
+            VirtualPetImage = "rbxassetid://0",
+            Reacting = false,
+            ReactionToken = 0,
+            ChatBubble = nil,
+            MemeSound = nil,
+            ReactionDuration = 1.5,
+            Memes = {
+                {
+                    Text = "Bruh...",
+                    SoundId = "rbxassetid://0"
+                },
+                {
+                    Text = "Sheesh!",
+                    SoundId = "rbxassetid://0"
+                },
+                {
+                    Text = "Nà Ní???",
+                    SoundId = "rbxassetid://0"
+                }
+            }
+        },
+
+        Snowfall = {
+            Enabled = false,
+            Container = nil,
+            Generation = 0,
+            Particles = {},
+            MaxActive = 30
+        },
+
+        Bubble = {
+            MainScale = nil,
+            BubbleScale = nil,
+            HoverTween = nil,
+            ScaleTween = nil,
+            MainTween = nil,
+            MainFadeTween = nil,
+            Token = 0
+        },
+
+        DynamicColor = {
+            Tween = nil,
+            CurrentColor = nil
+        },
+
+        ToggleFX = {
+            Overlay = nil,
+            Sound = nil,
+            SoundId = "rbxassetid://0",
+            ActiveParticles = {},
+            MaxParticles = 28,
+            ShakeBusy = false
+        },
+
+        Sliders = {
+            Active = {}
+        },
+
+        AnimationBusy = false,
+        InputTrackingReady = false,
+        Initialized = false
+    },
+
     NotificationText = "NHẬP THÔNG BÁO Ở ĐÂY",
     NotificationView = nil,
     NotificationPreviousPage = nil
 }
 
-function ExtraFeatures.GetClickedPlayer()
-    local targetPart = Mouse and Mouse.Target
-    if not targetPart then
-        return nil
+
+-- =========================================================
+-- ADVANCED UI EFFECTS
+-- Dynamic tab color / explosive toggle / heavy slider / reactive pet.
+-- These extend the existing UIEffects namespace and reuse the shared render
+-- pipeline. No second PageManager, toggle engine, slider engine or ScreenGui.
+-- =========================================================
+
+function ExtraFeatures.EnsureUIEffectOverlay()
+    local effects = ExtraFeatures.UIEffects
+    local state = effects.ToggleFX
+
+    if state.Overlay and state.Overlay.Parent then
+        return state.Overlay
     end
 
-    local character = targetPart:FindFirstAncestorOfClass("Model")
-    if not character then
-        return nil
-    end
+    local overlay = Instance.new("Frame")
+    overlay.Name = "UIEffectOverlay"
+    overlay.Size = UDim2.fromScale(1, 1)
+    overlay.Position = UDim2.fromOffset(0, 0)
+    overlay.BackgroundTransparency = 1
+    overlay.BorderSizePixel = 0
+    overlay.Active = false
+    overlay.Selectable = false
+    overlay.ZIndex = 90
+    overlay.Parent = ScreenGui
 
-    local player = Players:GetPlayerFromCharacter(character)
-    if not player or player == LocalPlayer then
-        return nil
-    end
-
-    return player
+    state.Overlay = overlay
+    return overlay
 end
 
-function ExtraFeatures.CopyPlayerOutfit()
-    if not Config.CopyPlayerOutfitEnabled
-        or not ExtraFeatures.CopyOutfitKeyHeld
+function ExtraFeatures.EnsureToggleFXSound()
+    local state = ExtraFeatures.UIEffects.ToggleFX
+
+    if state.Sound and state.Sound.Parent then
+        return state.Sound
+    end
+
+    local sound = Instance.new("Sound")
+    sound.Name = "ToggleExplosionSound"
+    sound.Volume = 0.45
+    sound.SoundId = tostring(state.SoundId or "rbxassetid://0")
+    sound.Parent = ScreenGui
+
+    state.Sound = sound
+    return sound
+end
+
+function ExtraFeatures.PlayToggleFXSound()
+    local state = ExtraFeatures.UIEffects.ToggleFX
+    local soundId = tostring(state.SoundId or "")
+
+    if soundId == ""
+        or soundId == "0"
+        or soundId == "rbxassetid://0"
     then
         return
     end
 
-    local targetPlayer = ExtraFeatures.GetClickedPlayer()
+    pcall(function()
+        local sound = ExtraFeatures.EnsureToggleFXSound()
+        sound:Stop()
+        sound.SoundId = soundId
+        sound.TimePosition = 0
+        sound:Play()
+    end)
+end
 
-    if not targetPlayer then
+function ExtraFeatures.CreateToggleExplosion(guiObject)
+    if not guiObject
+        or not guiObject.Parent
+        or not guiObject.AbsolutePosition
+    then
         return
     end
 
-    local localCharacter = LocalPlayer.Character
-    local humanoid = localCharacter
-        and localCharacter:FindFirstChildOfClass("Humanoid")
+    local state = ExtraFeatures.UIEffects.ToggleFX
+    local overlay = ExtraFeatures.EnsureUIEffectOverlay()
 
-    if not humanoid then
+    local activeCount = 0
+    local stale = {}
+
+    for particle in pairs(state.ActiveParticles) do
+        if particle and particle.Parent then
+            activeCount = activeCount + 1
+        else
+            table.insert(stale, particle)
+        end
+    end
+
+    for _, particle in ipairs(stale) do
+        state.ActiveParticles[particle] = nil
+    end
+
+    local remaining = math.max(
+        0,
+        (tonumber(state.MaxParticles) or 28) - activeCount
+    )
+    local amount = math.min(math.random(5, 8), remaining)
+
+    if amount <= 0 then
         return
+    end
+
+    local scale = math.max(UIScaleObj.Scale, 0.01)
+    local centerX =
+        (
+            guiObject.AbsolutePosition.X
+            + guiObject.AbsoluteSize.X * 0.5
+            - overlay.AbsolutePosition.X
+        ) / scale
+    local centerY =
+        (
+            guiObject.AbsolutePosition.Y
+            + guiObject.AbsoluteSize.Y * 0.5
+            - overlay.AbsolutePosition.Y
+        ) / scale
+
+    for index = 1, amount do
+        local particle = Instance.new("Frame")
+        local size = math.random(2, 4)
+
+        particle.Name = "ToggleSpark"
+        particle.AnchorPoint = Vector2.new(0.5, 0.5)
+        particle.Size = UDim2.fromOffset(size, size)
+        particle.Position = UDim2.fromOffset(centerX, centerY)
+        particle.BorderSizePixel = 0
+        particle.BackgroundTransparency = 0
+        particle.Active = false
+        particle.Selectable = false
+        particle.ZIndex = 91
+
+        if index % 3 == 1 then
+            particle.BackgroundColor3 = Color3.fromRGB(255, 214, 74)
+        elseif index % 3 == 2 then
+            particle.BackgroundColor3 = Color3.fromRGB(255, 145, 42)
+        else
+            particle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        end
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(1, 0)
+        corner.Parent = particle
+
+        particle.Parent = overlay
+        state.ActiveParticles[particle] = true
+
+        local angle = math.rad(math.random(0, 359))
+        local radius = math.random(16, 32) / scale
+        local targetX = centerX + math.cos(angle) * radius
+        local targetY = centerY + math.sin(angle) * radius
+        local duration = math.random(25, 35) / 100
+
+        local tween = TweenService:Create(
+            particle,
+            TweenInfo.new(
+                duration,
+                Enum.EasingStyle.Quad,
+                Enum.EasingDirection.Out
+            ),
+            {
+                Position = UDim2.fromOffset(targetX, targetY),
+                BackgroundTransparency = 1
+            }
+        )
+
+        tween:Play()
+
+        task.delay(duration + 0.05, function()
+            state.ActiveParticles[particle] = nil
+
+            if particle and particle.Parent then
+                particle:Destroy()
+            end
+        end)
+    end
+end
+
+function ExtraFeatures.ShakeToggle(guiObject)
+    if not guiObject or not guiObject.Parent then
+        return
+    end
+
+    local state = ExtraFeatures.UIEffects.ToggleFX
+
+    if state.ShakeBusy then
+        return
+    end
+
+    state.ShakeBusy = true
+
+    task.spawn(function()
+        local original = guiObject.Position
+
+        for index = 1, 5 do
+            if not guiObject or not guiObject.Parent then
+                break
+            end
+
+            local x = math.random(-3, 3)
+            local y = math.random(-2, 2)
+
+            guiObject.Position = UDim2.new(
+                original.X.Scale,
+                original.X.Offset + x,
+                original.Y.Scale,
+                original.Y.Offset + y
+            )
+
+            task.wait(0.018)
+        end
+
+        if guiObject and guiObject.Parent then
+            guiObject.Position = original
+        end
+
+        state.ShakeBusy = false
+    end)
+end
+
+function ExtraFeatures.ReactVirtualPet()
+    local state = ExtraFeatures.UIEffects.VirtualPet
+
+    if not Config.VirtualPetEnabled
+        or not state.Enabled
+        or not state.Instance
+        or not state.Instance.Parent
+    then
+        return
+    end
+
+    state.ReactionToken = (state.ReactionToken or 0) + 1
+    local token = state.ReactionToken
+
+    state.Reacting = true
+    state.State = "React"
+    state.LastInput = os.clock()
+
+    if state.Tween then
+        pcall(function()
+            state.Tween:Cancel()
+        end)
+    end
+
+    state.Tween = nil
+
+    if state.ChatBubble and state.ChatBubble.Parent then
+        state.ChatBubble:Destroy()
+    end
+
+    state.ChatBubble = nil
+
+    if state.MemeSound and state.MemeSound.Parent then
+        pcall(function()
+            state.MemeSound:Stop()
+        end)
+    end
+
+    if state.Fallback and state.Fallback.Parent then
+        state.Fallback.Text = "🙀"
     end
 
     pcall(function()
-        local description =
-            Players:GetHumanoidDescriptionFromUserIdAsync(
-                targetPlayer.UserId
-            )
+        state.Instance.Rotation = 0
+    end)
 
-        if description then
+    local memes =
+        type(state.Memes) == "table"
+        and state.Memes
+        or {}
+
+    local selected = nil
+
+    if #memes > 0 then
+        selected = memes[math.random(1, #memes)]
+    end
+
+    local bubble = Instance.new("TextLabel")
+    bubble.Name = "PetChatBubble"
+    bubble.AnchorPoint = Vector2.new(0.5, 1)
+    bubble.Size = UDim2.fromOffset(92, 26)
+    bubble.Position = UDim2.new(0.5, 0, 0, -4)
+    bubble.BackgroundColor3 = Config.CardBg
+    bubble.BackgroundTransparency = 0.08
+    bubble.BorderSizePixel = 0
+    bubble.Text =
+        selected and tostring(selected.Text or "!")
+        or "!"
+    bubble.TextColor3 = Config.TextColor
+    bubble.Font = Enum.Font.GothamBold
+    bubble.TextSize = 11
+    bubble.TextWrapped = true
+    bubble.Active = false
+    bubble.Selectable = false
+    bubble.ZIndex = 45
+    bubble.Parent = state.Instance
+
+    local bubbleCorner = Instance.new("UICorner")
+    bubbleCorner.CornerRadius = UDim.new(0, 7)
+    bubbleCorner.Parent = bubble
+
+    local bubbleStroke = Instance.new("UIStroke")
+    bubbleStroke.Color = Config.BorderColor
+    bubbleStroke.Thickness = 1
+    bubbleStroke.Transparency = 0.2
+    bubbleStroke.Parent = bubble
+
+    state.ChatBubble = bubble
+
+    local soundId =
+        selected
+        and tostring(selected.SoundId or "")
+        or ""
+
+    if soundId ~= ""
+        and soundId ~= "0"
+        and soundId ~= "rbxassetid://0"
+    then
+        pcall(function()
+            if not state.MemeSound
+                or not state.MemeSound.Parent
+            then
+                state.MemeSound = Instance.new("Sound")
+                state.MemeSound.Name = "VirtualPetMemeSound"
+                state.MemeSound.Volume = 0.4
+                state.MemeSound.Parent = ScreenGui
+            end
+
+            state.MemeSound:Stop()
+            state.MemeSound.SoundId = soundId
+            state.MemeSound.TimePosition = 0
+            state.MemeSound:Play()
+        end)
+    end
+
+    local duration =
+        tonumber(state.ReactionDuration)
+        or 1.5
+
+    task.delay(duration, function()
+        if token ~= state.ReactionToken then
+            return
+        end
+
+        if state.ChatBubble and state.ChatBubble.Parent then
+            local oldBubble = state.ChatBubble
+            state.ChatBubble = nil
+
             pcall(function()
-                humanoid:ApplyDescription(description)
+                local fade = TweenService:Create(
+                    oldBubble,
+                    TweenInfo.new(
+                        0.15,
+                        Enum.EasingStyle.Quad,
+                        Enum.EasingDirection.Out
+                    ),
+                    {
+                        BackgroundTransparency = 1,
+                        TextTransparency = 1
+                    }
+                )
+
+                fade:Play()
+            end)
+
+            task.delay(0.16, function()
+                if oldBubble and oldBubble.Parent then
+                    oldBubble:Destroy()
+                end
             end)
         end
+
+        if state.MemeSound and state.MemeSound.Parent then
+            pcall(function()
+                state.MemeSound:Stop()
+            end)
+        end
+
+        if state.Fallback and state.Fallback.Parent then
+            state.Fallback.Text = "🐱"
+        end
+
+        state.Reacting = false
+        state.State = "Idle"
+        state.LastInput = os.clock()
     end)
+end
+
+function ExtraFeatures.OnUserToggleClicked(guiObject)
+    pcall(function()
+        ExtraFeatures.PlayToggleFXSound()
+    end)
+
+    pcall(function()
+        ExtraFeatures.CreateToggleExplosion(guiObject)
+    end)
+
+    pcall(function()
+        ExtraFeatures.ShakeToggle(guiObject)
+    end)
+
+    pcall(function()
+        ExtraFeatures.ReactVirtualPet()
+    end)
+end
+
+function ExtraFeatures.OnTabChanged(previousPage, pageName)
+    if previousPage == pageName then
+        return
+    end
+
+    local state = ExtraFeatures.UIEffects.DynamicColor
+
+    if state.Tween then
+        pcall(function()
+            state.Tween:Cancel()
+        end)
+    end
+
+    local targetColor = Color3.fromHSV(
+        math.random(),
+        0.6,
+        0.3
+    )
+
+    state.CurrentColor = targetColor
+    state.Tween = TweenService:Create(
+        MainWindow,
+        TweenInfo.new(
+            0.5,
+            Enum.EasingStyle.Sine,
+            Enum.EasingDirection.Out
+        ),
+        {
+            BackgroundColor3 = targetColor
+        }
+    )
+
+    state.Tween:Play()
+end
+
+function ExtraFeatures.UpdateHeavySliders(renderDt)
+    local sliders = ExtraFeatures.UIEffects.Sliders.Active
+
+    if type(sliders) ~= "table" then
+        return
+    end
+
+    local dt = math.clamp(
+        tonumber(renderDt) or (1 / 60),
+        0,
+        0.1
+    )
+    local factor =
+        1 - math.pow(1 - 0.15, dt * 60)
+
+    local stale = {}
+
+    for frame, state in pairs(sliders) do
+        if not frame
+            or not frame.Parent
+            or type(state) ~= "table"
+            or not state.Fill
+            or not state.Fill.Parent
+        then
+            table.insert(stale, frame)
+        elseif state.ActiveVisual then
+            local target =
+                math.clamp(
+                    tonumber(state.TargetPercentage) or 0,
+                    0,
+                    1
+                )
+            local visual =
+                math.clamp(
+                    tonumber(state.VisualPercentage) or target,
+                    0,
+                    1
+                )
+
+            visual =
+                visual + (target - visual) * factor
+
+            if math.abs(target - visual) <= 0.001 then
+                visual = target
+                state.ActiveVisual = false
+            end
+
+            state.VisualPercentage = visual
+            state.Fill.Size =
+                UDim2.new(visual, 0, 1, 0)
+
+            if state.Knob
+                and state.Knob.Parent
+            then
+                state.Knob.Position =
+                    UDim2.new(visual, 0, 0.5, 0)
+            end
+        end
+    end
+
+    for _, frame in ipairs(stale) do
+        sliders[frame] = nil
+    end
+end
+
+function ExtraFeatures.ClearTargetAssist()
+    ExtraFeatures.TargetAssist.CurrentTarget = nil
+
+    if UIRefs.TargetAssistLabel
+        and UIRefs.TargetAssistLabel.Parent
+    then
+        UIRefs.TargetAssistLabel.Text = "Target: None"
+    end
 end
 
 function ExtraFeatures.StyleKeyButton(button)
@@ -669,13 +1195,13 @@ function ExtraFeatures.StyleKeyButton(button)
     stroke.Parent = button
 end
 
-function ExtraFeatures.RestoreHitboxPart(part)
-    local original = ExtraFeatures.HitboxCache[part]
+function ExtraFeatures.RestoreHeadHitboxPart(part)
+    local original = ExtraFeatures.HeadHitboxCache[part]
     if not original then
         return
     end
 
-    ExtraFeatures.HitboxCache[part] = nil
+    ExtraFeatures.HeadHitboxCache[part] = nil
 
     if part and part.Parent then
         pcall(function()
@@ -686,22 +1212,22 @@ function ExtraFeatures.RestoreHitboxPart(part)
     end
 end
 
-function ExtraFeatures.RestoreAllHitboxes()
+function ExtraFeatures.RestoreAllHeadHitboxes()
     local parts = {}
 
-    for part in pairs(ExtraFeatures.HitboxCache) do
+    for part in pairs(ExtraFeatures.HeadHitboxCache) do
         table.insert(parts, part)
     end
 
     for _, part in ipairs(parts) do
-        ExtraFeatures.RestoreHitboxPart(part)
+        ExtraFeatures.RestoreHeadHitboxPart(part)
     end
 
-    table.clear(ExtraFeatures.HitboxCache)
-    ExtraFeatures.HitboxAccumulator = 0
+    table.clear(ExtraFeatures.HeadHitboxCache)
+    ExtraFeatures.HeadHitboxAccumulator = 0
 end
 
-function ExtraFeatures.ApplyHitboxPart(part)
+function ExtraFeatures.ApplyHeadHitboxPart(part)
     if not part
         or typeof(part) ~= "Instance"
         or not part:IsA("BasePart")
@@ -710,23 +1236,23 @@ function ExtraFeatures.ApplyHitboxPart(part)
         return
     end
 
-    if not ExtraFeatures.HitboxCache[part] then
-        ExtraFeatures.HitboxCache[part] = {
+    if not ExtraFeatures.HeadHitboxCache[part] then
+        ExtraFeatures.HeadHitboxCache[part] = {
             Size = part.Size,
             Transparency = part.Transparency,
             CanCollide = part.CanCollide
         }
     end
 
-    local original = ExtraFeatures.HitboxCache[part]
+    local original = ExtraFeatures.HeadHitboxCache[part]
     local amount = math.clamp(
-        tonumber(Config.HitboxSize) or 0,
+        tonumber(Config.HeadHitboxSize) or 0,
         0,
         10
     )
 
-    if not Config.HitboxExpanderEnabled or amount <= 0 then
-        ExtraFeatures.RestoreHitboxPart(part)
+    if not Config.HeadHitboxEnabled or amount <= 0 then
+        ExtraFeatures.RestoreHeadHitboxPart(part)
         return
     end
 
@@ -740,468 +1266,123 @@ function ExtraFeatures.ApplyHitboxPart(part)
     end)
 end
 
-function ExtraFeatures.UpdateHitboxes(dt, force)
-    if not Config.HitboxExpanderEnabled
-        or (tonumber(Config.HitboxSize) or 0) <= 0
+function ExtraFeatures.UpdateHeadHitboxes(dt, force)
+    if not Config.HeadHitboxEnabled
+        or (tonumber(Config.HeadHitboxSize) or 0) <= 0
     then
-        if next(ExtraFeatures.HitboxCache) ~= nil then
-            ExtraFeatures.RestoreAllHitboxes()
+        if next(ExtraFeatures.HeadHitboxCache) ~= nil then
+            ExtraFeatures.RestoreAllHeadHitboxes()
         end
         return
     end
 
-    ExtraFeatures.HitboxAccumulator =
-        ExtraFeatures.HitboxAccumulator
+    ExtraFeatures.HeadHitboxAccumulator =
+        ExtraFeatures.HeadHitboxAccumulator
         + (tonumber(dt) or 0)
 
     if not force
-        and ExtraFeatures.HitboxAccumulator < 0.25
+        and ExtraFeatures.HeadHitboxAccumulator < 0.25
     then
         return
     end
 
-    ExtraFeatures.HitboxAccumulator = 0
+    ExtraFeatures.HeadHitboxAccumulator = 0
 
     local seen = {}
 
-    for _, target in ipairs(Players:GetPlayers()) do
-        if target ~= LocalPlayer then
-            local character = target.Character
-            local root =
-                character
-                and character:FindFirstChild("HumanoidRootPart")
-
-            if root and root:IsA("BasePart") then
-                seen[root] = true
-                ExtraFeatures.ApplyHitboxPart(root)
-            end
-        end
-    end
-
+    -- Head Hitbox is intentionally restricted to the existing NPC registry.
+    -- Real Player characters are never modified by this feature.
     for model in pairs(NPCSystem.ValidNPCs) do
-        if model and model.Parent then
-            local root =
-                model:FindFirstChild("HumanoidRootPart")
+        if model
+            and model.Parent
+            and Players:GetPlayerFromCharacter(model) == nil
+        then
+            local humanoid = model:FindFirstChildOfClass("Humanoid")
+            local head = model:FindFirstChild("Head")
 
-            if root and root:IsA("BasePart") then
-                seen[root] = true
-                ExtraFeatures.ApplyHitboxPart(root)
+            if humanoid
+                and humanoid.Health > 0
+                and head
+                and head:IsA("BasePart")
+            then
+                seen[head] = true
+                ExtraFeatures.ApplyHeadHitboxPart(head)
             end
         end
     end
 
     local stale = {}
 
-    for part in pairs(ExtraFeatures.HitboxCache) do
+    for part in pairs(ExtraFeatures.HeadHitboxCache) do
         if not seen[part] or not part or not part.Parent then
             table.insert(stale, part)
         end
     end
 
     for _, part in ipairs(stale) do
-        ExtraFeatures.RestoreHitboxPart(part)
+        ExtraFeatures.RestoreHeadHitboxPart(part)
     end
 end
 
-function ExtraFeatures.SetHitboxEnabled(enabled)
-    Config.HitboxExpanderEnabled = enabled == true
+function ExtraFeatures.SetHeadHitboxEnabled(enabled)
+    Config.HeadHitboxEnabled = enabled == true
 
-    if not Config.HitboxExpanderEnabled then
-        ExtraFeatures.RestoreAllHitboxes()
+    if not Config.HeadHitboxEnabled then
+        ExtraFeatures.RestoreAllHeadHitboxes()
         return
     end
 
-    ExtraFeatures.UpdateHitboxes(0, true)
+    ExtraFeatures.UpdateHeadHitboxes(0, true)
 end
 
-function ExtraFeatures.CaptureGuiRoots()
-    local snapshot = {}
-
-    local function capture(parent)
-        if not parent then
-            return
-        end
-
-        for _, child in ipairs(parent:GetChildren()) do
-            snapshot[child] = true
-        end
-    end
-
-    capture(TargetParent)
-
-    if CoreGui and CoreGui ~= TargetParent then
-        capture(CoreGui)
-    end
-
-    return snapshot
-end
-
-function ExtraFeatures.TrackNewGuiRoots(before)
-    local state = ExtraFeatures.InfiniteYield
-
-    local function capture(parent)
-        if not parent then
-            return
-        end
-
-        for _, child in ipairs(parent:GetChildren()) do
-            if not before[child] then
-                state.OwnedInstances[child] = true
-            end
-        end
-    end
-
-    capture(TargetParent)
-
-    if CoreGui and CoreGui ~= TargetParent then
-        capture(CoreGui)
-    end
-end
-
-function ExtraFeatures.SetInfiniteYieldGuiVisible(visible)
-    for instance in pairs(
-        ExtraFeatures.InfiniteYield.OwnedInstances
-    ) do
-        if not instance or not instance.Parent then
-            ExtraFeatures.InfiniteYield.OwnedInstances[instance] = nil
-        else
-            pcall(function()
-                if instance:IsA("ScreenGui") then
-                    instance.Enabled = visible == true
-                elseif instance:IsA("GuiObject") then
-                    instance.Visible = visible == true
-                end
-            end)
-        end
-    end
-end
-
-function ExtraFeatures.CallInfiniteYieldRuntime(methodNames)
-    local runtime = ExtraFeatures.InfiniteYield.Runtime
-
-    if type(runtime) ~= "table" then
-        return false
-    end
-
-    for _, methodName in ipairs(methodNames) do
-        local method = runtime[methodName]
-
-        if type(method) == "function" then
-            local ok = pcall(method, runtime)
-
-            if ok then
-                return true
-            end
-        end
-    end
-
-    return false
-end
-
-function ExtraFeatures.SetInfiniteYield(enabled)
-    local state = ExtraFeatures.InfiniteYield
+function ExtraFeatures.SetAntiAFK(enabled)
+    local state = ExtraFeatures.AntiAFK
     enabled = enabled == true
 
+    if state.Connection then
+        pcall(function()
+            state.Connection:Disconnect()
+        end)
+        state.Connection = nil
+    end
+
+    Config.AntiAFKEnabled = enabled
+
     if not enabled then
-        Config.InfiniteYieldEnabled = false
-        state.Enabled = false
-
-        local runtimeDisabled =
-            ExtraFeatures.CallInfiniteYieldRuntime({
-                "Disable",
-                "Pause",
-                "Hide"
-            })
-
-        ExtraFeatures.SetInfiniteYieldGuiVisible(false)
-
-        if ExtraFeatures.SetStatus then
-            if runtimeDisabled then
-                ExtraFeatures.SetStatus(
-                    "Infinite Yield disabled"
-                )
-            elseif state.Loaded then
-                ExtraFeatures.SetStatus(
-                    "Infinite Yield UI disabled; external runtime has no verified shutdown API"
-                )
-            end
-        end
-
         return true
     end
 
-    if state.Loaded then
-        state.Enabled = true
-        Config.InfiniteYieldEnabled = true
-
-        ExtraFeatures.CallInfiniteYieldRuntime({
-            "Enable",
-            "Resume",
-            "Show"
-        })
-        ExtraFeatures.SetInfiniteYieldGuiVisible(true)
-
-        return true
-    end
-
-    if type(loadstring) ~= "function" then
-        Config.InfiniteYieldEnabled = false
-
-        if ExtraFeatures.SetStatus then
-            ExtraFeatures.SetStatus(
-                "Infinite Yield unavailable: loadstring is not supported"
-            )
-        end
-
-        return false
-    end
-
-    local source = OtherSystem.Request(state.SourceUrl)
-
-    if type(source) ~= "string" or source == "" then
-        Config.InfiniteYieldEnabled = false
-
-        if ExtraFeatures.SetStatus then
-            ExtraFeatures.SetStatus(
-                "Infinite Yield load failed: source unavailable"
-            )
-        end
-
-        return false
-    end
-
-    local before = ExtraFeatures.CaptureGuiRoots()
-    local compileOk, compileResult =
-        pcall(function()
-            return loadstring(source)
+    if not state.VirtualUser then
+        local ok, service = pcall(function()
+            return game:GetService("VirtualUser")
         end)
 
-    if not compileOk
-        or type(compileResult) ~= "function"
-    then
-        Config.InfiniteYieldEnabled = false
+        if ok then
+            state.VirtualUser = service
+        end
+    end
+
+    if not state.VirtualUser then
+        Config.AntiAFKEnabled = false
 
         if ExtraFeatures.SetStatus then
             ExtraFeatures.SetStatus(
-                "Infinite Yield load failed: compile error"
+                "Anti-AFK unavailable: VirtualUser is not supported"
             )
         end
 
         return false
     end
 
-    local runOk, runtime =
-        pcall(function()
-            return compileResult()
+    state.Connection =
+        LocalPlayer.Idled:Connect(function()
+            pcall(function()
+                state.VirtualUser:CaptureController()
+                state.VirtualUser:ClickButton2(Vector2.new(0, 0))
+            end)
         end)
-
-    if not runOk then
-        Config.InfiniteYieldEnabled = false
-
-        if ExtraFeatures.SetStatus then
-            ExtraFeatures.SetStatus(
-                "Infinite Yield load failed: runtime error"
-            )
-        end
-
-        return false
-    end
-
-    state.Loaded = true
-    state.Enabled = true
-    state.Runtime = runtime
-    Config.InfiniteYieldEnabled = true
-
-    ExtraFeatures.TrackNewGuiRoots(before)
-
-    if ExtraFeatures.SetStatus then
-        ExtraFeatures.SetStatus("Infinite Yield loaded")
-    end
 
     return true
-end
-
-function ExtraFeatures.CleanupInfiniteYield()
-    local state = ExtraFeatures.InfiniteYield
-
-    ExtraFeatures.CallInfiniteYieldRuntime({
-        "Cleanup",
-        "Unload",
-        "Destroy",
-        "Disable"
-    })
-
-    for instance in pairs(state.OwnedInstances) do
-        if instance and instance.Parent then
-            pcall(function()
-                instance:Destroy()
-            end)
-        end
-    end
-
-    table.clear(state.OwnedInstances)
-
-    state.Enabled = false
-    state.Loaded = false
-    state.Runtime = nil
-    Config.InfiniteYieldEnabled = false
-end
-
-function ExtraFeatures.IsSuspiciousLocal(instance)
-    if not instance
-        or typeof(instance) ~= "Instance"
-        or not instance:IsA("LocalScript")
-    then
-        return false
-    end
-
-    local normalized =
-        string.lower(instance.Name)
-        :gsub("[%W_]+", "")
-
-    return normalized == "ac"
-        or normalized:find("anticheat", 1, true) ~= nil
-        or normalized:find("antiexploit", 1, true) ~= nil
-        or normalized:find("clientwatcher", 1, true) ~= nil
-        or normalized:find("speedcheck", 1, true) ~= nil
-        or normalized:find("flycheck", 1, true) ~= nil
-end
-
-function ExtraFeatures.IsLocalClientContainer(instance)
-    if not instance then
-        return false
-    end
-
-    local playerScripts =
-        LocalPlayer:FindFirstChild("PlayerScripts")
-
-    if playerScripts
-        and instance:IsDescendantOf(playerScripts)
-    then
-        return true
-    end
-
-    local character = LocalPlayer.Character
-
-    return (
-        character
-        and instance:IsDescendantOf(character)
-    ) == true
-end
-
-function ExtraFeatures.ApplyAntiLocalInstance(instance)
-    local state = ExtraFeatures.AntiLocal
-
-    if not state.Enabled
-        or not ExtraFeatures.IsSuspiciousLocal(instance)
-        or not ExtraFeatures.IsLocalClientContainer(instance)
-    then
-        return
-    end
-
-    if state.Cache[instance] == nil then
-        state.Cache[instance] = instance.Disabled
-    end
-
-    pcall(function()
-        instance.Disabled = true
-    end)
-end
-
-function ExtraFeatures.DisconnectAntiLocal()
-    local state = ExtraFeatures.AntiLocal
-
-    for _, key in ipairs({
-        "PlayerScriptsConnection",
-        "CharacterConnection",
-        "CharacterAddedConnection"
-    }) do
-        local conn = state[key]
-
-        if conn then
-            pcall(function()
-                conn:Disconnect()
-            end)
-        end
-
-        state[key] = nil
-    end
-end
-
-function ExtraFeatures.RestoreAntiLocal()
-    local state = ExtraFeatures.AntiLocal
-
-    for instance, originalDisabled in pairs(state.Cache) do
-        if instance and instance.Parent then
-            pcall(function()
-                instance.Disabled = originalDisabled
-            end)
-        end
-    end
-
-    table.clear(state.Cache)
-end
-
-function ExtraFeatures.BindAntiLocalCharacter(character)
-    local state = ExtraFeatures.AntiLocal
-
-    if state.CharacterConnection then
-        pcall(function()
-            state.CharacterConnection:Disconnect()
-        end)
-        state.CharacterConnection = nil
-    end
-
-    if not character or not state.Enabled then
-        return
-    end
-
-    for _, instance in ipairs(character:GetDescendants()) do
-        ExtraFeatures.ApplyAntiLocalInstance(instance)
-    end
-
-    state.CharacterConnection =
-        character.DescendantAdded:Connect(function(instance)
-            ExtraFeatures.ApplyAntiLocalInstance(instance)
-        end)
-end
-
-function ExtraFeatures.SetAntiLocal(enabled)
-    local state = ExtraFeatures.AntiLocal
-    enabled = enabled == true
-
-    ExtraFeatures.DisconnectAntiLocal()
-
-    state.Enabled = enabled
-    Config.AntiLocalEnabled = enabled
-
-    if not enabled then
-        ExtraFeatures.RestoreAntiLocal()
-        return
-    end
-
-    local playerScripts =
-        LocalPlayer:FindFirstChild("PlayerScripts")
-
-    if playerScripts then
-        for _, instance in ipairs(playerScripts:GetDescendants()) do
-            ExtraFeatures.ApplyAntiLocalInstance(instance)
-        end
-
-        state.PlayerScriptsConnection =
-            playerScripts.DescendantAdded:Connect(function(instance)
-                ExtraFeatures.ApplyAntiLocalInstance(instance)
-            end)
-    end
-
-    ExtraFeatures.BindAntiLocalCharacter(
-        LocalPlayer.Character
-    )
-
-    state.CharacterAddedConnection =
-        LocalPlayer.CharacterAdded:Connect(function(character)
-            ExtraFeatures.BindAntiLocalCharacter(character)
-        end)
 end
 
 function ExtraFeatures.EnableGamePassSpoofer()
@@ -1397,21 +1578,20 @@ function ExtraFeatures.UpdateHoldSpam(dt)
 end
 
 function ExtraFeatures.Cleanup()
-    ExtraFeatures.CopyOutfitKeyHeld = false
-    ExtraFeatures.CopyOutfitListening = false
-    ExtraFeatures.CopyOutfitKeyBox = nil
-
     ExtraFeatures.HoldSpamKeyHeld = false
     ExtraFeatures.HoldSpamRightHeld = false
     ExtraFeatures.HoldSpamListening = false
     ExtraFeatures.HoldSpamKeyBox = nil
     ExtraFeatures.HoldSpamAccumulator = 0
 
-    ExtraFeatures.RestoreAllHitboxes()
-
-    ExtraFeatures.SetAntiLocal(false)
-    ExtraFeatures.CleanupInfiniteYield()
+    ExtraFeatures.RestoreAllHeadHitboxes()
+    ExtraFeatures.ClearTargetAssist()
+    ExtraFeatures.SetAntiAFK(false)
     ExtraFeatures.RestoreGamePassSpoofer()
+
+    if ExtraFeatures.CleanupUIEffects then
+        ExtraFeatures.CleanupUIEffects()
+    end
 
     ExtraFeatures.NotificationPreviousPage = nil
 
@@ -2015,7 +2195,9 @@ function PageManager:AddPage(pageName)
     return pageScroll
 end
 
-function PageManager:ShowPage(pageName)
+function PageManager:ShowPage(pageName, suppressEffects)
+    local previousPage = GUIState.ActivePage
+
     for name, page in pairs(GUIState.Pages) do
         local btn = GUIState.TabButtons[name]
         if name == pageName then
@@ -2028,6 +2210,18 @@ function PageManager:ShowPage(pageName)
             btn.BackgroundColor3 = Config.DarkBg
             btn.TextColor3 = Config.SubTextColor
         end
+    end
+
+    if suppressEffects ~= true
+        and previousPage ~= GUIState.ActivePage
+        and ExtraFeatures.OnTabChanged
+    then
+        pcall(function()
+            ExtraFeatures.OnTabChanged(
+                previousPage,
+                GUIState.ActivePage
+            )
+        end)
     end
 end
 
@@ -2098,9 +2292,9 @@ function ExtraFeatures.BuildNotificationView()
         ExtraFeatures.NotificationPreviousPage = nil
 
         if previousPage and GUIState.Pages[previousPage] then
-            PageManager:ShowPage(previousPage)
+            PageManager:ShowPage(previousPage, true)
         elseif Config.StartPage and GUIState.Pages[Config.StartPage] then
-            PageManager:ShowPage(Config.StartPage)
+            PageManager:ShowPage(Config.StartPage, true)
         end
     end))
 
@@ -2230,12 +2424,17 @@ function UI:CreateToggle(parent, options)
     local state = default
 
     local toggleFrame = Instance.new("Frame")
-    toggleFrame.Size = UDim2.new(1, 0, 0, 28)
+    toggleFrame.Size = UDim2.new(1, 0, 0, 30)
     toggleFrame.BackgroundTransparency = 1
     toggleFrame.Parent = parent
 
+    local rowScale = Instance.new("UIScale")
+    rowScale.Name = "TogglePopScale"
+    rowScale.Scale = 1
+    rowScale.Parent = toggleFrame
+
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0.7, 0, 1, 0)
+    label.Size = UDim2.new(1, -58, 1, 0)
     label.Text = text
     label.TextColor3 = Config.TextColor
     label.Font = Enum.Font.GothamMedium
@@ -2245,10 +2444,15 @@ function UI:CreateToggle(parent, options)
     label.Parent = toggleFrame
 
     local switch = Instance.new("TextButton")
-    switch.Size = UDim2.new(0, 42, 0, 20)
-    switch.Position = UDim2.new(1, -42, 0.5, -10)
+    switch.Name = "SmoothSwitch"
+    switch.Size = UDim2.fromOffset(46, 24)
+    switch.Position = UDim2.new(1, -46, 0.5, -12)
     switch.Text = ""
-    switch.BackgroundColor3 = state and Config.AccentColor or Config.DarkBg
+    switch.BackgroundColor3 =
+        state
+        and Config.AccentColor
+        or Color3.fromRGB(55, 55, 64)
+    switch.BorderSizePixel = 0
     switch.AutoButtonColor = false
     switch.Parent = toggleFrame
 
@@ -2256,10 +2460,20 @@ function UI:CreateToggle(parent, options)
     sCorner.CornerRadius = UDim.new(1, 0)
     sCorner.Parent = switch
 
+    local sStroke = Instance.new("UIStroke")
+    sStroke.Color = Config.BorderColor
+    sStroke.Thickness = 1
+    sStroke.Transparency = 0.25
+    sStroke.Parent = switch
+
     local circle = Instance.new("Frame")
-    circle.Size = UDim2.new(0, 14, 0, 14)
-    circle.Position = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
-    circle.BackgroundColor3 = Config.TextColor
+    circle.Name = "Indicator"
+    circle.Size = UDim2.fromOffset(18, 18)
+    circle.Position =
+        state
+        and UDim2.new(1, -21, 0.5, -9)
+        or UDim2.new(0, 3, 0.5, -9)
+    circle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     circle.BorderSizePixel = 0
     circle.Parent = switch
 
@@ -2267,28 +2481,115 @@ function UI:CreateToggle(parent, options)
     cCorner.CornerRadius = UDim.new(1, 0)
     cCorner.Parent = circle
 
-    local function applyState(newState, invokeCallback)
+    local function pop(userInitiated)
+        local downScale =
+            userInitiated and 0.90 or 0.95
+
+        TweenService:Create(
+            rowScale,
+            TweenInfo.new(
+                0.06,
+                Enum.EasingStyle.Quad,
+                Enum.EasingDirection.Out
+            ),
+            {Scale = downScale}
+        ):Play()
+
+        task.delay(0.06, function()
+            if rowScale and rowScale.Parent then
+                TweenService:Create(
+                    rowScale,
+                    TweenInfo.new(
+                        userInitiated and 0.18 or 0.12,
+                        Enum.EasingStyle.Back,
+                        Enum.EasingDirection.Out
+                    ),
+                    {Scale = 1}
+                ):Play()
+            end
+        end)
+    end
+
+    local function applyState(
+        newState,
+        invokeCallback,
+        usePop,
+        userInitiated
+    )
         if type(newState) ~= "boolean" then
             return
         end
 
         state = newState
-        local targetColor = state and Config.AccentColor or Config.DarkBg
-        local targetPos = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
 
-        TweenService:Create(switch, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
-        TweenService:Create(circle, TweenInfo.new(0.2), {Position = targetPos}):Play()
+        local targetColor =
+            state
+            and Config.AccentColor
+            or Color3.fromRGB(55, 55, 64)
+
+        local targetPos =
+            state
+            and UDim2.new(1, -21, 0.5, -9)
+            or UDim2.new(0, 3, 0.5, -9)
+
+        local backgroundTweenInfo = TweenInfo.new(
+            0.24,
+            Enum.EasingStyle.Quint,
+            Enum.EasingDirection.Out
+        )
+
+        local indicatorTweenInfo
+
+        if userInitiated then
+            indicatorTweenInfo = TweenInfo.new(
+                0.34,
+                Enum.EasingStyle.Bounce,
+                Enum.EasingDirection.Out
+            )
+        else
+            indicatorTweenInfo = backgroundTweenInfo
+        end
+
+        TweenService:Create(
+            switch,
+            backgroundTweenInfo,
+            {BackgroundColor3 = targetColor}
+        ):Play()
+
+        TweenService:Create(
+            circle,
+            indicatorTweenInfo,
+            {Position = targetPos}
+        ):Play()
+
+        if usePop then
+            pop(userInitiated == true)
+        end
+
+        if userInitiated
+            and ExtraFeatures.OnUserToggleClicked
+        then
+            pcall(function()
+                ExtraFeatures.OnUserToggleClicked(switch)
+            end)
+        end
 
         if invokeCallback ~= false then
             callback(state)
         end
     end
 
-    local function toggle()
-        applyState(not state, true)
-    end
+    AddConnection(
+        switch.MouseButton1Click:Connect(function()
+            applyState(
+                not state,
+                true,
+                true,
+                true
+            )
+        end)
+    )
 
-    switch.MouseButton1Click:Connect(toggle)
     return {
         Set = function(val, silent)
             if type(val) ~= "boolean" then
@@ -2296,12 +2597,24 @@ function UI:CreateToggle(parent, options)
             end
 
             if state ~= val then
-                applyState(val, silent ~= true)
+                applyState(
+                    val,
+                    silent ~= true,
+                    false,
+                    false
+                )
             elseif silent then
-                -- Force a visual refresh without firing the callback.
-                applyState(val, false)
+                -- Visual refresh only; callback must remain silent and must
+                -- never trigger explosive FX / sound / pet reaction.
+                applyState(
+                    val,
+                    false,
+                    false,
+                    false
+                )
             end
         end,
+
         Get = function()
             return state
         end
@@ -2321,7 +2634,9 @@ function UI:CreateSlider(parent, options)
     local editableValue =
         options.EditableValue == true
 
-    -- currentValue is the single source of truth.
+    -- currentValue is the single source of truth for gameplay/config data.
+    -- Visual fill/knob position follows through the shared heavy-friction
+    -- slider updater in HoodRivalsUnifiedRender.
     local currentValue = default
     local sliderMax = max
 
@@ -2363,8 +2678,6 @@ function UI:CreateSlider(parent, options)
     local valueBox
 
     if editableValue then
-        -- The original value label becomes an editable TextBox only
-        -- for sliders that explicitly request direct numeric input.
         valueBox = Instance.new("TextBox")
         valueBox.Size = UDim2.new(0.40, 0, 0, 18)
         valueBox.Position = UDim2.new(0.60, 0, 0, 0)
@@ -2417,26 +2730,90 @@ function UI:CreateSlider(parent, options)
     fCorner.CornerRadius = UDim.new(1, 0)
     fCorner.Parent = fill
 
+    local knob = Instance.new("Frame")
+    knob.Name = "HeavyFrictionKnob"
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.Size = UDim2.fromOffset(12, 12)
+    knob.Position = UDim2.new(0, 0, 0.5, 0)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = fill.ZIndex + 1
+    knob.Parent = track
+
+    local knobCorner = Instance.new("UICorner")
+    knobCorner.CornerRadius = UDim.new(1, 0)
+    knobCorner.Parent = knob
+
+    local knobStroke = Instance.new("UIStroke")
+    knobStroke.Color = Config.AccentColor
+    knobStroke.Thickness = 1
+    knobStroke.Transparency = 0.15
+    knobStroke.Parent = knob
+
     local dragging = false
 
-    local function updateVisuals()
-        local visualMax = math.max(sliderMax, min + increment)
+    local visualState = {
+        Fill = fill,
+        Knob = knob,
+        TargetPercentage = 0,
+        VisualPercentage = 0,
+        ActiveVisual = false
+    }
+
+    ExtraFeatures.UIEffects.Sliders.Active[sliderFrame] =
+        visualState
+
+    local function GetPercentage()
+        local visualMax = math.max(
+            sliderMax,
+            min + math.max(increment, 0.0001)
+        )
         local denominator = visualMax - min
 
-        local percentage = 0
-        if denominator > 0 then
-            percentage = math.clamp(
-                (currentValue - min) / denominator,
-                0,
-                1
-            )
+        if denominator <= 0 then
+            return 0
         end
 
-        fill.Size = UDim2.new(percentage, 0, 1, 0)
-        valueBox.Text = FormatValue(currentValue)
+        return math.clamp(
+            (currentValue - min) / denominator,
+            0,
+            1
+        )
     end
 
-    -- Slider input intentionally stays inside the configured range.
+    local function ApplyVisualPercentage(percentage)
+        percentage = math.clamp(
+            tonumber(percentage) or 0,
+            0,
+            1
+        )
+
+        visualState.VisualPercentage = percentage
+        fill.Size = UDim2.new(percentage, 0, 1, 0)
+        knob.Position = UDim2.new(
+            percentage,
+            0,
+            0.5,
+            0
+        )
+    end
+
+    local function updateVisuals(immediate)
+        local percentage = GetPercentage()
+
+        valueBox.Text = FormatValue(currentValue)
+        visualState.TargetPercentage = percentage
+
+        if immediate == true then
+            visualState.ActiveVisual = false
+            ApplyVisualPercentage(percentage)
+        else
+            visualState.ActiveVisual = true
+        end
+    end
+
+    -- Slider input updates the real value immediately. Only the visual
+    -- fill/knob has friction, so gameplay controls never inherit UI lag.
     local function updateFromSlider(inputPos)
         local percentage = math.clamp(
             (inputPos.X - track.AbsolutePosition.X) /
@@ -2457,7 +2834,7 @@ function UI:CreateSlider(parent, options)
             sliderMax
         )
 
-        updateVisuals()
+        updateVisuals(false)
         callback(currentValue)
     end
 
@@ -2475,23 +2852,18 @@ function UI:CreateSlider(parent, options)
         end
 
         if allowTextInputBeyondRange then
-            -- Player values can exceed the original visual slider range.
-            -- Expand the slider range so the textbox and track remain
-            -- synchronized instead of hard-clamping the typed value.
             if enteredValue > sliderMax then
                 sliderMax = enteredValue
             end
 
             currentValue = enteredValue
         else
-            -- Preserve the configured slider range for existing sliders.
             currentValue = math.clamp(
                 enteredValue,
                 min,
                 sliderMax
             )
 
-            -- Respect the configured increment for regular sliders.
             if increment > 0 then
                 currentValue =
                     math.floor(
@@ -2506,7 +2878,7 @@ function UI:CreateSlider(parent, options)
             end
         end
 
-        updateVisuals()
+        updateVisuals(false)
         callback(currentValue)
     end
 
@@ -2524,7 +2896,7 @@ function UI:CreateSlider(parent, options)
         end
 
         currentValue = math.clamp(value, min, sliderMax)
-        updateVisuals()
+        updateVisuals(false)
 
         if silent ~= true then
             callback(currentValue)
@@ -2543,44 +2915,44 @@ function UI:CreateSlider(parent, options)
 
     AddConnection(
         track.InputBegan:Connect(function(input)
-        if
-            input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch
-        then
-            dragging = true
-            updateFromSlider(input.Position)
-        end
+            if
+                input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch
+            then
+                dragging = true
+                updateFromSlider(input.Position)
+            end
         end)
     )
 
     AddConnection(
         UserInputService.InputChanged:Connect(function(input)
-        if
-            dragging
-            and (
-                input.UserInputType
-                    == Enum.UserInputType.MouseMovement
-                or input.UserInputType
-                    == Enum.UserInputType.Touch
-            )
-        then
-            updateFromSlider(input.Position)
-        end
+            if
+                dragging
+                and (
+                    input.UserInputType
+                        == Enum.UserInputType.MouseMovement
+                    or input.UserInputType
+                        == Enum.UserInputType.Touch
+                )
+            then
+                updateFromSlider(input.Position)
+            end
         end)
     )
 
     AddConnection(
         UserInputService.InputEnded:Connect(function(input)
-        if
-            input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch
-        then
-            dragging = false
-        end
+            if
+                input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch
+            then
+                dragging = false
+            end
         end)
     )
 
-    updateVisuals()
+    updateVisuals(true)
 
     return {
         Frame = sliderFrame,
@@ -3251,98 +3623,6 @@ UIRefs.Toggles.NoclipEnabled = UI:CreateToggle(PlayerCharacterSec, {
     end
 })
 
-local PlayerOutfitSec =
-    UI:CreateSection(
-        PlayerPage,
-        "OUTFIT"
-    )
-
-UIRefs.Toggles.CopyPlayerOutfit =
-    UI:CreateToggle(
-        PlayerOutfitSec,
-        {
-            Text = "Copy Player Outfit",
-            Default =
-                Config.CopyPlayerOutfitEnabled,
-            Callback = function(value)
-                Config.CopyPlayerOutfitEnabled =
-                    value
-
-                ExtraFeatures.CopyOutfitKeyHeld =
-                    false
-            end
-        }
-    )
-
-UIRefs.CopyPlayerOutfitKeyBox =
-    Instance.new("TextButton")
-
-UIRefs.CopyPlayerOutfitKeyBox.Name =
-    "CopyPlayerOutfitKeyBox"
-UIRefs.CopyPlayerOutfitKeyBox.Size =
-    UDim2.new(1, 0, 0, 30)
-UIRefs.CopyPlayerOutfitKeyBox.Text =
-    "Copy Outfit Key: "
-    .. Config.CopyPlayerOutfitKey.Name
-UIRefs.CopyPlayerOutfitKeyBox.TextColor3 =
-    Config.TextColor
-UIRefs.CopyPlayerOutfitKeyBox.Font =
-    Enum.Font.GothamMedium
-UIRefs.CopyPlayerOutfitKeyBox.TextSize = 12
-UIRefs.CopyPlayerOutfitKeyBox.BackgroundColor3 =
-    Config.DarkBg
-UIRefs.CopyPlayerOutfitKeyBox.AutoButtonColor =
-    false
-UIRefs.CopyPlayerOutfitKeyBox.Parent =
-    PlayerOutfitSec
-
-local OutfitKeyCorner = Instance.new("UICorner")
-OutfitKeyCorner.CornerRadius =
-    UDim.new(0, 5)
-OutfitKeyCorner.Parent =
-    UIRefs.CopyPlayerOutfitKeyBox
-
-local OutfitKeyStroke = Instance.new("UIStroke")
-OutfitKeyStroke.Color =
-    Config.BorderColor
-OutfitKeyStroke.Thickness = 1
-OutfitKeyStroke.Parent =
-    UIRefs.CopyPlayerOutfitKeyBox
-
-AddConnection(
-    UIRefs.CopyPlayerOutfitKeyBox.MouseButton1Click:Connect(
-        function()
-            if ExtraFeatures.CopyOutfitListening then
-                ExtraFeatures.CopyOutfitListening = false
-                ExtraFeatures.CopyOutfitKeyBox = nil
-
-                UIRefs.CopyPlayerOutfitKeyBox.Text =
-                    "Copy Outfit Key: "
-                    .. Config.CopyPlayerOutfitKey.Name
-                return
-            end
-
-            ExtraFeatures.CopyOutfitListening = true
-            ExtraFeatures.CopyOutfitKeyBox =
-                UIRefs.CopyPlayerOutfitKeyBox
-
-            if ExtraFeatures.HoldSpamListening then
-                ExtraFeatures.HoldSpamListening = false
-                ExtraFeatures.HoldSpamKeyBox = nil
-
-                if UIRefs.HoldToSpamKeyBox then
-                    UIRefs.HoldToSpamKeyBox.Text =
-                        "Hold to Spam Key: "
-                        .. Config.HoldToSpamKey.Name
-                end
-            end
-
-            UIRefs.CopyPlayerOutfitKeyBox.Text =
-                "Press Key..."
-        end
-    )
-)
-
 -- =========================================================
 -- TAB: AIM
 -- Created exactly once in the existing PageManager.
@@ -3499,51 +3779,88 @@ UIRefs.Sliders.Smoothness = UI:CreateSlider(AimSettingsSec, {
     end
 })
 
-UIRefs.HitboxSection =
-    UI:CreateSection(
-        AimPage,
-        "HITBOX EXPANDER"
-    )
+do
+    local ok, err = pcall(function()
+        UIRefs.TargetAssistSection =
+            UI:CreateSection(
+                AimPage,
+                "TARGET ASSIST"
+            )
 
-UIRefs.Toggles.HitboxExpander =
-    UI:CreateToggle(
-        UIRefs.HitboxSection,
-        {
-            Text = "Hitbox Expander",
-            Default = Config.HitboxExpanderEnabled,
-            Callback = function(value)
-                ExtraFeatures.SetHitboxEnabled(value)
-            end
-        }
-    )
+        UIRefs.Toggles.TargetAssist =
+            UI:CreateToggle(
+                UIRefs.TargetAssistSection,
+                {
+                    Text = "Target Assist",
+                    Default = Config.TargetAssistEnabled,
+                    Callback = function(value)
+                        Config.TargetAssistEnabled = value == true
 
-UIRefs.Sliders.HitboxSize =
-    UI:CreateSlider(
-        UIRefs.HitboxSection,
-        {
-            Text = "Hitbox Size",
-            Min = 0,
-            Max = 10,
-            Default = Config.HitboxSize,
-            Increment = 1,
-            EditableValue = true,
-            AllowTextInputBeyondRange = false,
-            Callback = function(value)
-                Config.HitboxSize =
-                    math.clamp(
-                        tonumber(value) or 0,
-                        0,
-                        10
-                    )
+                        if not Config.TargetAssistEnabled then
+                            ExtraFeatures.ClearTargetAssist()
+                        end
+                    end
+                }
+            )
 
-                if Config.HitboxSize <= 0 then
-                    ExtraFeatures.RestoreAllHitboxes()
-                elseif Config.HitboxExpanderEnabled then
-                    ExtraFeatures.UpdateHitboxes(0, true)
-                end
-            end
-        }
-    )
+        UIRefs.TargetAssistLabel =
+            UI:CreateLabel(
+                UIRefs.TargetAssistSection,
+                "Target: None"
+            )
+
+        UIRefs.HeadHitboxSection =
+            UI:CreateSection(
+                AimPage,
+                "HEAD HITBOX"
+            )
+
+        UIRefs.Toggles.HeadHitbox =
+            UI:CreateToggle(
+                UIRefs.HeadHitboxSection,
+                {
+                    Text = "Head Hitbox",
+                    Default = Config.HeadHitboxEnabled,
+                    Callback = function(value)
+                        ExtraFeatures.SetHeadHitboxEnabled(value)
+                    end
+                }
+            )
+
+        UIRefs.Sliders.HeadHitboxSize =
+            UI:CreateSlider(
+                UIRefs.HeadHitboxSection,
+                {
+                    Text = "Head Size",
+                    Min = 0,
+                    Max = 10,
+                    Default = Config.HeadHitboxSize,
+                    Increment = 1,
+                    EditableValue = true,
+                    AllowTextInputBeyondRange = false,
+                    Callback = function(value)
+                        Config.HeadHitboxSize =
+                            math.clamp(
+                                tonumber(value) or 0,
+                                0,
+                                10
+                            )
+
+                        if Config.HeadHitboxSize <= 0 then
+                            ExtraFeatures.RestoreAllHeadHitboxes()
+                        elseif Config.HeadHitboxEnabled then
+                            ExtraFeatures.UpdateHeadHitboxes(0, true)
+                        end
+                    end
+                }
+            )
+
+    end)
+
+    if not ok then
+        warn("[Hood Rivals] AIM extra UI skipped: " .. tostring(err))
+    end
+end
 
 -- =========================================================
 -- TELEKILL
@@ -3615,6 +3932,11 @@ UIRefs.Sliders.TelekillDistance = UI:CreateSlider(TelekillSec, {
 -- Đúng một tab ESP trong Sidebar, page chỉ tạo một lần.
 -- Click ESP sẽ gọi PageManager:ShowPage("ESP") và ẩn các page khác.
 local ESPPage = PageManager:AddPage("ESP")
+
+-- Boot-safe: show the core default page immediately.
+pcall(function()
+    PageManager:ShowPage(Config.StartPage, true)
+end)
 
 local ESPMainSec = UI:CreateSection(ESPPage, "ESP Main")
 
@@ -4395,6 +4717,30 @@ local function GetBestTarget()
     end
 
     return bestTarget, bestAimPart
+end
+
+function ExtraFeatures.UpdateTargetAssist()
+    if not Config.TargetAssistEnabled
+        or not Config.AimEnabled
+        or not Config.UseFOV
+    then
+        ExtraFeatures.ClearTargetAssist()
+        return
+    end
+
+    local target = GetBestTarget()
+    ExtraFeatures.TargetAssist.CurrentTarget = target
+
+    if UIRefs.TargetAssistLabel
+        and UIRefs.TargetAssistLabel.Parent
+    then
+        if target then
+            UIRefs.TargetAssistLabel.Text =
+                "Target: " .. tostring(target.Name or "Unknown")
+        else
+            UIRefs.TargetAssistLabel.Text = "Target: None"
+        end
+    end
 end
 
 -- ---------------------------------------------------------
@@ -6264,6 +6610,941 @@ local function TrimString(value)
     return value
 end
 
+-- =========================================================
+-- UI EFFECTS — VIRTUAL PET / SNOWFALL / FLOATING BUBBLE
+-- Uses the existing ScreenGui, MainWindow, FloatingBtn and TweenService.
+-- No second ScreenGui, PageManager, render engine or input engine is created.
+-- =========================================================
+
+function ExtraFeatures.MarkUIActivity()
+    local effects = ExtraFeatures.UIEffects
+    if not effects then
+        return
+    end
+
+    effects.VirtualPet.LastInput = os.clock()
+
+    if effects.VirtualPet.State == "Sleep" then
+        effects.VirtualPet.State = "Idle"
+        if effects.VirtualPet.Fallback
+            and effects.VirtualPet.Fallback.Parent
+        then
+            effects.VirtualPet.Fallback.Text = "🐱"
+        end
+    end
+end
+
+function ExtraFeatures.EnsureVirtualPet()
+    local state = ExtraFeatures.UIEffects.VirtualPet
+
+    if state.Instance and state.Instance.Parent then
+        return state.Instance
+    end
+
+    local pet = Instance.new("ImageLabel")
+    pet.Name = "VirtualPet"
+    pet.Size = UDim2.fromOffset(30, 30)
+    pet.Position = UDim2.new(0, 8, 0, 42)
+    pet.BackgroundTransparency = 1
+    pet.BorderSizePixel = 0
+    pet.Image = state.VirtualPetImage
+    pet.ScaleType = Enum.ScaleType.Fit
+    pet.Active = false
+    pet.Selectable = false
+    pet.ZIndex = 30
+    pet.Parent = MainWindow
+
+    local fallback = Instance.new("TextLabel")
+    fallback.Name = "PetFallback"
+    fallback.Size = UDim2.fromScale(1, 1)
+    fallback.BackgroundTransparency = 1
+    fallback.Text = "🐱"
+    fallback.TextColor3 = Config.TextColor
+    fallback.Font = Enum.Font.GothamBold
+    fallback.TextScaled = true
+    fallback.Active = false
+    fallback.ZIndex = 31
+    fallback.Visible =
+        state.VirtualPetImage == ""
+        or state.VirtualPetImage == "rbxassetid://0"
+    fallback.Parent = pet
+
+    state.Instance = pet
+    state.Image = pet
+    state.Fallback = fallback
+
+    return pet
+end
+
+function ExtraFeatures.StopVirtualPet()
+    local state = ExtraFeatures.UIEffects.VirtualPet
+    state.Enabled = false
+    state.Generation = state.Generation + 1
+    state.ReactionToken = (state.ReactionToken or 0) + 1
+    state.Reacting = false
+
+    if state.Tween then
+        pcall(function()
+            state.Tween:Cancel()
+        end)
+    end
+
+    state.Tween = nil
+    state.State = "Idle"
+
+    if state.ChatBubble and state.ChatBubble.Parent then
+        state.ChatBubble:Destroy()
+    end
+
+    state.ChatBubble = nil
+
+    if state.MemeSound and state.MemeSound.Parent then
+        pcall(function()
+            state.MemeSound:Stop()
+        end)
+        state.MemeSound:Destroy()
+    end
+
+    state.MemeSound = nil
+
+    if state.Instance and state.Instance.Parent then
+        state.Instance:Destroy()
+    end
+
+    state.Instance = nil
+    state.Image = nil
+    state.Fallback = nil
+end
+
+
+function ExtraFeatures.GetVirtualPetTarget()
+    local state = ExtraFeatures.UIEffects.VirtualPet
+    local pet = state.Instance
+
+    if not pet or not pet.Parent then
+        return UDim2.new(0, 8, 0, 42)
+    end
+
+    local absoluteSize = MainWindow.AbsoluteSize
+    local width = math.max(absoluteSize.X, 560)
+    local height = math.max(absoluteSize.Y, 360)
+    local petSize = 30
+    local left = 6
+    local right = math.max(left, width - petSize - 6)
+    local top = 40
+    local bottom = math.max(top, height - petSize - 6)
+    local edge = math.random(1, 4)
+
+    if edge == 1 then
+        return UDim2.fromOffset(
+            math.random(left, math.max(left, right - 95)),
+            top
+        )
+    elseif edge == 2 then
+        return UDim2.fromOffset(
+            math.random(left, right),
+            bottom
+        )
+    elseif edge == 3 then
+        return UDim2.fromOffset(
+            left,
+            math.random(top, bottom)
+        )
+    end
+
+    return UDim2.fromOffset(
+        right,
+        math.random(math.min(bottom, top + 36), bottom)
+    )
+end
+
+function ExtraFeatures.StartVirtualPet()
+    local effects = ExtraFeatures.UIEffects
+    local state = effects.VirtualPet
+
+    ExtraFeatures.StopVirtualPet()
+
+    if not Config.VirtualPetEnabled then
+        return
+    end
+
+    state.Enabled = true
+    state.LastInput = os.clock()
+    state.Reacting = false
+    state.Generation = state.Generation + 1
+    local generation = state.Generation
+    local pet = ExtraFeatures.EnsureVirtualPet()
+
+    if not pet then
+        state.Enabled = false
+        return
+    end
+
+    task.spawn(function()
+        while state.Enabled
+            and Config.VirtualPetEnabled
+            and generation == state.Generation
+            and state.Instance
+            and state.Instance.Parent
+        do
+            if state.Reacting then
+                task.wait(0.10)
+                continue
+            end
+
+            local inactiveFor =
+                os.clock() - (state.LastInput or os.clock())
+
+            if inactiveFor >= 120 then
+                state.State = "Sleep"
+
+                if state.Fallback and state.Fallback.Parent then
+                    state.Fallback.Text = "😴"
+                end
+
+                pcall(function()
+                    state.Instance.Rotation = 8
+                end)
+
+                task.wait(0.5)
+            else
+                state.State = "Walk"
+
+                if state.Fallback and state.Fallback.Parent then
+                    state.Fallback.Text = "🐱"
+                end
+
+                local target = ExtraFeatures.GetVirtualPetTarget()
+                local currentX = state.Instance.AbsolutePosition.X
+                local targetX =
+                    MainWindow.AbsolutePosition.X
+                    + target.X.Offset
+
+                pcall(function()
+                    state.Instance.Rotation =
+                        targetX < currentX and -5 or 5
+                end)
+
+                local duration =
+                    math.random(15, 40) / 10
+
+                local tween = TweenService:Create(
+                    state.Instance,
+                    TweenInfo.new(
+                        duration,
+                        Enum.EasingStyle.Linear,
+                        Enum.EasingDirection.Out
+                    ),
+                    {
+                        Position = target
+                    }
+                )
+
+                state.Tween = tween
+                tween:Play()
+
+                local elapsed = 0
+                while elapsed < duration
+                    and state.Enabled
+                    and Config.VirtualPetEnabled
+                    and generation == state.Generation
+                    and not state.Reacting
+                do
+                    task.wait(0.2)
+                    elapsed = elapsed + 0.2
+
+                    if os.clock() - state.LastInput >= 120 then
+                        pcall(function()
+                            tween:Cancel()
+                        end)
+                        break
+                    end
+                end
+
+                if generation ~= state.Generation
+                    or not state.Enabled
+                then
+                    break
+                end
+
+                if state.Reacting then
+                    pcall(function()
+                        tween:Cancel()
+                    end)
+
+                    state.Tween = nil
+                    task.wait(0.10)
+                    continue
+                end
+
+                state.Tween = nil
+                state.State = "Idle"
+
+                pcall(function()
+                    state.Instance.Rotation = 0
+                end)
+
+                local idleScale =
+                    state.Instance:FindFirstChild(
+                        "VirtualPetIdleScale"
+                    )
+
+                if not idleScale then
+                    idleScale = Instance.new("UIScale")
+                    idleScale.Name = "VirtualPetIdleScale"
+                    idleScale.Scale = 1
+                    idleScale.Parent = state.Instance
+                end
+
+                local breathe = TweenService:Create(
+                    idleScale,
+                    TweenInfo.new(
+                        0.35,
+                        Enum.EasingStyle.Quad,
+                        Enum.EasingDirection.Out,
+                        0,
+                        true
+                    ),
+                    {
+                        Scale = 1.07
+                    }
+                )
+                breathe:Play()
+
+                local idleTime = math.random(30, 50) / 10
+                local idleElapsed = 0
+
+                while idleElapsed < idleTime
+                    and state.Enabled
+                    and Config.VirtualPetEnabled
+                    and generation == state.Generation
+                    and not state.Reacting
+                do
+                    task.wait(0.2)
+                    idleElapsed = idleElapsed + 0.2
+                end
+            end
+        end
+    end)
+end
+
+
+function ExtraFeatures.SetVirtualPetEnabled(enabled)
+    Config.VirtualPetEnabled = enabled == true
+
+    if Config.VirtualPetEnabled then
+        local ok, err = pcall(function()
+            ExtraFeatures.StartVirtualPet()
+        end)
+
+        if not ok then
+            Config.VirtualPetEnabled = false
+            ExtraFeatures.StopVirtualPet()
+            warn("[Hood Rivals] Virtual Pet disabled: " .. tostring(err))
+            return false
+        end
+
+        return true
+    end
+
+    ExtraFeatures.StopVirtualPet()
+    return true
+end
+
+function ExtraFeatures.EnsureSnowContainer()
+    local state = ExtraFeatures.UIEffects.Snowfall
+
+    if state.Container and state.Container.Parent then
+        return state.Container
+    end
+
+    local container = Instance.new("Frame")
+    container.Name = "SnowContainer"
+    container.Size = UDim2.fromScale(1, 1)
+    container.Position = UDim2.fromScale(0, 0)
+    container.BackgroundTransparency = 1
+    container.BorderSizePixel = 0
+    container.Active = false
+    container.Selectable = false
+    container.ClipsDescendants = true
+    container.ZIndex = 0
+    container.Parent = ScreenGui
+
+    state.Container = container
+    return container
+end
+
+function ExtraFeatures.DestroySnowfall()
+    local state = ExtraFeatures.UIEffects.Snowfall
+    state.Enabled = false
+    state.Generation = state.Generation + 1
+
+    for particle in pairs(state.Particles) do
+        if particle and particle.Parent then
+            particle:Destroy()
+        end
+        state.Particles[particle] = nil
+    end
+
+    if state.Container and state.Container.Parent then
+        state.Container:Destroy()
+    end
+
+    state.Container = nil
+end
+
+function ExtraFeatures.SpawnSnowParticle()
+    local state = ExtraFeatures.UIEffects.Snowfall
+
+    if not state.Enabled
+        or not Config.SnowfallEnabled
+        or not ScreenGui.Enabled
+    then
+        return
+    end
+
+    local activeCount = 0
+    for particle in pairs(state.Particles) do
+        if particle and particle.Parent then
+            activeCount = activeCount + 1
+        else
+            state.Particles[particle] = nil
+        end
+    end
+
+    if activeCount >= state.MaxActive then
+        return
+    end
+
+    local container = ExtraFeatures.EnsureSnowContainer()
+    if not container then
+        return
+    end
+
+    local size = math.random(2, 6)
+    local startX = math.random(0, 1000) / 1000
+    local drift = math.random(-12, 12) / 100
+    local endX = math.clamp(startX + drift, -0.05, 1.05)
+    local duration = math.random(30, 70) / 10
+
+    local particle = Instance.new("Frame")
+    particle.Name = "SnowParticle"
+    particle.Size = UDim2.fromOffset(size, size)
+    particle.Position = UDim2.new(startX, 0, -0.04, -size)
+    particle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    particle.BackgroundTransparency =
+        math.random(20, 80) / 100
+    particle.BorderSizePixel = 0
+    particle.Active = false
+    particle.ZIndex = 0
+    particle.Parent = container
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = particle
+
+    state.Particles[particle] = true
+
+    local tween = TweenService:Create(
+        particle,
+        TweenInfo.new(
+            duration,
+            Enum.EasingStyle.Linear,
+            Enum.EasingDirection.Out
+        ),
+        {
+            Position = UDim2.new(endX, 0, 1.05, 0)
+        }
+    )
+
+    tween:Play()
+
+    task.delay(duration + 0.15, function()
+        state.Particles[particle] = nil
+
+        if particle and particle.Parent then
+            particle:Destroy()
+        end
+    end)
+end
+
+function ExtraFeatures.StartSnowfall()
+    local state = ExtraFeatures.UIEffects.Snowfall
+
+    ExtraFeatures.DestroySnowfall()
+
+    if not Config.SnowfallEnabled then
+        return
+    end
+
+    state.Enabled = true
+    state.Generation = state.Generation + 1
+    local generation = state.Generation
+
+    ExtraFeatures.EnsureSnowContainer()
+
+    task.spawn(function()
+        while state.Enabled
+            and Config.SnowfallEnabled
+            and generation == state.Generation
+        do
+            if ScreenGui.Enabled then
+                pcall(function()
+                    ExtraFeatures.SpawnSnowParticle()
+                end)
+            end
+
+            task.wait(math.random(12, 30) / 100)
+        end
+    end)
+end
+
+function ExtraFeatures.SetSnowfallEnabled(enabled)
+    Config.SnowfallEnabled = enabled == true
+
+    if Config.SnowfallEnabled then
+        local ok, err = pcall(function()
+            ExtraFeatures.StartSnowfall()
+        end)
+
+        if not ok then
+            Config.SnowfallEnabled = false
+            ExtraFeatures.DestroySnowfall()
+            warn("[Hood Rivals] Snowfall disabled: " .. tostring(err))
+            return false
+        end
+
+        return true
+    end
+
+    ExtraFeatures.DestroySnowfall()
+    return true
+end
+
+function ExtraFeatures.PrepareBubble()
+    local effects = ExtraFeatures.UIEffects
+    local bubble = effects.Bubble
+
+    if not bubble.MainScale or not bubble.MainScale.Parent then
+        local scale = MainWindow:FindFirstChild("MenuAnimationScale")
+
+        if not scale then
+            scale = Instance.new("UIScale")
+            scale.Name = "MenuAnimationScale"
+            scale.Scale = 1
+            scale.Parent = MainWindow
+        end
+
+        bubble.MainScale = scale
+    end
+
+    if not bubble.BubbleScale or not bubble.BubbleScale.Parent then
+        local scale = FloatingBtn:FindFirstChild("BubbleScale")
+
+        if not scale then
+            scale = Instance.new("UIScale")
+            scale.Name = "BubbleScale"
+            scale.Scale = 1
+            scale.Parent = FloatingBtn
+        end
+
+        bubble.BubbleScale = scale
+    end
+end
+
+function ExtraFeatures.AnimateBubbleIn()
+    ExtraFeatures.PrepareBubble()
+
+    local bubble = ExtraFeatures.UIEffects.Bubble
+    FloatingBtn.Visible = true
+    FloatingBtn.BackgroundTransparency = 0.35
+    bubble.BubbleScale.Scale = 0
+
+    local grow = TweenService:Create(
+        bubble.BubbleScale,
+        TweenInfo.new(
+            0.14,
+            Enum.EasingStyle.Back,
+            Enum.EasingDirection.Out
+        ),
+        {
+            Scale = 1.08
+        }
+    )
+    grow:Play()
+
+    task.delay(0.14, function()
+        if bubble.BubbleScale and bubble.BubbleScale.Parent then
+            TweenService:Create(
+                bubble.BubbleScale,
+                TweenInfo.new(
+                    0.10,
+                    Enum.EasingStyle.Quad,
+                    Enum.EasingDirection.Out
+                ),
+                {
+                    Scale = 1
+                }
+            ):Play()
+        end
+    end)
+end
+
+function ExtraFeatures.AnimateMenuOpen()
+    local effects = ExtraFeatures.UIEffects
+    local bubble = effects.Bubble
+
+    ExtraFeatures.PrepareBubble()
+
+    effects.AnimationBusy = true
+    bubble.Token = bubble.Token + 1
+    local token = bubble.Token
+
+    ScreenGui.Enabled = true
+    MainWindow.Visible = true
+    FloatingBtn.Visible = false
+    bubble.MainScale.Scale = 0.88
+    MainWindow.BackgroundTransparency =
+        math.min(1, Config.BackgroundTransparency + 0.20)
+
+    if bubble.MainTween then
+        pcall(function()
+            bubble.MainTween:Cancel()
+        end)
+    end
+
+    if bubble.MainFadeTween then
+        pcall(function()
+            bubble.MainFadeTween:Cancel()
+        end)
+    end
+
+    bubble.MainTween = TweenService:Create(
+        bubble.MainScale,
+        TweenInfo.new(
+            0.22,
+            Enum.EasingStyle.Quint,
+            Enum.EasingDirection.Out
+        ),
+        {
+            Scale = 1
+        }
+    )
+
+    bubble.MainFadeTween = TweenService:Create(
+        MainWindow,
+        TweenInfo.new(
+            0.22,
+            Enum.EasingStyle.Quad,
+            Enum.EasingDirection.Out
+        ),
+        {
+            BackgroundTransparency =
+                Config.BackgroundTransparency
+        }
+    )
+
+    bubble.MainTween:Play()
+    bubble.MainFadeTween:Play()
+
+    task.delay(0.24, function()
+        if token == bubble.Token then
+            effects.AnimationBusy = false
+            bubble.MainTween = nil
+            bubble.MainFadeTween = nil
+        end
+    end)
+end
+
+function ExtraFeatures.AnimateMenuMinimize()
+    local effects = ExtraFeatures.UIEffects
+    local bubble = effects.Bubble
+
+    ExtraFeatures.PrepareBubble()
+
+    effects.AnimationBusy = true
+    bubble.Token = bubble.Token + 1
+    local token = bubble.Token
+
+    if bubble.MainTween then
+        pcall(function()
+            bubble.MainTween:Cancel()
+        end)
+    end
+
+    if bubble.MainFadeTween then
+        pcall(function()
+            bubble.MainFadeTween:Cancel()
+        end)
+    end
+
+    bubble.MainTween = TweenService:Create(
+        bubble.MainScale,
+        TweenInfo.new(
+            0.18,
+            Enum.EasingStyle.Quint,
+            Enum.EasingDirection.In
+        ),
+        {
+            Scale = 0.88
+        }
+    )
+
+    bubble.MainFadeTween = TweenService:Create(
+        MainWindow,
+        TweenInfo.new(
+            0.18,
+            Enum.EasingStyle.Quad,
+            Enum.EasingDirection.In
+        ),
+        {
+            BackgroundTransparency =
+                math.min(1, Config.BackgroundTransparency + 0.25)
+        }
+    )
+
+    bubble.MainTween:Play()
+    bubble.MainFadeTween:Play()
+
+    task.delay(0.19, function()
+        if token ~= bubble.Token then
+            return
+        end
+
+        MainWindow.Visible = false
+        bubble.MainScale.Scale = 1
+        MainWindow.BackgroundTransparency =
+            Config.BackgroundTransparency
+
+        ExtraFeatures.AnimateBubbleIn()
+        effects.AnimationBusy = false
+        bubble.MainTween = nil
+        bubble.MainFadeTween = nil
+    end)
+end
+
+function ExtraFeatures.InitializeUIEffects()
+    local effects = ExtraFeatures.UIEffects
+
+    if effects.Initialized then
+        return
+    end
+
+    effects.Initialized = true
+    ExtraFeatures.PrepareBubble()
+
+    if not effects.InputTrackingReady then
+        effects.InputTrackingReady = true
+
+        AddConnection(
+            UserInputService.InputChanged:Connect(function(input)
+                if input.UserInputType
+                    == Enum.UserInputType.MouseMovement
+                    or input.UserInputType
+                    == Enum.UserInputType.Touch
+                then
+                    ExtraFeatures.MarkUIActivity()
+                end
+            end)
+        )
+    end
+
+    AddConnection(
+        FloatingBtn.MouseEnter:Connect(function()
+            if not FloatingBtn.Visible then
+                return
+            end
+
+            pcall(function()
+                if effects.Bubble.HoverTween then
+                    effects.Bubble.HoverTween:Cancel()
+                end
+
+                effects.Bubble.HoverTween =
+                    TweenService:Create(
+                        FloatingBtn,
+                        TweenInfo.new(
+                            0.16,
+                            Enum.EasingStyle.Quad,
+                            Enum.EasingDirection.Out
+                        ),
+                        {
+                            BackgroundTransparency = 0.05
+                        }
+                    )
+
+                effects.Bubble.HoverTween:Play()
+
+                TweenService:Create(
+                    FloatStroke,
+                    TweenInfo.new(0.16),
+                    {
+                        Thickness = 2.2,
+                        Transparency = 0
+                    }
+                ):Play()
+
+                TweenService:Create(
+                    effects.Bubble.BubbleScale,
+                    TweenInfo.new(0.16),
+                    {
+                        Scale = 1.06
+                    }
+                ):Play()
+            end)
+        end)
+    )
+
+    AddConnection(
+        FloatingBtn.MouseLeave:Connect(function()
+            pcall(function()
+                if effects.Bubble.HoverTween then
+                    effects.Bubble.HoverTween:Cancel()
+                end
+
+                effects.Bubble.HoverTween =
+                    TweenService:Create(
+                        FloatingBtn,
+                        TweenInfo.new(
+                            0.16,
+                            Enum.EasingStyle.Quad,
+                            Enum.EasingDirection.Out
+                        ),
+                        {
+                            BackgroundTransparency = 0.35
+                        }
+                    )
+
+                effects.Bubble.HoverTween:Play()
+
+                TweenService:Create(
+                    FloatStroke,
+                    TweenInfo.new(0.16),
+                    {
+                        Thickness = 1.5,
+                        Transparency = 0.12
+                    }
+                ):Play()
+
+                TweenService:Create(
+                    effects.Bubble.BubbleScale,
+                    TweenInfo.new(0.16),
+                    {
+                        Scale = 1
+                    }
+                ):Play()
+            end)
+        end)
+    )
+
+    pcall(function()
+        ExtraFeatures.SetVirtualPetEnabled(
+            Config.VirtualPetEnabled
+        )
+    end)
+
+    pcall(function()
+        ExtraFeatures.SetSnowfallEnabled(
+            Config.SnowfallEnabled
+        )
+    end)
+end
+
+function ExtraFeatures.CleanupUIEffects()
+    local effects = ExtraFeatures.UIEffects
+
+    if not effects then
+        return
+    end
+
+    effects.AnimationBusy = false
+
+    pcall(function()
+        ExtraFeatures.StopVirtualPet()
+    end)
+
+    pcall(function()
+        ExtraFeatures.DestroySnowfall()
+    end)
+
+    local dynamic = effects.DynamicColor
+
+    if dynamic and dynamic.Tween then
+        pcall(function()
+            dynamic.Tween:Cancel()
+        end)
+
+        dynamic.Tween = nil
+    end
+
+    local toggleFX = effects.ToggleFX
+
+    if toggleFX then
+        toggleFX.ShakeBusy = false
+
+        for particle in pairs(toggleFX.ActiveParticles or {}) do
+            if particle and particle.Parent then
+                particle:Destroy()
+            end
+        end
+
+        table.clear(toggleFX.ActiveParticles)
+
+        if toggleFX.Sound and toggleFX.Sound.Parent then
+            pcall(function()
+                toggleFX.Sound:Stop()
+            end)
+
+            toggleFX.Sound:Destroy()
+        end
+
+        toggleFX.Sound = nil
+
+        if toggleFX.Overlay and toggleFX.Overlay.Parent then
+            toggleFX.Overlay:Destroy()
+        end
+
+        toggleFX.Overlay = nil
+    end
+
+    if effects.Sliders
+        and type(effects.Sliders.Active) == "table"
+    then
+        table.clear(effects.Sliders.Active)
+    end
+
+    local bubble = effects.Bubble
+    bubble.Token = bubble.Token + 1
+
+    for _, tween in ipairs({
+        bubble.HoverTween,
+        bubble.ScaleTween,
+        bubble.MainTween,
+        bubble.MainFadeTween
+    }) do
+        if tween then
+            pcall(function()
+                tween:Cancel()
+            end)
+        end
+    end
+
+    bubble.HoverTween = nil
+    bubble.ScaleTween = nil
+    bubble.MainTween = nil
+    bubble.MainFadeTween = nil
+
+    if bubble.MainScale and bubble.MainScale.Parent then
+        bubble.MainScale.Scale = 1
+    end
+
+    if bubble.BubbleScale and bubble.BubbleScale.Parent then
+        bubble.BubbleScale.Scale = 1
+    end
+
+    FloatingBtn.Visible = false
+end
+
 local function GetCurrentGameMetadata()
     local name = "Unknown"
     local placeId = 0
@@ -6287,7 +7568,7 @@ CurrentGameName, CurrentPlaceId = GetCurrentGameMetadata()
 
 local function BuildConfigPayload()
     return {
-        version = 2,
+        version = 4,
 
         -- AIM
         AimEnabled = Config.AimEnabled,
@@ -6302,8 +7583,9 @@ local function BuildConfigPayload()
         Smoothness = Config.Smoothness,
         AimMaxDistance = Config.AimMaxDistance,
         AimNPC = Config.AimNPC,
-        HitboxExpanderEnabled = Config.HitboxExpanderEnabled,
-        HitboxSize = Config.HitboxSize,
+        TargetAssistEnabled = Config.TargetAssistEnabled,
+        HeadHitboxEnabled = Config.HeadHitboxEnabled,
+        HeadHitboxSize = Config.HeadHitboxSize,
 
         -- TELEKILL
         TelekillEnabled = Config.TelekillEnabled,
@@ -6344,10 +7626,9 @@ local function BuildConfigPayload()
         ThirdPersonLock = Config.ThirdPersonLock,
         XRayEnabled = Config.XRayEnabled,
         XRayTransparency = Config.XRayTransparency,
-        CopyPlayerOutfitEnabled = Config.CopyPlayerOutfitEnabled,
-        CopyPlayerOutfitKey = Config.CopyPlayerOutfitKey and Config.CopyPlayerOutfitKey.Name or nil,
-        InfiniteYieldEnabled = Config.InfiniteYieldEnabled,
-        AntiLocalEnabled = Config.AntiLocalEnabled,
+        AntiAFKEnabled = Config.AntiAFKEnabled,
+        VirtualPetEnabled = Config.VirtualPetEnabled,
+        SnowfallEnabled = Config.SnowfallEnabled,
         HoldToSpamEnabled = Config.HoldToSpamEnabled,
         HoldToSpamKey = Config.HoldToSpamKey and Config.HoldToSpamKey.Name or nil,
         UIScale = Config.UIScale,
@@ -6411,8 +7692,23 @@ local function ApplyConfigPayload(payload)
     SetNumberField(payload, "Smoothness", Config, nil, 0.2, 1)
     SetNumberField(payload, "AimMaxDistance", Config, nil, 50, 10000)
     SetBooleanField(payload, "AimNPC", Config)
-    SetBooleanField(payload, "HitboxExpanderEnabled", Config)
-    SetNumberField(payload, "HitboxSize", Config, nil, 0, 10)
+    SetBooleanField(payload, "TargetAssistEnabled", Config)
+
+    -- Backward compatibility: old Hitbox profile fields now map only to
+    -- the safe NPC/dummy Head Hitbox implementation.
+    if type(payload.HeadHitboxEnabled) == "boolean" then
+        Config.HeadHitboxEnabled = payload.HeadHitboxEnabled
+    elseif type(payload.HitboxExpanderEnabled) == "boolean" then
+        Config.HeadHitboxEnabled = payload.HitboxExpanderEnabled
+    end
+
+    if IsFiniteNumber(payload.HeadHitboxSize) then
+        Config.HeadHitboxSize =
+            math.clamp(payload.HeadHitboxSize, 0, 10)
+    elseif IsFiniteNumber(payload.HitboxSize) then
+        Config.HeadHitboxSize =
+            math.clamp(payload.HitboxSize, 0, 10)
+    end
 
     SetBooleanField(payload, "TelekillEnabled", Config)
 
@@ -6526,24 +7822,9 @@ local function ApplyConfigPayload(payload)
         0.3,
         1.0
     )
-    SetBooleanField(
-        payload,
-        "CopyPlayerOutfitEnabled",
-        Config
-    )
-
-    if type(payload.CopyPlayerOutfitKey) == "string" then
-        pcall(function()
-            local enumItem =
-                Enum.KeyCode[payload.CopyPlayerOutfitKey]
-            if enumItem then
-                Config.CopyPlayerOutfitKey = enumItem
-            end
-        end)
-    end
-
-    SetBooleanField(payload, "InfiniteYieldEnabled", Config)
-    SetBooleanField(payload, "AntiLocalEnabled", Config)
+    SetBooleanField(payload, "AntiAFKEnabled", Config)
+    SetBooleanField(payload, "VirtualPetEnabled", Config)
+    SetBooleanField(payload, "SnowfallEnabled", Config)
     SetBooleanField(payload, "HoldToSpamEnabled", Config)
 
     if type(payload.HoldToSpamKey) == "string" then
@@ -6596,17 +7877,30 @@ local function ApplyConfigPayload(payload)
     OtherSystem.SetXRay(Config.XRayEnabled)
     OtherSystem.UpdateXRayTransparency()
 
-    ExtraFeatures.SetHitboxEnabled(
-        Config.HitboxExpanderEnabled
-    )
-    ExtraFeatures.SetAntiLocal(
-        Config.AntiLocalEnabled
+    ExtraFeatures.SetHeadHitboxEnabled(
+        Config.HeadHitboxEnabled
     )
 
-    if not ExtraFeatures.SetInfiniteYield(
-        Config.InfiniteYieldEnabled
+    if not ExtraFeatures.SetAntiAFK(
+        Config.AntiAFKEnabled
     ) then
-        Config.InfiniteYieldEnabled = false
+        Config.AntiAFKEnabled = false
+    end
+
+    if ExtraFeatures.SetVirtualPetEnabled then
+        pcall(function()
+            ExtraFeatures.SetVirtualPetEnabled(
+                Config.VirtualPetEnabled
+            )
+        end)
+    end
+
+    if ExtraFeatures.SetSnowfallEnabled then
+        pcall(function()
+            ExtraFeatures.SetSnowfallEnabled(
+                Config.SnowfallEnabled
+            )
+        end)
     end
 
     if not Config.HoldToSpamEnabled then
@@ -6639,15 +7933,24 @@ local function SyncSettingsUI()
     if UIRefs.Toggles.AimNPC then
         UIRefs.Toggles.AimNPC.Set(Config.AimNPC, true)
     end
-    if UIRefs.Toggles.HitboxExpander then
-        UIRefs.Toggles.HitboxExpander.Set(
-            Config.HitboxExpanderEnabled,
+    if UIRefs.Toggles.TargetAssist then
+        UIRefs.Toggles.TargetAssist.Set(
+            Config.TargetAssistEnabled,
             true
         )
     end
-    if UIRefs.Sliders.HitboxSize then
-        UIRefs.Sliders.HitboxSize.Set(
-            Config.HitboxSize,
+    if not Config.TargetAssistEnabled then
+        ExtraFeatures.ClearTargetAssist()
+    end
+    if UIRefs.Toggles.HeadHitbox then
+        UIRefs.Toggles.HeadHitbox.Set(
+            Config.HeadHitboxEnabled,
+            true
+        )
+    end
+    if UIRefs.Sliders.HeadHitboxSize then
+        UIRefs.Sliders.HeadHitboxSize.Set(
+            Config.HeadHitboxSize,
             true
         )
     end
@@ -6813,29 +8116,23 @@ local function SyncSettingsUI()
         )
     end
 
-    if UIRefs.Toggles.CopyPlayerOutfit then
-        UIRefs.Toggles.CopyPlayerOutfit.Set(
-            Config.CopyPlayerOutfitEnabled,
+    if UIRefs.Toggles.AntiAFK then
+        UIRefs.Toggles.AntiAFK.Set(
+            Config.AntiAFKEnabled,
             true
         )
     end
 
-    if UIRefs.CopyPlayerOutfitKeyBox then
-        UIRefs.CopyPlayerOutfitKeyBox.Text =
-            "Copy Outfit Key: "
-            .. Config.CopyPlayerOutfitKey.Name
-    end
-
-    if UIRefs.Toggles.InfiniteYield then
-        UIRefs.Toggles.InfiniteYield.Set(
-            Config.InfiniteYieldEnabled,
+    if UIRefs.Toggles.VirtualPet then
+        UIRefs.Toggles.VirtualPet.Set(
+            Config.VirtualPetEnabled,
             true
         )
     end
 
-    if UIRefs.Toggles.AntiLocal then
-        UIRefs.Toggles.AntiLocal.Set(
-            Config.AntiLocalEnabled,
+    if UIRefs.Toggles.Snowfall then
+        UIRefs.Toggles.Snowfall.Set(
+            Config.SnowfallEnabled,
             true
         )
     end
@@ -7472,39 +8769,35 @@ UIRefs.ExtraSettingsSection =
         "FEATURE SETTINGS"
     )
 
-UIRefs.Toggles.InfiniteYield =
-    UI:CreateToggle(
-        UIRefs.ExtraSettingsSection,
-        {
-            Text = "Infinite Yield",
-            Default = Config.InfiniteYieldEnabled,
-            Callback = function(value)
-                local ok =
-                    ExtraFeatures.SetInfiniteYield(value)
+do
+    local ok, err = pcall(function()
+        UIRefs.Toggles.AntiAFK =
+            UI:CreateToggle(
+                UIRefs.ExtraSettingsSection,
+                {
+                    Text = "Anti-AFK",
+                    Default = Config.AntiAFKEnabled,
+                    Callback = function(value)
+                        local ok =
+                            ExtraFeatures.SetAntiAFK(value)
 
-                if value and not ok
-                    and UIRefs.Toggles.InfiniteYield
-                then
-                    UIRefs.Toggles.InfiniteYield.Set(
-                        false,
-                        true
-                    )
-                end
-            end
-        }
-    )
+                        if value and not ok
+                            and UIRefs.Toggles.AntiAFK
+                        then
+                            UIRefs.Toggles.AntiAFK.Set(
+                                false,
+                                true
+                            )
+                        end
+                    end
+                }
+            )    end)
 
-UIRefs.Toggles.AntiLocal =
-    UI:CreateToggle(
-        UIRefs.ExtraSettingsSection,
-        {
-            Text = "Anti-Local Anti-Cheat",
-            Default = Config.AntiLocalEnabled,
-            Callback = function(value)
-                ExtraFeatures.SetAntiLocal(value)
-            end
-        }
-    )
+    if not ok then
+        Config.AntiAFKEnabled = false
+        warn("[Hood Rivals] Anti-AFK UI skipped: " .. tostring(err))
+    end
+end
 
 UIRefs.GamePassSpooferButton =
     UI:CreateButton(
@@ -7572,22 +8865,61 @@ AddConnection(
             ExtraFeatures.HoldSpamKeyBox =
                 UIRefs.HoldToSpamKeyBox
 
-            if ExtraFeatures.CopyOutfitListening then
-                ExtraFeatures.CopyOutfitListening = false
-                ExtraFeatures.CopyOutfitKeyBox = nil
-
-                if UIRefs.CopyPlayerOutfitKeyBox then
-                    UIRefs.CopyPlayerOutfitKeyBox.Text =
-                        "Copy Outfit Key: "
-                        .. Config.CopyPlayerOutfitKey.Name
-                end
-            end
-
             UIRefs.HoldToSpamKeyBox.Text =
                 "Press Key..."
         end
     )
 )
+
+UIRefs.UIEffectsSection =
+    UI:CreateSection(
+        SettingsPage,
+        "UI EFFECTS"
+    )
+
+UIRefs.Toggles.VirtualPet =
+    UI:CreateToggle(
+        UIRefs.UIEffectsSection,
+        {
+            Text = "Virtual Pet",
+            Default = Config.VirtualPetEnabled,
+            Callback = function(value)
+                local ok =
+                    ExtraFeatures.SetVirtualPetEnabled(value)
+
+                if value and not ok
+                    and UIRefs.Toggles.VirtualPet
+                then
+                    UIRefs.Toggles.VirtualPet.Set(
+                        false,
+                        true
+                    )
+                end
+            end
+        }
+    )
+
+UIRefs.Toggles.Snowfall =
+    UI:CreateToggle(
+        UIRefs.UIEffectsSection,
+        {
+            Text = "Snowfall",
+            Default = Config.SnowfallEnabled,
+            Callback = function(value)
+                local ok =
+                    ExtraFeatures.SetSnowfallEnabled(value)
+
+                if value and not ok
+                    and UIRefs.Toggles.Snowfall
+                then
+                    UIRefs.Toggles.Snowfall.Set(
+                        false,
+                        true
+                    )
+                end
+            end
+        }
+    )
 
 UIRefs.ConfigSaveLoadSec =
     UI:CreateSection(
@@ -7683,9 +9015,15 @@ if not FileAPI.Available then
 end
 
 
+-- Initialize optional UI decorations only after the base GUI,
+-- PageManager and SETTINGS controls have been created.
+pcall(function()
+    ExtraFeatures.InitializeUIEffects()
+end)
+
 -- =========================================================
 -- TAB: KHÁC
--- Exactly the seven requested features only.
+-- Existing OTHER features remain unchanged.
 -- =========================================================
 PageManager:AddPage("KHÁC")
 
@@ -7840,7 +9178,9 @@ AddConnection(
 )
 
 -- Initialize NPC detection after the GUI/settings framework is ready.
-NPCSystem.Initialize()
+pcall(function()
+    NPCSystem.Initialize()
+end)
 
 -- =========================================================
 -- RENDER PIPELINE
@@ -7871,8 +9211,13 @@ RunService:BindToRenderStep(
     function(renderDt)
         UpdatePlayer(renderDt)
         UpdateTeleport()
-        ExtraFeatures.UpdateHitboxes(renderDt, false)
+        pcall(function()
+            ExtraFeatures.UpdateHeadHitboxes(renderDt, false)
+        end)
         ExtraFeatures.UpdateHoldSpam(renderDt)
+        pcall(function()
+            ExtraFeatures.UpdateHeavySliders(renderDt)
+        end)
         OtherSystem.UpdateMenuInput()
     end
 )
@@ -7884,6 +9229,9 @@ RunService:BindToRenderStep(
     Enum.RenderPriority.Last.Value - 1,
     function()
         Telekill.Update()
+        pcall(function()
+            ExtraFeatures.UpdateTargetAssist()
+        end)
         UpdateAim()
         UpdateFOVCircle()
     end
@@ -7921,6 +9269,10 @@ local function BindPlayerLifecycle(target)
                 CurrentAimTarget = nil
             end
 
+            if ExtraFeatures.TargetAssist.CurrentTarget == target then
+                ExtraFeatures.ClearTargetAssist()
+            end
+
             if Telekill.CurrentTarget == target then
                 Telekill.CurrentTarget = nil
             end
@@ -7934,6 +9286,10 @@ local function BindPlayerLifecycle(target)
 
             if CurrentAimTarget == target then
                 CurrentAimTarget = nil
+            end
+
+            if ExtraFeatures.TargetAssist.CurrentTarget == target then
+                ExtraFeatures.ClearTargetAssist()
             end
 
             if Telekill.CurrentTarget == target then
@@ -7971,6 +9327,10 @@ AddConnection(
             CurrentAimTarget = nil
         end
 
+        if ExtraFeatures.TargetAssist.CurrentTarget == target then
+            ExtraFeatures.ClearTargetAssist()
+        end
+
         if Telekill.CurrentTarget == target then
             Telekill.CurrentTarget = nil
         end
@@ -7981,25 +9341,56 @@ AddConnection(
 
 
 -- Mở mặc định Tab ESP
-PageManager:ShowPage(Config.StartPage)
+pcall(function()
+    PageManager:ShowPage(Config.StartPage, true)
+end)
 
 -- ==========================================
 -- 10. EVENT CONTROLS & MINIMIZE / CLOSE
 -- ==========================================
 
 SetMenuState = function(newState)
+    local effects = ExtraFeatures.UIEffects
+
+    if newState ~= "Closed"
+        and effects
+        and effects.AnimationBusy
+    then
+        return
+    end
+
     GUIState.CurrentState = newState
 
     if newState == "Open" then
         ScreenGui.Enabled = true
-        MainWindow.Visible = true
-        FloatingBtn.Visible = false
         OtherSystem.SetMenuMouseState(true)
+
+        local ok = pcall(function()
+            ExtraFeatures.AnimateMenuOpen()
+        end)
+
+        if not ok then
+            MainWindow.Visible = true
+            FloatingBtn.Visible = false
+        end
     elseif newState == "Minimized" then
-        MainWindow.Visible = false
-        FloatingBtn.Visible = true
         OtherSystem.SetMenuMouseState(false)
+
+        local ok = pcall(function()
+            ExtraFeatures.AnimateMenuMinimize()
+        end)
+
+        if not ok then
+            MainWindow.Visible = false
+            FloatingBtn.Visible = true
+        end
     elseif newState == "Closed" then
+        if effects then
+            effects.AnimationBusy = false
+            effects.Bubble.Token =
+                effects.Bubble.Token + 1
+        end
+
         ScreenGui.Enabled = false
         OtherSystem.SetMenuMouseState(false)
     end
@@ -8022,7 +9413,7 @@ CloseBtn.MouseButton1Click:Connect(function()
     SetMenuState("Closed")
 
     CleanupPlayerRuntime()
-    ExtraFeatures.RestoreAllHitboxes()
+    ExtraFeatures.RestoreAllHeadHitboxes()
     ExtraFeatures.HoldSpamKeyHeld = false
     ExtraFeatures.HoldSpamRightHeld = false
     ExtraFeatures.HoldSpamAccumulator = 0
@@ -8045,34 +9436,16 @@ end)
 
 -- Keybind Event (RightControl)
 AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if ExtraFeatures.MarkUIActivity then
+        ExtraFeatures.MarkUIActivity()
+    end
+
     if OtherSystem.ConsumeNextToggleInput then
         OtherSystem.ConsumeNextToggleInput = false
         return
     end
 
     if OtherSystem.KeybindListening then
-        return
-    end
-
-    if ExtraFeatures.CopyOutfitListening then
-        if input.UserInputType ~= Enum.UserInputType.Keyboard
-            or input.KeyCode == Enum.KeyCode.Unknown
-        then
-            return
-        end
-
-        Config.CopyPlayerOutfitKey = input.KeyCode
-        ExtraFeatures.CopyOutfitListening = false
-
-        if ExtraFeatures.CopyOutfitKeyBox
-            and ExtraFeatures.CopyOutfitKeyBox.Parent
-        then
-            ExtraFeatures.CopyOutfitKeyBox.Text =
-                "Copy Outfit Key: "
-                .. Config.CopyPlayerOutfitKey.Name
-        end
-
-        ExtraFeatures.CopyOutfitKeyBox = nil
         return
     end
 
@@ -8099,12 +9472,6 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 
     if input.UserInputType == Enum.UserInputType.Keyboard then
-        if input.KeyCode == Config.CopyPlayerOutfitKey
-            and Config.CopyPlayerOutfitEnabled
-        then
-            ExtraFeatures.CopyOutfitKeyHeld = true
-        end
-
         if input.KeyCode == Config.HoldToSpamKey
             and Config.HoldToSpamEnabled
         then
@@ -8117,16 +9484,8 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 
     if input.UserInputType == Enum.UserInputType.Keyboard
-        and (
-            (
-                Config.CopyPlayerOutfitEnabled
-                and input.KeyCode == Config.CopyPlayerOutfitKey
-            )
-            or (
-                Config.HoldToSpamEnabled
-                and input.KeyCode == Config.HoldToSpamKey
-            )
-        )
+        and Config.HoldToSpamEnabled
+        and input.KeyCode == Config.HoldToSpamKey
     then
         return
     end
@@ -8157,8 +9516,11 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
                 function(renderDt)
                     UpdatePlayer(renderDt)
                     UpdateTeleport()
-                    ExtraFeatures.UpdateHitboxes(renderDt, false)
+                    ExtraFeatures.UpdateHeadHitboxes(renderDt, false)
                     ExtraFeatures.UpdateHoldSpam(renderDt)
+                    pcall(function()
+                        ExtraFeatures.UpdateHeavySliders(renderDt)
+                    end)
                     OtherSystem.UpdateMenuInput()
                 end
             )
@@ -8168,6 +9530,7 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
                 Enum.RenderPriority.Last.Value - 1,
                 function()
                     Telekill.Update()
+                    ExtraFeatures.UpdateTargetAssist()
                     UpdateAim()
                     UpdateFOVCircle()
                 end
@@ -8191,10 +9554,6 @@ end))
 AddConnection(
     UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Keyboard then
-            if input.KeyCode == Config.CopyPlayerOutfitKey then
-                ExtraFeatures.CopyOutfitKeyHeld = false
-            end
-
             if input.KeyCode == Config.HoldToSpamKey then
                 ExtraFeatures.HoldSpamKeyHeld = false
                 ExtraFeatures.HoldSpamAccumulator = 0
@@ -8203,12 +9562,6 @@ AddConnection(
             ExtraFeatures.HoldSpamRightHeld = false
             ExtraFeatures.HoldSpamAccumulator = 0
         end
-    end)
-)
-
-AddConnection(
-    Mouse.Button1Down:Connect(function()
-        ExtraFeatures.CopyPlayerOutfit()
     end)
 )
 
