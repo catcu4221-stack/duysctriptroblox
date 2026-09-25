@@ -71,8 +71,8 @@ end
 -- 2. CONFIGURATION & STATE
 -- ==========================================
 local Config = {
-    Title = "[VIP] PDuyz",
-    Author = "Made By Pduyor_AI_",
+    Title = "[UPD] Hood Rivals",
+    Author = "Made By @rullzsy_",
     ToggleKey = Enum.KeyCode.RightControl,
     ToggleKeyEnabled = true,
     UIScale = 1.0,
@@ -98,6 +98,10 @@ local Config = {
     AntiAFKEnabled = false,
     VirtualPetEnabled = true,
     SnowfallEnabled = true,
+
+    -- FUNCTION 1 (safe visual / camera helpers)
+    DroneStrikeKey = Enum.KeyCode.V,
+    MagicSilentEnabled = false,
 
     -- ESP Core Configuration
     Enabled = false,
@@ -129,6 +133,7 @@ local Config = {
     AimMaxDistance = 2000,
     AimNPC = false,
     TargetAssistEnabled = false,
+    AimSilentEnabled = false,
     HeadHitboxEnabled = false,
     HeadHitboxSize = 0,
 
@@ -249,7 +254,9 @@ local function UpdateFOVCircle()
         return
     end
 
-    if not Config.AimEnabled or not Config.UseFOV then
+    if not Config.UseFOV
+        or (not Config.AimEnabled and not Config.AimSilentEnabled)
+    then
         FOVCircle.Visible = false
         return
     end
@@ -359,8 +366,8 @@ end
 -- ==========================================
 local MainWindow = Instance.new("Frame")
 MainWindow.Name = "MainWindow"
-MainWindow.Size = UDim2.new(0, 560, 0, 360)
-MainWindow.Position = UDim2.new(0.5, -280, 0.5, -180)
+MainWindow.Size = UDim2.new(0, 560, 0, 390)
+MainWindow.Position = UDim2.new(0.5, -280, 0.5, -195)
 MainWindow.BackgroundColor3 = Config.DarkBg
 MainWindow.BackgroundTransparency = Config.BackgroundTransparency
 MainWindow.BorderSizePixel = 0
@@ -379,13 +386,22 @@ MainStroke.Parent = MainWindow
 -- Header
 local Header = Instance.new("Frame")
 Header.Name = "Header"
-Header.Size = UDim2.new(1, 0, 0, 35)
+Header.Size = UDim2.new(1, 0, 0, 64)
 Header.BackgroundTransparency = 1
 Header.Parent = MainWindow
 
+-- Two-row header: the first row owns title/window controls and is the
+-- draggable area.  The second row is a horizontal top-tab rail.
+local TopRow = Instance.new("Frame")
+TopRow.Name = "TopRow"
+TopRow.Size = UDim2.new(1, 0, 0, 33)
+TopRow.Position = UDim2.new(0, 0, 0, 0)
+TopRow.BackgroundTransparency = 1
+TopRow.Parent = Header
+
 local TitleLabel = Instance.new("TextLabel")
 TitleLabel.Name = "Title"
-TitleLabel.Size = UDim2.new(0, 200, 1, 0)
+TitleLabel.Size = UDim2.new(0, 230, 1, 0)
 TitleLabel.Position = UDim2.new(0, 12, 0, 0)
 TitleLabel.Text = Config.Title
 TitleLabel.TextColor3 = Config.TextColor
@@ -393,18 +409,18 @@ TitleLabel.TextSize = 14
 TitleLabel.Font = Enum.Font.GothamBold
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 TitleLabel.BackgroundTransparency = 1
-TitleLabel.Parent = Header
+TitleLabel.Parent = TopRow
 
 local ControlButtons = Instance.new("Frame")
-ControlButtons.Size = UDim2.new(0, 90, 1, 0)
-ControlButtons.Position = UDim2.new(1, -95, 0, 0)
+ControlButtons.Size = UDim2.new(0, 90, 0, 31)
+ControlButtons.Position = UDim2.new(1, -95, 0, 1)
 ControlButtons.BackgroundTransparency = 1
-ControlButtons.Parent = Header
+ControlButtons.Parent = TopRow
 
 local MinimizeBtn = Instance.new("TextButton")
 MinimizeBtn.Name = "Minimize"
 MinimizeBtn.Size = UDim2.new(0, 25, 0, 25)
-MinimizeBtn.Position = UDim2.new(0, 0, 0.5, -12)
+MinimizeBtn.Position = UDim2.new(0, 0, 0, 3)
 MinimizeBtn.Text = "-"
 MinimizeBtn.TextColor3 = Config.SubTextColor
 MinimizeBtn.TextSize = 16
@@ -420,7 +436,7 @@ MinCorner.Parent = MinimizeBtn
 UIRefs.NotificationButton = Instance.new("TextButton")
 UIRefs.NotificationButton.Name = "Notification"
 UIRefs.NotificationButton.Size = UDim2.new(0, 25, 0, 25)
-UIRefs.NotificationButton.Position = UDim2.new(0, 30, 0.5, -12)
+UIRefs.NotificationButton.Position = UDim2.new(0, 30, 0, 3)
 UIRefs.NotificationButton.Text = "🔔"
 UIRefs.NotificationButton.TextColor3 = Config.SubTextColor
 UIRefs.NotificationButton.TextSize = 13
@@ -436,7 +452,7 @@ NotificationCorner.Parent = UIRefs.NotificationButton
 local CloseBtn = Instance.new("TextButton")
 CloseBtn.Name = "Close"
 CloseBtn.Size = UDim2.new(0, 25, 0, 25)
-CloseBtn.Position = UDim2.new(0, 60, 0.5, -12)
+CloseBtn.Position = UDim2.new(0, 60, 0, 3)
 CloseBtn.Text = "X"
 CloseBtn.TextColor3 = Config.SubTextColor
 CloseBtn.TextSize = 13
@@ -449,13 +465,33 @@ local CloseCorner = Instance.new("UICorner")
 CloseCorner.CornerRadius = UDim.new(0, 4)
 CloseCorner.Parent = CloseBtn
 
--- Kéo thả MainWindow qua Header
-MakeDraggable(MainWindow, Header)
+local TopTabBar = Instance.new("ScrollingFrame")
+TopTabBar.Name = "TopTabBar"
+TopTabBar.Size = UDim2.new(1, -16, 0, 26)
+TopTabBar.Position = UDim2.new(0, 8, 0, 35)
+TopTabBar.BackgroundTransparency = 1
+TopTabBar.BorderSizePixel = 0
+TopTabBar.ScrollBarThickness = 2
+TopTabBar.ScrollBarImageColor3 = Config.SubTextColor
+TopTabBar.ScrollingDirection = Enum.ScrollingDirection.X
+TopTabBar.AutomaticCanvasSize = Enum.AutomaticSize.X
+TopTabBar.CanvasSize = UDim2.new(0, 0, 0, 0)
+TopTabBar.Parent = Header
+
+local TopTabLayout = Instance.new("UIListLayout")
+TopTabLayout.FillDirection = Enum.FillDirection.Horizontal
+TopTabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+TopTabLayout.Padding = UDim.new(0, 7)
+TopTabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+TopTabLayout.Parent = TopTabBar
+
+-- Drag only from the top row so horizontal tabs never fight the drag system.
+MakeDraggable(MainWindow, TopRow)
 
 -- Divider Line
 local HeaderDivider = Instance.new("Frame")
 HeaderDivider.Size = UDim2.new(1, 0, 0, 1)
-HeaderDivider.Position = UDim2.new(0, 0, 0, 35)
+HeaderDivider.Position = UDim2.new(0, 0, 0, 63)
 HeaderDivider.BackgroundColor3 = Config.BorderColor
 HeaderDivider.BorderSizePixel = 0
 HeaderDivider.Parent = MainWindow
@@ -463,8 +499,8 @@ HeaderDivider.Parent = MainWindow
 -- Sidebar Container
 local Sidebar = Instance.new("Frame")
 Sidebar.Name = "Sidebar"
-Sidebar.Size = UDim2.new(0, 140, 1, -36)
-Sidebar.Position = UDim2.new(0, 0, 0, 36)
+Sidebar.Size = UDim2.new(0, 140, 1, -64)
+Sidebar.Position = UDim2.new(0, 0, 0, 64)
 Sidebar.BackgroundColor3 = Config.SidebarBg
 Sidebar.BorderSizePixel = 0
 Sidebar.Parent = MainWindow
@@ -507,8 +543,8 @@ AuthorLabel.Parent = Sidebar
 -- Content Area
 local ContentArea = Instance.new("Frame")
 ContentArea.Name = "ContentArea"
-ContentArea.Size = UDim2.new(1, -141, 1, -36)
-ContentArea.Position = UDim2.new(0, 141, 0, 36)
+ContentArea.Size = UDim2.new(1, -141, 1, -64)
+ContentArea.Position = UDim2.new(0, 141, 0, 64)
 ContentArea.BackgroundTransparency = 1
 ContentArea.Parent = MainWindow
 
@@ -519,10 +555,10 @@ FloatingBtn.Size = UDim2.fromOffset(48, 48)
 FloatingBtn.Position = UDim2.new(1, -68, 1, -68)
 FloatingBtn.BackgroundColor3 = Config.DarkBg
 FloatingBtn.BackgroundTransparency = 0.35
-FloatingBtn.Text = "Menu"
+FloatingBtn.Text = "HR"
 FloatingBtn.TextColor3 = Config.TextColor
 FloatingBtn.Font = Enum.Font.GothamBold
-FloatingBtn.TextSize = 15
+FloatingBtn.TextSize = 13
 FloatingBtn.AutoButtonColor = false
 FloatingBtn.Visible = false
 FloatingBtn.Parent = ScreenGui
@@ -549,6 +585,7 @@ local OtherSystem = {
     MenuMouseState = nil,
     KeybindListening = false,
     KeybindBox = nil,
+    KeybindCaptureMode = nil,
     ConsumeNextToggleInput = false,
     Generation = 0
 }
@@ -559,6 +596,16 @@ local ExtraFeatures = {
 
     TargetAssist = {
         CurrentTarget = nil
+    },
+
+    AimSilent = {
+        CurrentTarget = nil,
+        CurrentPart = nil,
+        TargetOptions = {
+            AllowWhenAimDisabled = true,
+            RequireFOV = true,
+            RequireVisibility = true
+        }
     },
 
     AntiAFK = {
@@ -579,6 +626,27 @@ local ExtraFeatures = {
     HoldSpamAccumulator = 0,
     HoldSpamInterval = 0.12,
     HoldSpamInput = nil,
+
+    Function1 = {
+        DroneStrike = {
+            Active = false,
+            Original = nil,
+            CFrame = nil,
+            Pitch = 0,
+            Yaw = 0,
+            Speed = 60,
+            Target = nil,
+            TargetAccumulator = 0
+        },
+
+        MagicSilent = {
+            Target = nil,
+            Accumulator = 0
+        },
+
+        Marker = nil,
+        MarkerText = nil
+    },
 
     UIEffects = {
         VirtualPet = {
@@ -653,7 +721,7 @@ local ExtraFeatures = {
         Initialized = false
     },
 
-    NotificationText = "Thông báo cái con Cặc, tự mò mà chơi",
+    NotificationText = "NHẬP THÔNG BÁO Ở ĐÂY",
     NotificationView = nil,
     NotificationPreviousPage = nil
 }
@@ -1174,6 +1242,18 @@ function ExtraFeatures.ClearTargetAssist()
     end
 end
 
+function ExtraFeatures.ClearAimSilent()
+    ExtraFeatures.AimSilent.CurrentTarget = nil
+    ExtraFeatures.AimSilent.CurrentPart = nil
+    FOVCircleStroke.Thickness = 2
+
+    if UIRefs.AimSilentLabel
+        and UIRefs.AimSilentLabel.Parent
+    then
+        UIRefs.AimSilentLabel.Text = "Target: None"
+    end
+end
+
 function ExtraFeatures.StyleKeyButton(button)
     if not button then
         return
@@ -1203,11 +1283,20 @@ function ExtraFeatures.RestoreHeadHitboxPart(part)
 
     ExtraFeatures.HeadHitboxCache[part] = nil
 
+    if original.Visual then
+        pcall(function()
+            original.Visual:Destroy()
+        end)
+        original.Visual = nil
+    end
+
     if part and part.Parent then
         pcall(function()
             part.Size = original.Size
             part.Transparency = original.Transparency
             part.CanCollide = original.CanCollide
+            part.CanQuery = original.CanQuery
+            part.CanTouch = original.CanTouch
         end)
     end
 end
@@ -1240,7 +1329,10 @@ function ExtraFeatures.ApplyHeadHitboxPart(part)
         ExtraFeatures.HeadHitboxCache[part] = {
             Size = part.Size,
             Transparency = part.Transparency,
-            CanCollide = part.CanCollide
+            CanCollide = part.CanCollide,
+            CanQuery = part.CanQuery,
+            CanTouch = part.CanTouch,
+            Visual = nil
         }
     end
 
@@ -1260,10 +1352,28 @@ function ExtraFeatures.ApplyHeadHitboxPart(part)
         part.Size =
             original.Size
             + Vector3.new(amount, amount, amount)
-        part.Transparency =
-            math.max(original.Transparency, 0.8)
+
+        -- Visible enough to understand the expanded bounds while still
+        -- remaining transparent enough not to obstruct the target.
+        part.Transparency = math.max(original.Transparency, 0.65)
         part.CanCollide = false
+        part.CanQuery = true
+        part.CanTouch = original.CanTouch
     end)
+
+    if not original.Visual or not original.Visual.Parent then
+        pcall(function()
+            local visual = Instance.new("SelectionBox")
+            visual.Name = "__HoodRivals_HeadHitboxVisual"
+            visual.Adornee = part
+            visual.Color3 = Config.AccentColor
+            visual.SurfaceColor3 = Config.AccentColor
+            visual.SurfaceTransparency = 0.92
+            visual.LineThickness = 0.03
+            visual.Parent = part
+            original.Visual = visual
+        end)
+    end
 end
 
 function ExtraFeatures.UpdateHeadHitboxes(dt, force)
@@ -1290,7 +1400,7 @@ function ExtraFeatures.UpdateHeadHitboxes(dt, force)
 
     local seen = {}
 
-    -- Head Hitbox is intentionally restricted to the existing NPC registry.
+    -- Head Hitbox remains restricted to the existing NPC/dummy registry.
     -- Real Player characters are never modified by this feature.
     for model in pairs(NPCSystem.ValidNPCs) do
         if model
@@ -1586,8 +1696,15 @@ function ExtraFeatures.Cleanup()
 
     ExtraFeatures.RestoreAllHeadHitboxes()
     ExtraFeatures.ClearTargetAssist()
+    ExtraFeatures.ClearAimSilent()
     ExtraFeatures.SetAntiAFK(false)
     ExtraFeatures.RestoreGamePassSpoofer()
+
+    if ExtraFeatures.CleanupFunction1 then
+        pcall(function()
+            ExtraFeatures.CleanupFunction1()
+        end)
+    end
 
     if ExtraFeatures.CleanupUIEffects then
         ExtraFeatures.CleanupUIEffects()
@@ -1793,22 +1910,36 @@ function OtherSystem.UpdateMenuInput()
     end
 end
 
-function OtherSystem.BeginKeybindCapture(box)
+function OtherSystem.BeginKeybindCapture(box, captureMode)
+    local requestedMode = captureMode or "MenuToggle"
+
     if OtherSystem.KeybindListening then
+        local oldBox = OtherSystem.KeybindBox
+        local oldMode = OtherSystem.KeybindCaptureMode or "MenuToggle"
+
         OtherSystem.KeybindListening = false
+        OtherSystem.KeybindCaptureMode = nil
         OtherSystem.KeybindBox = nil
 
-        if box and box.Parent then
-            box.Text = Config.ToggleKey.Name
+        if oldBox and oldBox.Parent then
+            if oldMode == "DroneStrike" then
+                oldBox.Text = "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+            else
+                oldBox.Text = Config.ToggleKey.Name
+            end
         end
-        return
+
+        if oldBox == box then
+            return
+        end
     end
 
     OtherSystem.KeybindListening = true
+    OtherSystem.KeybindCaptureMode = requestedMode
     OtherSystem.KeybindBox = box
 
     if box and box.Parent then
-        box.Text = "Press Key"
+        box.Text = "Press Key..."
     end
 end
 
@@ -1825,14 +1956,102 @@ function OtherSystem.HandleKeybindInput(input)
         return true
     end
 
-    Config.ToggleKey = input.KeyCode
+    local mode = OtherSystem.KeybindCaptureMode or "MenuToggle"
+    local box = OtherSystem.KeybindBox
+
+    if input.KeyCode == Enum.KeyCode.Escape then
+        OtherSystem.KeybindListening = false
+        OtherSystem.KeybindCaptureMode = nil
+        OtherSystem.KeybindBox = nil
+        OtherSystem.ConsumeNextToggleInput = true
+
+        if box and box.Parent then
+            if mode == "DroneStrike" then
+                box.Text = "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+            else
+                box.Text = Config.ToggleKey.Name
+            end
+        end
+
+        return true
+    end
+
+    if mode == "DroneStrike" then
+        if input.KeyCode == Enum.KeyCode.W
+            or input.KeyCode == Enum.KeyCode.A
+            or input.KeyCode == Enum.KeyCode.S
+            or input.KeyCode == Enum.KeyCode.D
+            or input.KeyCode == Enum.KeyCode.Q
+            or input.KeyCode == Enum.KeyCode.E
+        then
+            if ExtraFeatures.SetStatus then
+                ExtraFeatures.SetStatus(
+                    "That key is reserved for Drone Strike freecam movement"
+                )
+            end
+
+            if box and box.Parent then
+                box.Text = "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+            end
+
+            OtherSystem.KeybindListening = false
+            OtherSystem.KeybindCaptureMode = nil
+            OtherSystem.KeybindBox = nil
+            OtherSystem.ConsumeNextToggleInput = true
+            return true
+        end
+
+        if input.KeyCode == Config.ToggleKey then
+            if ExtraFeatures.SetStatus then
+                ExtraFeatures.SetStatus(
+                    "Drone Strike key cannot match the menu ToggleKey"
+                )
+            end
+
+            if box and box.Parent then
+                box.Text = "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+            end
+
+            OtherSystem.KeybindListening = false
+            OtherSystem.KeybindCaptureMode = nil
+            OtherSystem.KeybindBox = nil
+            OtherSystem.ConsumeNextToggleInput = true
+            return true
+        end
+
+        Config.DroneStrikeKey = input.KeyCode
+    else
+        if input.KeyCode == Config.DroneStrikeKey then
+            if ExtraFeatures.SetStatus then
+                ExtraFeatures.SetStatus(
+                    "Menu ToggleKey cannot match the Drone Strike key"
+                )
+            end
+
+            if box and box.Parent then
+                box.Text = Config.ToggleKey.Name
+            end
+
+            OtherSystem.KeybindListening = false
+            OtherSystem.KeybindCaptureMode = nil
+            OtherSystem.KeybindBox = nil
+            OtherSystem.ConsumeNextToggleInput = true
+            return true
+        end
+
+        Config.ToggleKey = input.KeyCode
+    end
+
     OtherSystem.KeybindListening = false
+    OtherSystem.KeybindCaptureMode = nil
     OtherSystem.ConsumeNextToggleInput = true
 
-    if OtherSystem.KeybindBox
-        and OtherSystem.KeybindBox.Parent
-    then
-        OtherSystem.KeybindBox.Text = Config.ToggleKey.Name
+    if box and box.Parent then
+        if mode == "DroneStrike" then
+            box.Text = "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+        else
+            box.Text = Config.ToggleKey.Name
+        end
     end
 
     OtherSystem.KeybindBox = nil
@@ -2117,6 +2336,7 @@ function OtherSystem.Cleanup()
 
     OtherSystem.KeybindListening = false
     OtherSystem.KeybindBox = nil
+    OtherSystem.KeybindCaptureMode = nil
     OtherSystem.ConsumeNextToggleInput = false
     OtherSystem.ServerActionBusy = false
 
@@ -2144,7 +2364,10 @@ AddConnection(
 -- ==========================================
 local PageManager = {}
 
-function PageManager:AddPage(pageName)
+function PageManager:AddPage(pageName, options)
+    options = options or {}
+    local placement = options.Placement or "Sidebar"
+
     local pageScroll = Instance.new("ScrollingFrame")
     pageScroll.Name = pageName .. "Page"
     pageScroll.Size = UDim2.new(1, 0, 1, 0)
@@ -2169,28 +2392,45 @@ function PageManager:AddPage(pageName)
 
     AutoCanvasSize(pageScroll, pageList)
 
-    -- Tab Button
+    -- Both vertical and horizontal tabs reuse the same PageManager/GUIState.
     local tabBtn = Instance.new("TextButton")
     tabBtn.Name = pageName .. "Btn"
-    tabBtn.Size = UDim2.new(1, 0, 0, 32)
+
+    if placement == "Top" then
+        tabBtn.Size = UDim2.fromOffset(
+            math.max(86, math.min(150, #pageName * 7 + 26)),
+            24
+        )
+        tabBtn.TextSize = 11
+        tabBtn.Parent = TopTabBar
+    else
+        tabBtn.Size = UDim2.new(1, 0, 0, 32)
+        tabBtn.TextSize = 13
+        tabBtn.Parent = TabContainer
+    end
+
     tabBtn.Text = pageName
     tabBtn.TextColor3 = Config.SubTextColor
     tabBtn.Font = Enum.Font.GothamMedium
-    tabBtn.TextSize = 13
     tabBtn.BackgroundColor3 = Config.DarkBg
     tabBtn.AutoButtonColor = false
-    tabBtn.Parent = TabContainer
 
     local tabCorner = Instance.new("UICorner")
     tabCorner.CornerRadius = UDim.new(0, 6)
     tabCorner.Parent = tabBtn
 
+    local tabStroke = Instance.new("UIStroke")
+    tabStroke.Color = Config.BorderColor
+    tabStroke.Thickness = placement == "Top" and 1 or 0
+    tabStroke.Transparency = placement == "Top" and 0.25 or 1
+    tabStroke.Parent = tabBtn
+
     GUIState.Pages[pageName] = pageScroll
     GUIState.TabButtons[pageName] = tabBtn
 
-    tabBtn.MouseButton1Click:Connect(function()
+    AddConnection(tabBtn.MouseButton1Click:Connect(function()
         PageManager:ShowPage(pageName)
-    end)
+    end))
 
     return pageScroll
 end
@@ -2202,13 +2442,17 @@ function PageManager:ShowPage(pageName, suppressEffects)
         local btn = GUIState.TabButtons[name]
         if name == pageName then
             page.Visible = true
-            btn.BackgroundColor3 = Config.AccentColor
-            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            if btn then
+                btn.BackgroundColor3 = Config.AccentColor
+                btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            end
             GUIState.ActivePage = name
         else
             page.Visible = false
-            btn.BackgroundColor3 = Config.DarkBg
-            btn.TextColor3 = Config.SubTextColor
+            if btn then
+                btn.BackgroundColor3 = Config.DarkBg
+                btn.TextColor3 = Config.SubTextColor
+            end
         end
     end
 
@@ -3433,6 +3677,12 @@ end
 -- =========================
 
 local function HandleLocalCharacterAdded(character)
+    if ExtraFeatures.SetDroneStrikeActive then
+        pcall(function()
+            ExtraFeatures.SetDroneStrikeActive(false)
+        end)
+    end
+
     RefreshPlayerCharacterReferences(character)
 
     PlayerRuntime.AirFlyJumpRequested = false
@@ -3447,6 +3697,12 @@ local function HandleLocalCharacterAdded(character)
 end
 
 local function HandleLocalCharacterRemoving(character)
+    if ExtraFeatures.SetDroneStrikeActive then
+        pcall(function()
+            ExtraFeatures.SetDroneStrikeActive(false)
+        end)
+    end
+
     PlayerRuntime.AirFlyJumpRequested = false
 
     RestoreNoclip(character)
@@ -3699,11 +3955,11 @@ UIRefs.Toggles.UseFOV = UI:CreateToggle(AimFovSec, {
 UIRefs.Sliders.FOV = UI:CreateSlider(AimFovSec, {
     Text = "FOV",
     Min = 0,
-    Max = 180,
+    Max = 600,
     Default = Config.FOV,
     Increment = 1,
     Callback = function(value)
-        Config.FOV = math.clamp(value, 0, 180)
+        Config.FOV = math.clamp(value, 0, 600)
     end
 })
 
@@ -3806,6 +4062,34 @@ do
         UIRefs.TargetAssistLabel =
             UI:CreateLabel(
                 UIRefs.TargetAssistSection,
+                "Target: None"
+            )
+
+        UIRefs.AimSilentSection =
+            UI:CreateSection(
+                AimPage,
+                "AIM SILENT"
+            )
+
+        UIRefs.Toggles.AimSilent =
+            UI:CreateToggle(
+                UIRefs.AimSilentSection,
+                {
+                    Text = "AimSilent",
+                    Default = Config.AimSilentEnabled,
+                    Callback = function(value)
+                        Config.AimSilentEnabled = value == true
+
+                        if not Config.AimSilentEnabled then
+                            ExtraFeatures.ClearAimSilent()
+                        end
+                    end
+                }
+            )
+
+        UIRefs.AimSilentLabel =
+            UI:CreateLabel(
+                UIRefs.AimSilentSection,
                 "Target: None"
             )
 
@@ -4552,10 +4836,12 @@ local function GetScreenDistance(targetPart, camera, worldPosition)
 end
 
 -- Single validation function for AIM.
--- It now accepts both Player and NPC Model targets while preserving the same
--- validation chain and existing player behavior.
-local function IsValidTarget(target)
-    if not Config.AimEnabled then
+-- It accepts both Player and NPC Model targets and can also be reused by
+-- non-camera AIM helpers without creating a second AIM engine.
+local function IsValidTarget(target, options)
+    if not Config.AimEnabled
+        and not (options and options.AllowWhenAimDisabled == true)
+    then
         return false
     end
 
@@ -4574,7 +4860,12 @@ local function IsValidTarget(target)
         return false
     end
 
-    if isNPC and not Config.AimNPC then
+    local allowNPC = options and options.AllowNPC
+    if allowNPC == nil then
+        allowNPC = Config.AimNPC
+    end
+
+    if isNPC and not allowNPC then
         return false
     end
 
@@ -4607,8 +4898,13 @@ local function IsValidTarget(target)
             targetPart
         )
 
-    if
-        not PassesVisibility(
+    local requireVisibility = options and options.RequireVisibility
+    if requireVisibility == nil then
+        requireVisibility = true
+    end
+
+    if requireVisibility
+        and not PassesVisibility(
             targetPart,
             targetWorldPosition
         )
@@ -4632,7 +4928,12 @@ local function IsValidTarget(target)
         return false
     end
 
-    if Config.UseFOV then
+    local requireFOV = options and options.RequireFOV
+    if requireFOV == nil then
+        requireFOV = Config.UseFOV
+    end
+
+    if requireFOV then
         if not onScreen then
             return false
         end
@@ -4645,11 +4946,26 @@ local function IsValidTarget(target)
     return true
 end
 
-local function GetBestTarget()
+local function GetBestTarget(options)
     local camera = Workspace.CurrentCamera
 
-    if not camera or not Config.AimEnabled then
+    if not camera
+        or (
+            not Config.AimEnabled
+            and not (options and options.AllowWhenAimDisabled == true)
+        )
+    then
         return nil, nil
+    end
+
+    local requireFOV = options and options.RequireFOV
+    if requireFOV == nil then
+        requireFOV = Config.UseFOV
+    end
+
+    local allowNPC = options and options.AllowNPC
+    if allowNPC == nil then
+        allowNPC = Config.AimNPC
     end
 
     local bestTarget = nil
@@ -4657,8 +4973,9 @@ local function GetBestTarget()
     local bestScreenDistance = math.huge
 
     for _, target in ipairs(Players:GetPlayers()) do
-        if target ~= LocalPlayer and IsValidTarget(target) then
-            -- Re-read the CURRENT target part on every frame.
+        if target ~= LocalPlayer
+            and IsValidTarget(target, options)
+        then
             local targetPart = GetAimPart(target)
 
             if targetPart then
@@ -4669,23 +4986,21 @@ local function GetBestTarget()
                         targetPart.Position
                     )
 
-                if screenDistance < math.huge then
-                    if (not Config.UseFOV) or onScreen then
-                        if screenDistance < bestScreenDistance then
-                            bestScreenDistance = screenDistance
-                            bestTarget = target
-                            bestAimPart = targetPart
-                        end
-                    end
+                if screenDistance < math.huge
+                    and ((not requireFOV) or onScreen)
+                    and screenDistance < bestScreenDistance
+                then
+                    bestScreenDistance = screenDistance
+                    bestTarget = target
+                    bestAimPart = targetPart
                 end
             end
         end
     end
 
-    -- NPC targets are evaluated by the SAME target-selection pipeline.
-    if Config.AimNPC then
+    if allowNPC then
         for npc in pairs(NPCSystem.ValidNPCs) do
-            if IsValidTarget(npc) then
+            if IsValidTarget(npc, options) then
                 local targetPart = GetAimPart(npc)
 
                 if targetPart then
@@ -4702,14 +5017,13 @@ local function GetBestTarget()
                             predictedPosition
                         )
 
-                    if screenDistance < math.huge then
-                        if (not Config.UseFOV) or onScreen then
-                            if screenDistance < bestScreenDistance then
-                                bestScreenDistance = screenDistance
-                                bestTarget = npc
-                                bestAimPart = targetPart
-                            end
-                        end
+                    if screenDistance < math.huge
+                        and ((not requireFOV) or onScreen)
+                        and screenDistance < bestScreenDistance
+                    then
+                        bestScreenDistance = screenDistance
+                        bestTarget = npc
+                        bestAimPart = targetPart
                     end
                 end
             end
@@ -4718,6 +5032,7 @@ local function GetBestTarget()
 
     return bestTarget, bestAimPart
 end
+
 
 function ExtraFeatures.UpdateTargetAssist()
     if not Config.TargetAssistEnabled
@@ -4742,6 +5057,594 @@ function ExtraFeatures.UpdateTargetAssist()
         end
     end
 end
+
+function ExtraFeatures.UpdateAimSilent()
+    if not Config.AimSilentEnabled
+        or not Config.UseFOV
+    then
+        ExtraFeatures.ClearAimSilent()
+        return
+    end
+
+    local target, targetPart =
+        GetBestTarget(
+            ExtraFeatures.AimSilent.TargetOptions
+        )
+
+    ExtraFeatures.AimSilent.CurrentTarget = target
+    ExtraFeatures.AimSilent.CurrentPart = targetPart
+    FOVCircleStroke.Thickness = target and 3 or 2
+
+    if UIRefs.AimSilentLabel
+        and UIRefs.AimSilentLabel.Parent
+    then
+        if target then
+            UIRefs.AimSilentLabel.Text =
+                "Target: " .. tostring(target.Name or "Unknown")
+        else
+            UIRefs.AimSilentLabel.Text = "Target: None"
+        end
+    end
+end
+
+
+-- =========================================================
+-- FUNCTION 1 — SAFE CAMERA / TARGET VISUAL HELPERS
+-- Reuses the existing input + unified render lifecycle. Drone Strike and
+-- Magic Silent remain local camera/target helpers without remote/damage spoofing.
+-- =========================================================
+function ExtraFeatures.EnsureFunction1Marker()
+    local system = ExtraFeatures.Function1
+
+    if system.Marker and system.Marker.Parent then
+        return system.Marker
+    end
+
+    local marker = Instance.new("Frame")
+    marker.Name = "Function1TargetMarker"
+    marker.AnchorPoint = Vector2.new(0.5, 0.5)
+    marker.Size = UDim2.fromOffset(12, 12)
+    marker.BackgroundColor3 = Config.AccentColor
+    marker.BackgroundTransparency = 0.08
+    marker.BorderSizePixel = 0
+    marker.Visible = false
+    marker.Active = false
+    marker.ZIndex = 85
+    marker.Parent = ScreenGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = marker
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Thickness = 1
+    stroke.Transparency = 0.15
+    stroke.Parent = marker
+
+    local text = Instance.new("TextLabel")
+    text.Name = "TargetText"
+    text.Size = UDim2.fromOffset(150, 18)
+    text.Position = UDim2.new(1, 7, 0.5, -9)
+    text.BackgroundTransparency = 1
+    text.TextColor3 = Config.TextColor
+    text.TextStrokeTransparency = 0.45
+    text.TextSize = 10
+    text.Font = Enum.Font.GothamBold
+    text.TextXAlignment = Enum.TextXAlignment.Left
+    text.Text = ""
+    text.Active = false
+    text.ZIndex = 86
+    text.Parent = marker
+
+    system.Marker = marker
+    system.MarkerText = text
+    return marker
+end
+
+function ExtraFeatures.HideFunction1Marker()
+    local system = ExtraFeatures.Function1
+    if system.Marker and system.Marker.Parent then
+        system.Marker.Visible = false
+    end
+end
+
+function ExtraFeatures.ShowSilentShotFeedback()
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local targetPart = nil
+    if Config.AimSilentEnabled
+        and ExtraFeatures.AimSilent.CurrentPart
+        and ExtraFeatures.AimSilent.CurrentPart.Parent
+    then
+        targetPart = ExtraFeatures.AimSilent.CurrentPart
+    elseif Config.MagicSilentEnabled
+        and ExtraFeatures.Function1.MagicSilent.Target
+    then
+        targetPart = ExtraFeatures.GetFunction1PlayerPart(
+            ExtraFeatures.Function1.MagicSilent.Target
+        )
+    end
+
+    if not targetPart then
+        return
+    end
+
+    local point, onScreen = camera:WorldToViewportPoint(targetPart.Position)
+    if not onScreen or point.Z <= 0 then
+        return
+    end
+
+    local scale = math.max(UIScaleObj.Scale, 0.01)
+    local startPoint = Vector2.new(
+        (camera.ViewportSize.X * 0.5) / scale,
+        (camera.ViewportSize.Y * 0.5) / scale
+    )
+    local endPoint = Vector2.new(point.X / scale, point.Y / scale)
+    local delta = endPoint - startPoint
+    local length = delta.Magnitude
+
+    if length <= 1 then
+        return
+    end
+
+    local tracer = Instance.new("Frame")
+    tracer.Name = "SilentShotFeedback"
+    tracer.AnchorPoint = Vector2.new(0.5, 0.5)
+    tracer.Size = UDim2.fromOffset(length, 2)
+    tracer.Position = UDim2.fromOffset(
+        (startPoint.X + endPoint.X) * 0.5,
+        (startPoint.Y + endPoint.Y) * 0.5
+    )
+    tracer.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+    tracer.BackgroundColor3 = Config.AccentColor
+    tracer.BackgroundTransparency = 0.15
+    tracer.BorderSizePixel = 0
+    tracer.Active = false
+    tracer.ZIndex = 84
+    tracer.Parent = ScreenGui
+
+    task.delay(0.16, function()
+        if tracer and tracer.Parent then
+            tracer:Destroy()
+        end
+    end)
+end
+
+function ExtraFeatures.GetFunction1PlayerPart(target)
+    if not target or target == LocalPlayer then
+        return nil
+    end
+
+    local character = target.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not character or not humanoid or humanoid.Health <= 0 then
+        return nil
+    end
+
+    if Config.TeamCheck and NPCSystem.ClassifyPlayer(target) == "Teammate" then
+        return nil
+    end
+
+    return character:FindFirstChild("Head")
+        or character:FindFirstChild("HumanoidRootPart")
+end
+
+function ExtraFeatures.FindFunction1VisualTarget(
+    anchorPoint,
+    requireFOV,
+    useAimMaxDistance
+)
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        return nil
+    end
+
+    local bestTarget = nil
+    local bestDistance = math.huge
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= LocalPlayer then
+            local part = ExtraFeatures.GetFunction1PlayerPart(target)
+
+            if part then
+                local passesWorldDistance = true
+
+                if useAimMaxDistance then
+                    local character = target.Character
+                    local targetRoot =
+                        character and (
+                            character:FindFirstChild("HumanoidRootPart")
+                            or character.PrimaryPart
+                            or character:FindFirstChild("UpperTorso")
+                            or character:FindFirstChild("Torso")
+                            or character:FindFirstChild("Head")
+                        )
+
+                    passesWorldDistance =
+                        targetRoot ~= nil
+                        and GetAimWorldDistance(targetRoot)
+                            <= Config.AimMaxDistance
+                end
+
+                if passesWorldDistance then
+                    local point, onScreen =
+                        camera:WorldToViewportPoint(part.Position)
+
+                    if point.Z > 0 and onScreen then
+                        local distance = (
+                            Vector2.new(point.X, point.Y) - anchorPoint
+                        ).Magnitude
+
+                        if (not requireFOV or distance <= Config.FOV)
+                            and distance < bestDistance
+                        then
+                            bestDistance = distance
+                            bestTarget = target
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestTarget
+end
+
+function ExtraFeatures.RenderFunction1Marker()
+    local system = ExtraFeatures.Function1
+    local target = nil
+    local prefix = nil
+
+    local part = nil
+
+    if system.DroneStrike.Active and system.DroneStrike.Target then
+        target = system.DroneStrike.Target
+        prefix = "Drone"
+        part = ExtraFeatures.GetFunction1PlayerPart(target)
+    elseif Config.AimSilentEnabled
+        and ExtraFeatures.AimSilent.CurrentTarget
+        and ExtraFeatures.AimSilent.CurrentPart
+    then
+        target = ExtraFeatures.AimSilent.CurrentTarget
+        prefix = "AimSilent"
+        part = ExtraFeatures.AimSilent.CurrentPart
+    elseif Config.MagicSilentEnabled and system.MagicSilent.Target then
+        target = system.MagicSilent.Target
+        prefix = "Magic"
+        part = ExtraFeatures.GetFunction1PlayerPart(target)
+    end
+
+    local camera = Workspace.CurrentCamera
+
+    if not part or not camera then
+        ExtraFeatures.HideFunction1Marker()
+        return
+    end
+
+    local point, onScreen = camera:WorldToViewportPoint(part.Position)
+    if not onScreen or point.Z <= 0 then
+        ExtraFeatures.HideFunction1Marker()
+        return
+    end
+
+    local marker = ExtraFeatures.EnsureFunction1Marker()
+    local uiScale = math.max(UIScaleObj.Scale, 0.01)
+    marker.Position = UDim2.fromOffset(
+        point.X / uiScale,
+        point.Y / uiScale
+    )
+    marker.Visible = true
+
+    if system.MarkerText and system.MarkerText.Parent then
+        system.MarkerText.Text =
+            tostring(prefix or "Target")
+            .. ": "
+            .. tostring(target.Name or "Unknown")
+    end
+end
+
+function ExtraFeatures.SetDroneStrikeActive(enabled)
+    local state = ExtraFeatures.Function1.DroneStrike
+    enabled = enabled == true
+
+    if state.Active == enabled then
+        return true
+    end
+
+    local camera = Workspace.CurrentCamera
+
+    if enabled then
+        if not camera then
+            return false
+        end
+
+        state.Original = {
+            CameraType = camera.CameraType,
+            CameraSubject = camera.CameraSubject,
+            CFrame = camera.CFrame,
+            MouseBehavior = UserInputService.MouseBehavior,
+            MouseIconEnabled = UserInputService.MouseIconEnabled
+        }
+
+        state.CFrame = camera.CFrame
+        local pitch, yaw = camera.CFrame:ToOrientation()
+        state.Pitch = pitch
+        state.Yaw = yaw
+        state.Target = nil
+        state.TargetAccumulator = 0
+        state.Active = true
+
+        camera.CameraType = Enum.CameraType.Scriptable
+        camera.CFrame = state.CFrame
+
+        if UIRefs.DroneStrikeStatus then
+            UIRefs.DroneStrikeStatus.Text = "Drone Strike: ACTIVE"
+        end
+
+        return true
+    end
+
+    state.Active = false
+    state.Target = nil
+    state.TargetAccumulator = 0
+
+    if camera and state.Original then
+        pcall(function()
+            camera.CameraType = state.Original.CameraType
+
+            if state.Original.CameraSubject
+                and state.Original.CameraSubject.Parent
+            then
+                camera.CameraSubject = state.Original.CameraSubject
+            else
+                local character = LocalPlayer.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    camera.CameraSubject = humanoid
+                end
+            end
+
+            camera.CFrame = state.Original.CFrame
+        end)
+    end
+
+    if state.Original then
+        pcall(function()
+            UserInputService.MouseBehavior = state.Original.MouseBehavior
+            UserInputService.MouseIconEnabled = state.Original.MouseIconEnabled
+        end)
+    end
+
+    state.Original = nil
+    state.CFrame = nil
+
+    if UIRefs.DroneStrikeStatus then
+        UIRefs.DroneStrikeStatus.Text = "Drone Strike: OFF"
+    end
+
+    ExtraFeatures.RenderFunction1Marker()
+    return true
+end
+
+function ExtraFeatures.UpdateDroneStrike(dt)
+    local state = ExtraFeatures.Function1.DroneStrike
+    if not state.Active then
+        return
+    end
+
+    local camera = Workspace.CurrentCamera
+    if not camera or not state.CFrame then
+        ExtraFeatures.SetDroneStrikeActive(false)
+        return
+    end
+
+    camera.CameraType = Enum.CameraType.Scriptable
+
+    pcall(function()
+        UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+        UserInputService.MouseIconEnabled = false
+    end)
+
+    local mouseDelta = UserInputService:GetMouseDelta()
+    local sensitivity = 0.0025
+    state.Yaw = state.Yaw - mouseDelta.X * sensitivity
+    state.Pitch = math.clamp(
+        state.Pitch - mouseDelta.Y * sensitivity,
+        -1.45,
+        1.45
+    )
+
+    local rotation = CFrame.Angles(state.Pitch, state.Yaw, 0)
+    local move = Vector3.new(0, 0, 0)
+
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+        move = move + Vector3.new(0, 0, -1)
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+        move = move + Vector3.new(0, 0, 1)
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+        move = move + Vector3.new(-1, 0, 0)
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+        move = move + Vector3.new(1, 0, 0)
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Q) then
+        move = move + Vector3.new(0, -1, 0)
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.E) then
+        move = move + Vector3.new(0, 1, 0)
+    end
+
+    local position = state.CFrame.Position
+    if move.Magnitude > 0 then
+        local worldMove = rotation:VectorToWorldSpace(move.Unit)
+        position = position + worldMove * state.Speed * (tonumber(dt) or 0)
+    end
+
+    state.CFrame = CFrame.new(position) * rotation
+    camera.CFrame = state.CFrame
+
+    state.TargetAccumulator = state.TargetAccumulator + (tonumber(dt) or 0)
+    if state.TargetAccumulator >= 0.08 then
+        state.TargetAccumulator = 0
+        local center = Vector2.new(
+            camera.ViewportSize.X * 0.5,
+            camera.ViewportSize.Y * 0.5
+        )
+        state.Target = ExtraFeatures.FindFunction1VisualTarget(
+            center,
+            Config.UseFOV == true,
+            true
+        )
+
+        if UIRefs.DroneTargetLabel then
+            UIRefs.DroneTargetLabel.Text = state.Target
+                and ("Target: " .. tostring(state.Target.Name))
+                or "Target: None"
+        end
+    end
+end
+
+function ExtraFeatures.UpdateMagicSilent(dt)
+    local state = ExtraFeatures.Function1.MagicSilent
+
+    if not Config.MagicSilentEnabled then
+        state.Target = nil
+        state.Accumulator = 0
+        if UIRefs.MagicSilentStatus then
+            UIRefs.MagicSilentStatus.Text = "Target: None"
+        end
+        return
+    end
+
+    state.Accumulator = state.Accumulator + (tonumber(dt) or 0)
+    if state.Accumulator < 0.08 then
+        return
+    end
+    state.Accumulator = 0
+
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        state.Target = nil
+        return
+    end
+
+    local anchor = UserInputService:GetMouseLocation()
+    state.Target = ExtraFeatures.FindFunction1VisualTarget(
+        anchor,
+        Config.UseFOV == true,
+        true
+    )
+
+    if UIRefs.MagicSilentStatus then
+        UIRefs.MagicSilentStatus.Text = state.Target
+            and ("Target: " .. tostring(state.Target.Name))
+            or "Target: None"
+    end
+end
+
+function ExtraFeatures.UpdateFunction1(dt)
+    pcall(function()
+        ExtraFeatures.UpdateDroneStrike(dt)
+    end)
+
+    pcall(function()
+        ExtraFeatures.UpdateMagicSilent(dt)
+    end)
+
+    ExtraFeatures.RenderFunction1Marker()
+end
+
+function ExtraFeatures.CleanupFunction1()
+    pcall(function()
+        ExtraFeatures.SetDroneStrikeActive(false)
+    end)
+
+    local system = ExtraFeatures.Function1
+    system.MagicSilent.Target = nil
+    system.MagicSilent.Accumulator = 0
+
+    if system.Marker and system.Marker.Parent then
+        system.Marker:Destroy()
+    end
+
+    system.Marker = nil
+    system.MarkerText = nil
+end
+
+-- FUNCTION 1 is the only horizontal top tab.  It still uses the same
+-- PageManager, ContentArea, GUIState and UI component engine as every page.
+UIRefs.Function1Page = PageManager:AddPage(
+    "FUNCTION 1",
+    {Placement = "Top"}
+)
+
+UIRefs.Function1DroneSection = UI:CreateSection(
+    UIRefs.Function1Page,
+    "DRONE STRIKE"
+)
+
+UIRefs.DroneStrikeKeyBox = Instance.new("TextButton")
+UIRefs.DroneStrikeKeyBox.Name = "DroneStrikeKeyBox"
+UIRefs.DroneStrikeKeyBox.Size = UDim2.new(1, 0, 0, 30)
+UIRefs.DroneStrikeKeyBox.Text =
+    "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+UIRefs.DroneStrikeKeyBox.Parent = UIRefs.Function1DroneSection
+ExtraFeatures.StyleKeyButton(UIRefs.DroneStrikeKeyBox)
+
+AddConnection(
+    UIRefs.DroneStrikeKeyBox.MouseButton1Click:Connect(function()
+        OtherSystem.BeginKeybindCapture(
+            UIRefs.DroneStrikeKeyBox,
+            "DroneStrike"
+        )
+    end)
+)
+
+UIRefs.DroneStrikeStatus = UI:CreateLabel(
+    UIRefs.Function1DroneSection,
+    "Drone Strike: OFF"
+)
+UIRefs.DroneTargetLabel = UI:CreateLabel(
+    UIRefs.Function1DroneSection,
+    "Target: None"
+)
+UI:CreateLabel(
+    UIRefs.Function1DroneSection,
+    "W/A/S/D/Q/E move the safe freecam. Target tracking is visual only."
+)
+
+UIRefs.Function1MagicSection = UI:CreateSection(
+    UIRefs.Function1Page,
+    "MAGIC SILENT"
+)
+UIRefs.Toggles.MagicSilent = UI:CreateToggle(
+    UIRefs.Function1MagicSection,
+    {
+        Text = "Magic Silent",
+        Default = Config.MagicSilentEnabled,
+        Callback = function(value)
+            Config.MagicSilentEnabled = value == true
+            if not Config.MagicSilentEnabled then
+                ExtraFeatures.Function1.MagicSilent.Target = nil
+            end
+        end
+    }
+)
+UIRefs.MagicSilentStatus = UI:CreateLabel(
+    UIRefs.Function1MagicSection,
+    "Target: None"
+)
+UI:CreateLabel(
+    UIRefs.Function1MagicSection,
+    "Tracks the closest valid target and shows local shot feedback without changing the camera."
+)
+
 
 -- ---------------------------------------------------------
 -- Fire-state input
@@ -7568,7 +8471,7 @@ CurrentGameName, CurrentPlaceId = GetCurrentGameMetadata()
 
 local function BuildConfigPayload()
     return {
-        version = 4,
+        version = 6,
 
         -- AIM
         AimEnabled = Config.AimEnabled,
@@ -7584,6 +8487,7 @@ local function BuildConfigPayload()
         AimMaxDistance = Config.AimMaxDistance,
         AimNPC = Config.AimNPC,
         TargetAssistEnabled = Config.TargetAssistEnabled,
+        AimSilentEnabled = Config.AimSilentEnabled,
         HeadHitboxEnabled = Config.HeadHitboxEnabled,
         HeadHitboxSize = Config.HeadHitboxSize,
 
@@ -7629,6 +8533,11 @@ local function BuildConfigPayload()
         AntiAFKEnabled = Config.AntiAFKEnabled,
         VirtualPetEnabled = Config.VirtualPetEnabled,
         SnowfallEnabled = Config.SnowfallEnabled,
+
+        -- FUNCTION 1 DATA
+        DroneStrikeKey = Config.DroneStrikeKey and Config.DroneStrikeKey.Name or nil,
+        MagicSilentEnabled = Config.MagicSilentEnabled,
+
         HoldToSpamEnabled = Config.HoldToSpamEnabled,
         HoldToSpamKey = Config.HoldToSpamKey and Config.HoldToSpamKey.Name or nil,
         UIScale = Config.UIScale,
@@ -7679,7 +8588,7 @@ local function ApplyConfigPayload(payload)
     SetBooleanField(payload, "WallCheck", Config)
     SetBooleanField(payload, "IgnoreVisibility", Config)
     SetBooleanField(payload, "UseFOV", Config)
-    SetNumberField(payload, "FOV", Config, nil, 0, 180)
+    SetNumberField(payload, "FOV", Config, nil, 0, 600)
     SetBooleanField(payload, "AlwaysAim", Config)
     SetBooleanField(payload, "AimOnFire", Config)
 
@@ -7693,6 +8602,12 @@ local function ApplyConfigPayload(payload)
     SetNumberField(payload, "AimMaxDistance", Config, nil, 50, 10000)
     SetBooleanField(payload, "AimNPC", Config)
     SetBooleanField(payload, "TargetAssistEnabled", Config)
+
+    if type(payload.AimSilentEnabled) == "boolean" then
+        Config.AimSilentEnabled = payload.AimSilentEnabled
+    else
+        Config.AimSilentEnabled = false
+    end
 
     -- Backward compatibility: old Hitbox profile fields now map only to
     -- the safe NPC/dummy Head Hitbox implementation.
@@ -7825,6 +8740,18 @@ local function ApplyConfigPayload(payload)
     SetBooleanField(payload, "AntiAFKEnabled", Config)
     SetBooleanField(payload, "VirtualPetEnabled", Config)
     SetBooleanField(payload, "SnowfallEnabled", Config)
+
+    SetBooleanField(payload, "MagicSilentEnabled", Config)
+
+    if type(payload.DroneStrikeKey) == "string" then
+        pcall(function()
+            local enumItem = Enum.KeyCode[payload.DroneStrikeKey]
+            if enumItem and enumItem ~= Config.ToggleKey then
+                Config.DroneStrikeKey = enumItem
+            end
+        end)
+    end
+
     SetBooleanField(payload, "HoldToSpamEnabled", Config)
 
     if type(payload.HoldToSpamKey) == "string" then
@@ -7854,6 +8781,13 @@ local function ApplyConfigPayload(payload)
                 Config.ToggleKey = enumItem
             end
         end)
+    end
+
+    if Config.DroneStrikeKey == Config.ToggleKey then
+        Config.DroneStrikeKey = Enum.KeyCode.V
+        if Config.DroneStrikeKey == Config.ToggleKey then
+            Config.DroneStrikeKey = Enum.KeyCode.B
+        end
     end
 
     if oldFullBrightEnabled and not Config.Player.FullBrightEnabled then
@@ -7941,6 +8875,15 @@ local function SyncSettingsUI()
     end
     if not Config.TargetAssistEnabled then
         ExtraFeatures.ClearTargetAssist()
+    end
+    if UIRefs.Toggles.AimSilent then
+        UIRefs.Toggles.AimSilent.Set(
+            Config.AimSilentEnabled,
+            true
+        )
+    end
+    if not Config.AimSilentEnabled then
+        ExtraFeatures.ClearAimSilent()
     end
     if UIRefs.Toggles.HeadHitbox then
         UIRefs.Toggles.HeadHitbox.Set(
@@ -8137,6 +9080,19 @@ local function SyncSettingsUI()
         )
     end
 
+    if UIRefs.Toggles.MagicSilent then
+        UIRefs.Toggles.MagicSilent.Set(
+            Config.MagicSilentEnabled,
+            true
+        )
+    end
+
+
+    if UIRefs.DroneStrikeKeyBox then
+        UIRefs.DroneStrikeKeyBox.Text =
+            "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+    end
+
     if UIRefs.Toggles.HoldToSpam then
         UIRefs.Toggles.HoldToSpam.Set(
             Config.HoldToSpamEnabled,
@@ -8231,6 +9187,18 @@ local MenuProfilePopupConnections = {}
 local MenuProfileList
 local MenuProfilePopup
 
+local function GenerateMenuProfileId()
+    local ok, value = pcall(function()
+        return HttpService:GenerateGUID(false)
+    end)
+
+    if ok and type(value) == "string" and value ~= "" then
+        return value
+    end
+
+    return tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+end
+
 local function DisconnectMenuProfileConnections()
     for _, conn in ipairs(MenuProfileConnections) do
         pcall(function()
@@ -8310,7 +9278,7 @@ local function LoadMenuProfiles()
     end
 
     local cleaned = {}
-    local names = {}
+    local usedIds = {}
 
     for _, profile in ipairs(decoded) do
         if type(profile) == "table" then
@@ -8364,15 +9332,22 @@ local function LoadMenuProfiles()
                         or 0
                     )
 
-                local profileKey =
-                    tostring(placeId)
-                    .. "|"
-                    .. tostring(gameName)
-                    .. "|"
-                    .. name
+                local profileId =
+                    type(profile.ProfileId) == "string"
+                    and profile.ProfileId
+                    or (
+                        type(profile.profileId) == "string"
+                        and profile.profileId
+                        or GenerateMenuProfileId()
+                    )
 
-                if name ~= "" and not names[profileKey] then
+                if usedIds[profileId] then
+                    profileId = GenerateMenuProfileId()
+                end
+
+                if name ~= "" then
                     table.insert(cleaned, {
+                        ProfileId = profileId,
                         ProfileName = name,
                         GameName = gameName,
                         PlaceId = placeId,
@@ -8381,6 +9356,7 @@ local function LoadMenuProfiles()
                         ConfigData = rawConfig,
 
                         -- Legacy aliases kept for old code/profile compatibility.
+                        profileId = profileId,
                         name = name,
                         gameName = gameName,
                         placeId = placeId,
@@ -8389,21 +9365,36 @@ local function LoadMenuProfiles()
                         config = rawConfig
                     })
 
-                    names[profileKey] = true
+                    usedIds[profileId] = true
                 end
             end
         end
     end
 
     MenuProfiles = cleaned
+
+    -- Persist migrated ProfileId fields when the filesystem is available.
+    if #cleaned > 0 then
+        pcall(function()
+            SaveMenuProfiles()
+        end)
+    end
 end
 
-local function FindMenuProfile(name)
+local function FindMenuProfile(identifier)
+    local query = TrimString(tostring(identifier or ""))
+    local lowered = string.lower(query)
+
     for _, profile in ipairs(MenuProfiles) do
-        if profile.name == name
-            and profile.placeId == CurrentPlaceId
-            and profile.gameName == CurrentGameName
-        then
+        local profileId = tostring(profile.ProfileId or profile.profileId or "")
+        if profileId ~= "" and profileId == query then
+            return profile
+        end
+    end
+
+    for _, profile in ipairs(MenuProfiles) do
+        local name = TrimString(tostring(profile.ProfileName or profile.name or ""))
+        if name ~= "" and string.lower(name) == lowered then
             return profile
         end
     end
@@ -8439,16 +9430,26 @@ local function ApplyMenuProfile(profile)
     )
 end
 
-local function DeleteMenuProfile(profileName)
+local function DeleteMenuProfile(identifier)
+    local query = TrimString(tostring(identifier or ""))
+    local lowered = string.lower(query)
     local indexToRemove
 
     for index, profile in ipairs(MenuProfiles) do
-        if profile.name == profileName
-            and profile.placeId == CurrentPlaceId
-            and profile.gameName == CurrentGameName
-        then
+        local profileId = tostring(profile.ProfileId or profile.profileId or "")
+        if profileId ~= "" and profileId == query then
             indexToRemove = index
             break
+        end
+    end
+
+    if not indexToRemove then
+        for index, profile in ipairs(MenuProfiles) do
+            local name = TrimString(tostring(profile.ProfileName or profile.name or ""))
+            if name ~= "" and string.lower(name) == lowered then
+                indexToRemove = index
+                break
+            end
         end
     end
 
@@ -8492,14 +9493,7 @@ local function RefreshMenuProfileList()
     local visibleProfiles = {}
 
     for _, profile in ipairs(MenuProfiles) do
-        if profile.placeId == CurrentPlaceId
-            and profile.gameName == CurrentGameName
-        then
-            table.insert(
-                visibleProfiles,
-                profile
-            )
-        end
+        table.insert(visibleProfiles, profile)
     end
 
     for index, profile in ipairs(visibleProfiles) do
@@ -8538,7 +9532,8 @@ local function RefreshMenuProfileList()
         gameLabel.Position =
             UDim2.new(0, 8, 0, 28)
         gameLabel.Text =
-            tostring(profile.gameName)
+            "Saved from: "
+            .. tostring(profile.gameName)
             .. " | PlaceId: "
             .. tostring(profile.placeId)
         gameLabel.TextColor3 =
@@ -8571,7 +9566,7 @@ local function RefreshMenuProfileList()
                 item,
                 "DELETE",
                 function()
-                    if DeleteMenuProfile(profile.name) then
+                    if DeleteMenuProfile(profile.ProfileId or profile.profileId or profile.name) then
                         RefreshMenuProfileList()
                         SetSettingsStatus(
                             "Profile deleted: "
@@ -8690,14 +9685,17 @@ local function OpenSaveMenuProfilePopup()
 
                 if profile then
                     SetSettingsStatus(
-                        "Profile already exists in this game. DELETE it first or use another name."
+                        "Profile name already exists. DELETE it first or use another name."
                     )
                     return
                 end
 
+                local profileId = GenerateMenuProfileId()
+
                 table.insert(
                     MenuProfiles,
                     {
+                        ProfileId = profileId,
                         ProfileName = profileName,
                         GameName = CurrentGameName,
                         PlaceId = CurrentPlaceId,
@@ -8706,6 +9704,7 @@ local function OpenSaveMenuProfilePopup()
                         CreatedAt = os.time(),
 
                         -- Compatibility aliases for older profile readers.
+                        profileId = profileId,
                         name = profileName,
                         gameName = CurrentGameName,
                         placeId = CurrentPlaceId,
@@ -8958,10 +9957,12 @@ UIRefs.MenuProfileSec =
 
 UI:CreateLabel(
     UIRefs.MenuProfileSec,
-    "Current Game: "
+    "GLOBAL MENU PROFILES"
+        .. "\nCurrent Game: "
         .. tostring(CurrentGameName)
-        .. "\nPlaceId: "
+        .. "\nCurrent PlaceId: "
         .. tostring(CurrentPlaceId)
+        .. "\nProfiles saved here are available in every game."
 )
 
 UI:CreateButton(
@@ -9082,7 +10083,7 @@ UI:CreateButton(
         GUIState.Pages["KHÁC"],
         "SERVER"
     ),
-    "🗿  Đổi Server",
+    "↻  Đổi Server",
     function()
         OtherSystem.RunServerAction("Change")
     end
@@ -9092,7 +10093,7 @@ UI:CreateButton(
     GUIState.Pages["KHÁC"]:FindFirstChild(
         "SERVERSection"
     ),
-    "⚡️  Ping Thấp",
+    "⌁  Ping Thấp",
     function()
         OtherSystem.RunServerAction("Ping")
     end
@@ -9102,7 +10103,7 @@ UI:CreateButton(
     GUIState.Pages["KHÁC"]:FindFirstChild(
         "SERVERSection"
     ),
-    "🫃  Ít Người",
+    "↓  Ít Người",
     function()
         OtherSystem.RunServerAction("Small")
     end
@@ -9219,6 +10220,9 @@ RunService:BindToRenderStep(
             ExtraFeatures.UpdateHeavySliders(renderDt)
         end)
         OtherSystem.UpdateMenuInput()
+        pcall(function()
+            ExtraFeatures.UpdateFunction1(renderDt)
+        end)
     end
 )
 
@@ -9232,7 +10236,12 @@ RunService:BindToRenderStep(
         pcall(function()
             ExtraFeatures.UpdateTargetAssist()
         end)
-        UpdateAim()
+        pcall(function()
+            ExtraFeatures.UpdateAimSilent()
+        end)
+        if not ExtraFeatures.Function1.DroneStrike.Active then
+            UpdateAim()
+        end
         UpdateFOVCircle()
     end
 )
@@ -9273,6 +10282,10 @@ local function BindPlayerLifecycle(target)
                 ExtraFeatures.ClearTargetAssist()
             end
 
+            if ExtraFeatures.AimSilent.CurrentTarget == target then
+                ExtraFeatures.ClearAimSilent()
+            end
+
             if Telekill.CurrentTarget == target then
                 Telekill.CurrentTarget = nil
             end
@@ -9290,6 +10303,10 @@ local function BindPlayerLifecycle(target)
 
             if ExtraFeatures.TargetAssist.CurrentTarget == target then
                 ExtraFeatures.ClearTargetAssist()
+            end
+
+            if ExtraFeatures.AimSilent.CurrentTarget == target then
+                ExtraFeatures.ClearAimSilent()
             end
 
             if Telekill.CurrentTarget == target then
@@ -9331,8 +10348,21 @@ AddConnection(
             ExtraFeatures.ClearTargetAssist()
         end
 
+        if ExtraFeatures.AimSilent.CurrentTarget == target then
+            ExtraFeatures.ClearAimSilent()
+        end
+
         if Telekill.CurrentTarget == target then
             Telekill.CurrentTarget = nil
+        end
+
+        if ExtraFeatures.Function1 then
+            if ExtraFeatures.Function1.DroneStrike.Target == target then
+                ExtraFeatures.Function1.DroneStrike.Target = nil
+            end
+            if ExtraFeatures.Function1.MagicSilent.Target == target then
+                ExtraFeatures.Function1.MagicSilent.Target = nil
+            end
         end
 
         RefreshTeleportPlayerList()
@@ -9414,6 +10444,10 @@ CloseBtn.MouseButton1Click:Connect(function()
 
     CleanupPlayerRuntime()
     ExtraFeatures.RestoreAllHeadHitboxes()
+    ExtraFeatures.ClearAimSilent()
+    if ExtraFeatures.CleanupFunction1 then
+        pcall(function() ExtraFeatures.CleanupFunction1() end)
+    end
     ExtraFeatures.HoldSpamKeyHeld = false
     ExtraFeatures.HoldSpamRightHeld = false
     ExtraFeatures.HoldSpamAccumulator = 0
@@ -9491,6 +10525,31 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 
     if gameProcessed then return end
+
+    if UserInputService:GetFocusedTextBox() == nil then
+        if input.UserInputType == Enum.UserInputType.Keyboard
+            and input.KeyCode == Config.DroneStrikeKey
+        then
+            pcall(function()
+                ExtraFeatures.SetDroneStrikeActive(
+                    not ExtraFeatures.Function1.DroneStrike.Active
+                )
+            end)
+            return
+        end
+
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            and (
+                Config.AimSilentEnabled
+                or Config.MagicSilentEnabled
+            )
+        then
+            pcall(function()
+                ExtraFeatures.ShowSilentShotFeedback()
+            end)
+        end
+    end
+
     if Config.ToggleKeyEnabled and input.KeyCode == Config.ToggleKey then
         if GUIState.CurrentState == "Open" then
             SetMenuState("Minimized")
@@ -9522,6 +10581,9 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
                         ExtraFeatures.UpdateHeavySliders(renderDt)
                     end)
                     OtherSystem.UpdateMenuInput()
+                    pcall(function()
+                        ExtraFeatures.UpdateFunction1(renderDt)
+                    end)
                 end
             )
 
@@ -9530,8 +10592,15 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
                 Enum.RenderPriority.Last.Value - 1,
                 function()
                     Telekill.Update()
-                    ExtraFeatures.UpdateTargetAssist()
-                    UpdateAim()
+                    pcall(function()
+                        ExtraFeatures.UpdateTargetAssist()
+                    end)
+                    pcall(function()
+                        ExtraFeatures.UpdateAimSilent()
+                    end)
+                    if not ExtraFeatures.Function1.DroneStrike.Active then
+                        UpdateAim()
+                    end
                     UpdateFOVCircle()
                 end
             )
@@ -9649,10 +10718,18 @@ _G.MyGUIFramework = {
         Update = UpdateAim,
         GetCurrentTarget = function()
             return CurrentAimTarget
+        end,
+        GetSilentTarget = function()
+            return ExtraFeatures.AimSilent.CurrentTarget
         end
     },
 
     NPC = NPCSystem,
+
+    Function1 = {
+        SetDroneStrikeActive = ExtraFeatures.SetDroneStrikeActive,
+        Cleanup = ExtraFeatures.CleanupFunction1
+    },
 
     Notification = {
         Open = ExtraFeatures.OpenNotificationView,
