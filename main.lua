@@ -71,8 +71,8 @@ end
 -- 2. CONFIGURATION & STATE
 -- ==========================================
 local Config = {
-    Title = "[UPD] Hood Rivals",
-    Author = "Made By @rullzsy_",
+    Title = "[TPD] 陈福维",
+    Author = "Made By @duytpvipro_",
     ToggleKey = Enum.KeyCode.RightControl,
     ToggleKeyEnabled = true,
     UIScale = 1.0,
@@ -99,7 +99,7 @@ local Config = {
     VirtualPetEnabled = true,
     SnowfallEnabled = true,
 
-    -- FUNCTION 1 (safe visual / camera helpers)
+    -- FUNCTION 1 (camera helpers + developer-owned game combat bridge)
     DroneStrikeKey = Enum.KeyCode.V,
     MagicSilentEnabled = false,
 
@@ -141,9 +141,16 @@ local Config = {
     -- TELEKILL CONFIGURATION
     -- =========================================================
     TelekillEnabled = false,
+    -- Legacy field retained only for old profile compatibility.
     TelekillTarget = "Enemy",
+    TelekillTargets = {
+        Enemy = true,
+        Team = false,
+        NPC = false
+    },
     TelekillDistanceMode = "Nearest",
     TelekillDistance = 3,
+    TelekillSwitchKey = Enum.KeyCode.T,
 
     -- =========================================================
     -- PLAYER CONFIGURATION
@@ -379,9 +386,25 @@ MainCorner.CornerRadius = UDim.new(0, 8)
 MainCorner.Parent = MainWindow
 
 local MainStroke = Instance.new("UIStroke")
-MainStroke.Color = Config.BorderColor
-MainStroke.Thickness = 1
+MainStroke.Color = Color3.fromRGB(255, 255, 255)
+MainStroke.Thickness = 2
+MainStroke.Transparency = 0.04
 MainStroke.Parent = MainWindow
+
+-- Animated neon-rainbow border for the existing MainWindow.
+-- Reuses the shared UI-effects render update; no new render connection.
+UIRefs.MainRainbowGradient = Instance.new("UIGradient")
+UIRefs.MainRainbowGradient.Name = "MainWindowRainbowNeon"
+UIRefs.MainRainbowGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0.00, Color3.fromRGB(255, 45, 45)),
+    ColorSequenceKeypoint.new(0.16, Color3.fromRGB(255, 145, 35)),
+    ColorSequenceKeypoint.new(0.33, Color3.fromRGB(255, 235, 45)),
+    ColorSequenceKeypoint.new(0.50, Color3.fromRGB(45, 255, 90)),
+    ColorSequenceKeypoint.new(0.66, Color3.fromRGB(40, 180, 255)),
+    ColorSequenceKeypoint.new(0.83, Color3.fromRGB(135, 70, 255)),
+    ColorSequenceKeypoint.new(1.00, Color3.fromRGB(255, 60, 210))
+})
+UIRefs.MainRainbowGradient.Parent = MainStroke
 
 -- Header
 local Header = Instance.new("Frame")
@@ -535,7 +558,7 @@ AuthorLabel.Position = UDim2.new(0, 8, 1, -35)
 AuthorLabel.Text = Config.Author
 AuthorLabel.TextColor3 = Config.SubTextColor
 AuthorLabel.TextSize = 11
-AuthorLabel.Font = Enum.Font.Gotham
+AuthorLabel.Font = Enum.Font.GothamMedium
 AuthorLabel.TextWrapped = true
 AuthorLabel.BackgroundTransparency = 1
 AuthorLabel.Parent = Sidebar
@@ -551,11 +574,11 @@ ContentArea.Parent = MainWindow
 -- Floating Open Button
 local FloatingBtn = Instance.new("TextButton")
 FloatingBtn.Name = "FloatingOpenButton"
-FloatingBtn.Size = UDim2.fromOffset(48, 48)
-FloatingBtn.Position = UDim2.new(1, -68, 1, -68)
+FloatingBtn.Size = UDim2.fromOffset(128, 42)
+FloatingBtn.Position = UDim2.new(1, -148, 1, -62)
 FloatingBtn.BackgroundColor3 = Config.DarkBg
-FloatingBtn.BackgroundTransparency = 0.35
-FloatingBtn.Text = "HR"
+FloatingBtn.BackgroundTransparency = 0.18
+FloatingBtn.Text = "⚡ FPS: -- ⚡"
 FloatingBtn.TextColor3 = Config.TextColor
 FloatingBtn.Font = Enum.Font.GothamBold
 FloatingBtn.TextSize = 13
@@ -564,14 +587,27 @@ FloatingBtn.Visible = false
 FloatingBtn.Parent = ScreenGui
 
 local FloatCorner = Instance.new("UICorner")
-FloatCorner.CornerRadius = UDim.new(1, 0)
+FloatCorner.CornerRadius = UDim.new(0, 9)
 FloatCorner.Parent = FloatingBtn
 
 local FloatStroke = Instance.new("UIStroke")
-FloatStroke.Color = Config.AccentColor
-FloatStroke.Thickness = 1.5
-FloatStroke.Transparency = 0.12
+FloatStroke.Color = Color3.fromRGB(255, 255, 255)
+FloatStroke.Thickness = 2
+FloatStroke.Transparency = 0.05
 FloatStroke.Parent = FloatingBtn
+
+UIRefs.FloatingRainbowGradient = Instance.new("UIGradient")
+UIRefs.FloatingRainbowGradient.Name = "SevenColorBorder"
+UIRefs.FloatingRainbowGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0.00, Color3.fromRGB(255, 45, 45)),
+    ColorSequenceKeypoint.new(0.16, Color3.fromRGB(255, 145, 35)),
+    ColorSequenceKeypoint.new(0.33, Color3.fromRGB(255, 235, 45)),
+    ColorSequenceKeypoint.new(0.50, Color3.fromRGB(45, 255, 90)),
+    ColorSequenceKeypoint.new(0.66, Color3.fromRGB(40, 180, 255)),
+    ColorSequenceKeypoint.new(0.83, Color3.fromRGB(135, 70, 255)),
+    ColorSequenceKeypoint.new(1.00, Color3.fromRGB(255, 60, 210))
+})
+UIRefs.FloatingRainbowGradient.Parent = FloatStroke
 
 local isFloatDragged = MakeDraggable(FloatingBtn, FloatingBtn)
 
@@ -587,6 +623,8 @@ local OtherSystem = {
     KeybindBox = nil,
     KeybindCaptureMode = nil,
     ConsumeNextToggleInput = false,
+    SettingsLoadChordLatched = false,
+    TelekillToggleChordLatched = false,
     Generation = 0
 }
 
@@ -606,6 +644,14 @@ local ExtraFeatures = {
             RequireFOV = true,
             RequireVisibility = true
         }
+    },
+
+    -- Developer-owned game combat bridge.
+    -- The companion ServerScript validates and applies damage server-side.
+    DeveloperCombat = {
+        FolderName = "HoodRivalsDevCombat",
+        RemoteName = "RequestShot",
+        MissingWarned = false
     },
 
     AntiAFK = {
@@ -695,7 +741,22 @@ local ExtraFeatures = {
             ScaleTween = nil,
             MainTween = nil,
             MainFadeTween = nil,
-            Token = 0
+            Token = 0,
+            FPSAccumulator = 0,
+            FPSFrames = 0,
+            LastFPS = 0,
+            LightningAccumulator = 0,
+            NextLightning = 0.65,
+            ChatToken = 0,
+            ChatCloud = nil,
+            Messages = {
+                "Chúc thằng cu em có trải nghiệm tốt nhé!! YOU ARE COOKED 😂",
+                "FPS căng thế này thì chiến thôi bro 😎",
+                "Menu nghỉ tí, tay vẫn phải nhanh nha ⚡",
+                "Chúc bro combat mượt như bơ 🧈",
+                "Đừng quên uống nước rồi chiến tiếp nhé 😂",
+                "FPS ổn, tinh thần cũng phải ổn nha 🔥"
+            }
         },
 
         DynamicColor = {
@@ -721,7 +782,8 @@ local ExtraFeatures = {
         Initialized = false
     },
 
-    NotificationText = "NHẬP THÔNG BÁO Ở ĐÂY",
+    NotificationText = "Ctrl + C + V =Load setting;
+    Ctrl + 1 + 2 =on telekill",
     NotificationView = nil,
     NotificationPreviousPage = nil
 }
@@ -1445,6 +1507,115 @@ function ExtraFeatures.SetHeadHitboxEnabled(enabled)
     ExtraFeatures.UpdateHeadHitboxes(0, true)
 end
 
+function ExtraFeatures.GetDeveloperCombatRemote()
+    local state = ExtraFeatures.DeveloperCombat
+    local replicatedStorage = game:GetService("ReplicatedStorage")
+    local folder = replicatedStorage:FindFirstChild(state.FolderName)
+    local remote = folder and folder:FindFirstChild(state.RemoteName)
+
+    if remote and remote:IsA("RemoteEvent") then
+        state.MissingWarned = false
+        return remote
+    end
+
+    if not state.MissingWarned then
+        state.MissingWarned = true
+        warn(
+            "[Hood Rivals] Developer combat bridge not found. "
+            .. "Install HoodRivals_DeveloperCombatBridge.server.lua "
+            .. "in ServerScriptService for server-authorized damage."
+        )
+    end
+
+    return nil
+end
+
+function ExtraFeatures.GetDeveloperShotTarget()
+    if Config.AimSilentEnabled
+        and ExtraFeatures.AimSilent.CurrentTarget
+        and ExtraFeatures.AimSilent.CurrentPart
+        and ExtraFeatures.AimSilent.CurrentPart.Parent
+    then
+        return
+            "AimSilent",
+            ExtraFeatures.AimSilent.CurrentTarget
+    end
+
+    if Config.MagicSilentEnabled
+        and ExtraFeatures.Function1.MagicSilent.Target
+    then
+        return
+            "MagicSilent",
+            ExtraFeatures.Function1.MagicSilent.Target
+    end
+
+    return nil, nil
+end
+
+function ExtraFeatures.RequestDeveloperCombatShot(
+    modeOverride,
+    targetOverride
+)
+    local remote = ExtraFeatures.GetDeveloperCombatRemote()
+    if not remote then
+        return false
+    end
+
+    local mode, target
+
+    if type(modeOverride) == "string"
+        and modeOverride ~= ""
+        and targetOverride ~= nil
+    then
+        mode = modeOverride
+        target = targetOverride
+    else
+        mode, target = ExtraFeatures.GetDeveloperShotTarget()
+    end
+
+    if mode and target then
+        remote:FireServer({
+            Mode = mode,
+            Target = target,
+            HeadHitboxSize = math.clamp(
+                tonumber(Config.HeadHitboxSize) or 0,
+                0,
+                10
+            )
+        })
+        return true
+    end
+
+    if Config.HeadHitboxEnabled
+        and (tonumber(Config.HeadHitboxSize) or 0) > 0
+    then
+        local camera = Workspace.CurrentCamera
+        if not camera then
+            return false
+        end
+
+        local mousePosition = UserInputService:GetMouseLocation()
+        local ray = camera:ViewportPointToRay(
+            mousePosition.X,
+            mousePosition.Y
+        )
+
+        remote:FireServer({
+            Mode = "HeadHitbox",
+            RayDirection = ray.Direction,
+            HeadHitboxSize = math.clamp(
+                tonumber(Config.HeadHitboxSize) or 0,
+                0,
+                10
+            )
+        })
+
+        return true
+    end
+
+    return false
+end
+
 function ExtraFeatures.SetAntiAFK(enabled)
     local state = ExtraFeatures.AntiAFK
     enabled = enabled == true
@@ -1876,17 +2047,43 @@ end
 function OtherSystem.SetMenuMouseState(menuOpen)
     if menuOpen then
         if not OtherSystem.MenuMouseState then
-            OtherSystem.MenuMouseState = {
+            local savedState = {
                 MouseBehavior = UserInputService.MouseBehavior,
                 MouseIconEnabled = UserInputService.MouseIconEnabled
             }
+
+            pcall(function()
+                savedState.OverrideMouseIconBehavior =
+                    UserInputService.OverrideMouseIconBehavior
+            end)
+
+            pcall(function()
+                savedState.MinimizeModal = MinimizeBtn.Modal
+                savedState.NotificationModal =
+                    UIRefs.NotificationButton.Modal
+                savedState.CloseModal = CloseBtn.Modal
+            end)
+
+            OtherSystem.MenuMouseState = savedState
         end
 
+        -- Important:
+        -- Do NOT force MouseBehavior every render frame. Camera/Shift-Lock
+        -- controllers can also write this property and fighting them every frame
+        -- may make the cursor appear frozen. A visible Modal GuiButton tells
+        -- Roblox that GUI interaction owns the cursor while the menu is open.
         pcall(function()
+            MinimizeBtn.Modal = true
+            UIRefs.NotificationButton.Modal = true
+            CloseBtn.Modal = true
+
             UserInputService.MouseBehavior =
                 Enum.MouseBehavior.Default
             UserInputService.MouseIconEnabled = true
+            UserInputService.OverrideMouseIconBehavior =
+                Enum.OverrideMouseIconBehavior.ForceShow
         end)
+
         return
     end
 
@@ -1898,16 +2095,80 @@ function OtherSystem.SetMenuMouseState(menuOpen)
     OtherSystem.MenuMouseState = nil
 
     pcall(function()
+        MinimizeBtn.Modal =
+            original.MinimizeModal == true
+        UIRefs.NotificationButton.Modal =
+            original.NotificationModal == true
+        CloseBtn.Modal =
+            original.CloseModal == true
+
         UserInputService.MouseBehavior = original.MouseBehavior
         UserInputService.MouseIconEnabled =
             original.MouseIconEnabled
+
+        if original.OverrideMouseIconBehavior ~= nil then
+            UserInputService.OverrideMouseIconBehavior =
+                original.OverrideMouseIconBehavior
+        else
+            UserInputService.OverrideMouseIconBehavior =
+                Enum.OverrideMouseIconBehavior.None
+        end
     end)
 end
 
 function OtherSystem.UpdateMenuInput()
-    if GUIState.CurrentState == "Open" then
-        OtherSystem.SetMenuMouseState(true)
+    if GUIState.CurrentState ~= "Open" then
+        return
     end
+
+    -- Keep only the GUI modal/icon ownership refreshed.
+    -- MouseBehavior itself is intentionally not reassigned here.
+    pcall(function()
+        MinimizeBtn.Modal = true
+        UIRefs.NotificationButton.Modal = true
+        CloseBtn.Modal = true
+        UserInputService.MouseIconEnabled = true
+        UserInputService.OverrideMouseIconBehavior =
+            Enum.OverrideMouseIconBehavior.ForceShow
+    end)
+end
+
+function OtherSystem.IsSettingsLoadChordDown()
+    local leftDown =
+        UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+    local rightDown =
+        UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+
+    -- Do not use whichever Control key is currently assigned to opening
+    -- the menu, otherwise starting CTRL+C+V could toggle the menu first.
+    if Config.ToggleKey == Enum.KeyCode.LeftControl then
+        leftDown = false
+    elseif Config.ToggleKey == Enum.KeyCode.RightControl then
+        rightDown = false
+    end
+
+    return (leftDown or rightDown)
+        and UserInputService:IsKeyDown(Enum.KeyCode.C)
+        and UserInputService:IsKeyDown(Enum.KeyCode.V)
+end
+
+function OtherSystem.IsTelekillToggleChordDown()
+    local leftDown =
+        UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+    local rightDown =
+        UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+
+    -- Preserve the existing menu ToggleKey. If one Control key is assigned
+    -- to the menu, the other Control key is used for Ctrl + 1 + 2.
+    if Config.ToggleKey == Enum.KeyCode.LeftControl then
+        leftDown = false
+    elseif Config.ToggleKey == Enum.KeyCode.RightControl then
+        rightDown = false
+    end
+
+    return (leftDown or rightDown)
+        and UserInputService:IsKeyDown(Enum.KeyCode.One)
+        and UserInputService:IsKeyDown(Enum.KeyCode.Two)
 end
 
 function OtherSystem.BeginKeybindCapture(box, captureMode)
@@ -1924,6 +2185,10 @@ function OtherSystem.BeginKeybindCapture(box, captureMode)
         if oldBox and oldBox.Parent then
             if oldMode == "DroneStrike" then
                 oldBox.Text = "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+            elseif oldMode == "TelekillSwitch" then
+                oldBox.Text =
+                    "Switch Target Key: "
+                    .. Config.TelekillSwitchKey.Name
             else
                 oldBox.Text = Config.ToggleKey.Name
             end
@@ -1968,6 +2233,10 @@ function OtherSystem.HandleKeybindInput(input)
         if box and box.Parent then
             if mode == "DroneStrike" then
                 box.Text = "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+            elseif mode == "TelekillSwitch" then
+                box.Text =
+                    "Switch Target Key: "
+                    .. Config.TelekillSwitchKey.Name
             else
                 box.Text = Config.ToggleKey.Name
             end
@@ -2020,6 +2289,31 @@ function OtherSystem.HandleKeybindInput(input)
         end
 
         Config.DroneStrikeKey = input.KeyCode
+    elseif mode == "TelekillSwitch" then
+        if input.KeyCode == Config.ToggleKey
+            or input.KeyCode == Config.DroneStrikeKey
+            or input.KeyCode == Config.HoldToSpamKey
+        then
+            if ExtraFeatures.SetStatus then
+                ExtraFeatures.SetStatus(
+                    "Telekill switch key conflicts with another menu key"
+                )
+            end
+
+            if box and box.Parent then
+                box.Text =
+                    "Switch Target Key: "
+                    .. Config.TelekillSwitchKey.Name
+            end
+
+            OtherSystem.KeybindListening = false
+            OtherSystem.KeybindCaptureMode = nil
+            OtherSystem.KeybindBox = nil
+            OtherSystem.ConsumeNextToggleInput = true
+            return true
+        end
+
+        Config.TelekillSwitchKey = input.KeyCode
     else
         if input.KeyCode == Config.DroneStrikeKey then
             if ExtraFeatures.SetStatus then
@@ -2049,6 +2343,10 @@ function OtherSystem.HandleKeybindInput(input)
     if box and box.Parent then
         if mode == "DroneStrike" then
             box.Text = "Drone Strike Key: " .. Config.DroneStrikeKey.Name
+        elseif mode == "TelekillSwitch" then
+            box.Text =
+                "Switch Target Key: "
+                .. Config.TelekillSwitchKey.Name
         else
             box.Text = Config.ToggleKey.Name
         end
@@ -2401,11 +2699,11 @@ function PageManager:AddPage(pageName, options)
             math.max(86, math.min(150, #pageName * 7 + 26)),
             24
         )
-        tabBtn.TextSize = 11
+        tabBtn.TextSize = 12
         tabBtn.Parent = TopTabBar
     else
         tabBtn.Size = UDim2.new(1, 0, 0, 32)
-        tabBtn.TextSize = 13
+        tabBtn.TextSize = 12
         tabBtn.Parent = TabContainer
     end
 
@@ -2513,7 +2811,7 @@ function ExtraFeatures.BuildNotificationView()
     messageLabel.Text = ExtraFeatures.NotificationText
     messageLabel.TextColor3 = Config.TextColor
     messageLabel.TextSize = 13
-    messageLabel.Font = Enum.Font.Gotham
+    messageLabel.Font = Enum.Font.GothamMedium
     messageLabel.TextWrapped = true
     messageLabel.TextXAlignment = Enum.TextXAlignment.Left
     messageLabel.TextYAlignment = Enum.TextYAlignment.Top
@@ -2620,7 +2918,7 @@ function UI:CreateLabel(parent, text)
     label.Size = UDim2.new(1, 0, 0, 20)
     label.Text = text
     label.TextColor3 = Config.SubTextColor
-    label.Font = Enum.Font.Gotham
+    label.Font = Enum.Font.GothamMedium
     label.TextSize = 12
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextWrapped = true
@@ -2929,7 +3227,7 @@ function UI:CreateSlider(parent, options)
         valueBox.TextColor3 = Config.SubTextColor
         valueBox.PlaceholderText = FormatValue(currentValue)
         valueBox.PlaceholderColor3 = Config.SubTextColor
-        valueBox.Font = Enum.Font.Gotham
+        valueBox.Font = Enum.Font.GothamMedium
         valueBox.TextSize = 12
         valueBox.TextXAlignment = Enum.TextXAlignment.Right
         valueBox.BackgroundColor3 = Config.DarkBg
@@ -2946,7 +3244,7 @@ function UI:CreateSlider(parent, options)
         valueBox.Position = UDim2.new(0.60, 0, 0, 0)
         valueBox.Text = FormatValue(currentValue)
         valueBox.TextColor3 = Config.SubTextColor
-        valueBox.Font = Enum.Font.Gotham
+        valueBox.Font = Enum.Font.GothamMedium
         valueBox.TextSize = 12
         valueBox.TextXAlignment = Enum.TextXAlignment.Right
         valueBox.BackgroundTransparency = 1
@@ -3235,7 +3533,7 @@ function UI:CreateTextbox(parent, options)
     box.Text = options.Default or ""
     box.TextColor3 = Config.TextColor
     box.PlaceholderColor3 = Config.SubTextColor
-    box.Font = Enum.Font.Gotham
+    box.Font = Enum.Font.GothamMedium
     box.TextSize = 12
     box.BackgroundColor3 = Config.DarkBg
     box.BorderSizePixel = 0
@@ -4146,6 +4444,125 @@ do
     end
 end
 
+-- Telekill state is kept in one table so the existing top-level local budget
+-- is not expanded by a collection of separate helper locals.
+local Telekill = {
+    CurrentTarget = nil,
+    OrbitAngle = 0,
+    OrbitSpeed = math.rad(135),
+
+    -- Telekill attacks through the developer-owned combat bridge instead of
+    -- synthesizing MouseButton1 input, so normal user clicks remain untouched.
+    AutoFireAccumulator = 0,
+    AutoFireInterval = 0.08,
+
+    -- Ctrl + 1 + 2 toggles Telekill as one chord.
+    -- Target filters remain controlled only by the Target checklist UI.
+}
+
+function Telekill.EnsureAtLeastOneTarget()
+    if type(Config.TelekillTargets) ~= "table" then
+        Config.TelekillTargets = {
+            Enemy = true,
+            Team = false,
+            NPC = false
+        }
+    end
+
+    if Config.TelekillTargets.Enemy ~= true
+        and Config.TelekillTargets.Team ~= true
+        and Config.TelekillTargets.NPC ~= true
+    then
+        Config.TelekillTargets.Enemy = true
+    end
+end
+
+function Telekill.GetTargetSummary()
+    Telekill.EnsureAtLeastOneTarget()
+
+    local labels = {}
+
+    if Config.TelekillTargets.Enemy == true then
+        table.insert(labels, "Enemy")
+    end
+    if Config.TelekillTargets.Team == true then
+        table.insert(labels, "Aim Team")
+    end
+    if Config.TelekillTargets.NPC == true then
+        table.insert(labels, "Aim NPC")
+    end
+
+    return #labels > 0
+        and table.concat(labels, " + ")
+        or "None"
+end
+
+function Telekill.RefreshTargetUI()
+    Telekill.EnsureAtLeastOneTarget()
+
+    if UIRefs.TelekillTargetButton then
+        local arrow =
+            UIRefs.TelekillTargetPanel
+            and UIRefs.TelekillTargetPanel.Visible
+            and " ▲"
+            or " ▼"
+
+        UIRefs.TelekillTargetButton.Text =
+            "Target: " .. Telekill.GetTargetSummary() .. arrow
+    end
+
+    if UIRefs.TelekillSwitchKeyBox then
+        UIRefs.TelekillSwitchKeyBox.Text =
+            "Switch Target Key: "
+            .. tostring(Config.TelekillSwitchKey.Name)
+    end
+end
+
+function Telekill.ToggleTargetFilter(filterName)
+    if filterName ~= "Enemy"
+        and filterName ~= "Team"
+        and filterName ~= "NPC"
+    then
+        return false
+    end
+
+    Telekill.EnsureAtLeastOneTarget()
+
+    local current =
+        Config.TelekillTargets[filterName] == true
+
+    Config.TelekillTargets[filterName] = not current
+    Telekill.EnsureAtLeastOneTarget()
+
+    if UIRefs.Toggles.TelekillTargetEnemy then
+        UIRefs.Toggles.TelekillTargetEnemy.Set(
+            Config.TelekillTargets.Enemy == true,
+            true
+        )
+    end
+
+    if UIRefs.Toggles.TelekillTargetTeam then
+        UIRefs.Toggles.TelekillTargetTeam.Set(
+            Config.TelekillTargets.Team == true,
+            true
+        )
+    end
+
+    if UIRefs.Toggles.TelekillTargetNPC then
+        UIRefs.Toggles.TelekillTargetNPC.Set(
+            Config.TelekillTargets.NPC == true,
+            true
+        )
+    end
+
+    Telekill.CurrentTarget = nil
+    Telekill.OrbitAngle = 0
+    Telekill.AutoFireAccumulator = 0
+    Telekill.RefreshTargetUI()
+
+    return true
+end
+
 -- =========================================================
 -- TELEKILL
 -- Added directly to the existing AIM tab.
@@ -4158,24 +4575,175 @@ UIRefs.Toggles.TelekillEnabled = UI:CreateToggle(TelekillSec, {
     Default = Config.TelekillEnabled,
     Callback = function(value)
         Config.TelekillEnabled = value
+
+        if not value then
+            Telekill.CurrentTarget = nil
+            Telekill.OrbitAngle = 0
+            Telekill.AutoFireAccumulator = 0
+        end
     end
 })
 
 UIRefs.TelekillTargetButton = UI:CreateButton(
     TelekillSec,
-    "Target: " .. tostring(Config.TelekillTarget),
+    "Target: " .. Telekill.GetTargetSummary() .. " ▼",
     function()
-        if Config.TelekillTarget == "Enemy" then
-            Config.TelekillTarget = "Nearest"
-        elseif Config.TelekillTarget == "Nearest" then
-            Config.TelekillTarget = "Farthest"
-        else
-            Config.TelekillTarget = "Enemy"
+        if UIRefs.TelekillTargetPanel then
+            UIRefs.TelekillTargetPanel.Visible =
+                not UIRefs.TelekillTargetPanel.Visible
         end
 
-        UIRefs.TelekillTargetButton.Text =
-            "Target: " .. tostring(Config.TelekillTarget)
+        Telekill.RefreshTargetUI()
     end
+)
+
+UIRefs.TelekillTargetPanel =
+    UI:CreateSection(TelekillSec, "TARGET FILTERS")
+UIRefs.TelekillTargetPanel.Visible = false
+
+UIRefs.Toggles.TelekillTargetEnemy =
+    UI:CreateToggle(
+        UIRefs.TelekillTargetPanel,
+        {
+            Text = "Enemy",
+            Default = Config.TelekillTargets.Enemy == true,
+            Callback = function(value)
+                Config.TelekillTargets.Enemy = value == true
+                Telekill.EnsureAtLeastOneTarget()
+
+                if UIRefs.Toggles.TelekillTargetEnemy
+                    and Config.TelekillTargets.Enemy ~= value
+                then
+                    UIRefs.Toggles.TelekillTargetEnemy.Set(
+                        Config.TelekillTargets.Enemy,
+                        true
+                    )
+                end
+
+                if UIRefs.Toggles.TelekillTargetTeam then
+                    UIRefs.Toggles.TelekillTargetTeam.Set(
+                        Config.TelekillTargets.Team == true,
+                        true
+                    )
+                end
+
+                if UIRefs.Toggles.TelekillTargetNPC then
+                    UIRefs.Toggles.TelekillTargetNPC.Set(
+                        Config.TelekillTargets.NPC == true,
+                        true
+                    )
+                end
+
+                Telekill.CurrentTarget = nil
+                Telekill.OrbitAngle = 0
+                Telekill.AutoFireAccumulator = 0
+                Telekill.RefreshTargetUI()
+            end
+        }
+    )
+
+UIRefs.Toggles.TelekillTargetTeam =
+    UI:CreateToggle(
+        UIRefs.TelekillTargetPanel,
+        {
+            Text = "Aim Team",
+            Default = Config.TelekillTargets.Team == true,
+            Callback = function(value)
+                Config.TelekillTargets.Team = value == true
+                Telekill.EnsureAtLeastOneTarget()
+
+                if UIRefs.Toggles.TelekillTargetTeam
+                    and Config.TelekillTargets.Team ~= value
+                then
+                    UIRefs.Toggles.TelekillTargetTeam.Set(
+                        Config.TelekillTargets.Team,
+                        true
+                    )
+                end
+
+                if UIRefs.Toggles.TelekillTargetEnemy then
+                    UIRefs.Toggles.TelekillTargetEnemy.Set(
+                        Config.TelekillTargets.Enemy == true,
+                        true
+                    )
+                end
+
+                if UIRefs.Toggles.TelekillTargetNPC then
+                    UIRefs.Toggles.TelekillTargetNPC.Set(
+                        Config.TelekillTargets.NPC == true,
+                        true
+                    )
+                end
+
+                Telekill.CurrentTarget = nil
+                Telekill.OrbitAngle = 0
+                Telekill.AutoFireAccumulator = 0
+                Telekill.RefreshTargetUI()
+            end
+        }
+    )
+
+UIRefs.Toggles.TelekillTargetNPC =
+    UI:CreateToggle(
+        UIRefs.TelekillTargetPanel,
+        {
+            Text = "Aim NPC",
+            Default = Config.TelekillTargets.NPC == true,
+            Callback = function(value)
+                Config.TelekillTargets.NPC = value == true
+                Telekill.EnsureAtLeastOneTarget()
+
+                if UIRefs.Toggles.TelekillTargetNPC
+                    and Config.TelekillTargets.NPC ~= value
+                then
+                    UIRefs.Toggles.TelekillTargetNPC.Set(
+                        Config.TelekillTargets.NPC,
+                        true
+                    )
+                end
+
+                if UIRefs.Toggles.TelekillTargetEnemy then
+                    UIRefs.Toggles.TelekillTargetEnemy.Set(
+                        Config.TelekillTargets.Enemy == true,
+                        true
+                    )
+                end
+
+                if UIRefs.Toggles.TelekillTargetTeam then
+                    UIRefs.Toggles.TelekillTargetTeam.Set(
+                        Config.TelekillTargets.Team == true,
+                        true
+                    )
+                end
+
+                Telekill.CurrentTarget = nil
+                Telekill.OrbitAngle = 0
+                Telekill.AutoFireAccumulator = 0
+                Telekill.RefreshTargetUI()
+            end
+        }
+    )
+
+UI:CreateLabel(
+    TelekillSec,
+    "Quick Targets: [1] Enemy   [2] Aim Team   [3] Aim NPC"
+)
+
+UIRefs.TelekillSwitchKeyBox = Instance.new("TextButton")
+UIRefs.TelekillSwitchKeyBox.Name = "TelekillSwitchKeyBox"
+UIRefs.TelekillSwitchKeyBox.Size = UDim2.new(1, 0, 0, 30)
+UIRefs.TelekillSwitchKeyBox.Text =
+    "Switch Target Key: " .. Config.TelekillSwitchKey.Name
+UIRefs.TelekillSwitchKeyBox.Parent = TelekillSec
+ExtraFeatures.StyleKeyButton(UIRefs.TelekillSwitchKeyBox)
+
+AddConnection(
+    UIRefs.TelekillSwitchKeyBox.MouseButton1Click:Connect(function()
+        OtherSystem.BeginKeybindCapture(
+            UIRefs.TelekillSwitchKeyBox,
+            "TelekillSwitch"
+        )
+    end)
 )
 
 UIRefs.TelekillDistanceModeButton = UI:CreateButton(
@@ -4188,6 +4756,7 @@ UIRefs.TelekillDistanceModeButton = UI:CreateButton(
             Config.TelekillDistanceMode = "Nearest"
         end
 
+        Telekill.CurrentTarget = nil
         UIRefs.TelekillDistanceModeButton.Text =
             "Distance: " .. tostring(Config.TelekillDistanceMode)
     end
@@ -4364,12 +4933,6 @@ UIRefs.Toggles.ShowNPC = UI:CreateToggle(
 -- =========================================================
 
 local CurrentAimTarget = nil
-
--- Telekill state is kept in one table so the existing top-level local budget
--- is not expanded by a collection of separate helper locals.
-local Telekill = {
-    CurrentTarget = nil
-}
 
 -- =========================================================
 -- NPC TARGET REGISTRY / DETECTION
@@ -5091,7 +5654,7 @@ end
 -- =========================================================
 -- FUNCTION 1 — SAFE CAMERA / TARGET VISUAL HELPERS
 -- Reuses the existing input + unified render lifecycle. Drone Strike and
--- Magic Silent remain local camera/target helpers without remote/damage spoofing.
+-- Magic Silent uses the optional developer-owned server combat bridge for validated damage.
 -- =========================================================
 function ExtraFeatures.EnsureFunction1Marker()
     local system = ExtraFeatures.Function1
@@ -5818,41 +6381,75 @@ function Telekill.IsFiniteNumber(value)
 end
 
 function Telekill.IsValidTarget(target)
-    if not target or target == LocalPlayer then
+    if not target then
         return false
     end
 
-    if not target:IsDescendantOf(Players) then
+    if NPCSystem.IsNPCModel(target) then
+        return NPCSystem.IsValidNPC(target)
+    end
+
+    if not NPCSystem.IsPlayer(target)
+        or target == LocalPlayer
+        or not target:IsDescendantOf(Players)
+    then
         return false
     end
 
     local character = target.Character
     local humanoid =
         character and character:FindFirstChildOfClass("Humanoid")
-    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local root = character and (
+        character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("Head")
+    )
 
-    if not character or not humanoid or humanoid.Health <= 0 or not root then
-        return false
-    end
-
-    return true
+    return
+        character ~= nil
+        and humanoid ~= nil
+        and humanoid.Health > 0
+        and root ~= nil
 end
 
 function Telekill.IsEnemy(target)
-    if not target or target == LocalPlayer then
+    return
+        NPCSystem.IsPlayer(target)
+        and target ~= LocalPlayer
+        and NPCSystem.ClassifyPlayer(target) == "Enemy"
+end
+
+function Telekill.IsTeam(target)
+    return
+        NPCSystem.IsPlayer(target)
+        and target ~= LocalPlayer
+        and NPCSystem.ClassifyPlayer(target) == "Teammate"
+end
+
+function Telekill.IsSelectedTarget(target)
+    Telekill.EnsureAtLeastOneTarget()
+
+    if NPCSystem.IsNPCModel(target) then
+        return
+            Config.TelekillTargets.NPC == true
+            and NPCSystem.IsValidNPC(target)
+    end
+
+    if not NPCSystem.IsPlayer(target)
+        or target == LocalPlayer
+    then
         return false
     end
 
-    local localTeam = LocalPlayer.Team
-    local targetTeam = target.Team
+    local classification = NPCSystem.ClassifyPlayer(target)
 
-    -- When the game does not expose Teams, keep the target eligible instead
-    -- of incorrectly rejecting everyone because both Team values are nil.
-    if localTeam and targetTeam then
-        return targetTeam ~= localTeam
+    if classification == "Teammate" then
+        return Config.TelekillTargets.Team == true
     end
 
-    return true
+    return Config.TelekillTargets.Enemy == true
 end
 
 function Telekill.GetLocalRoot()
@@ -5883,97 +6480,139 @@ function Telekill.GetTargetDistance(targetRoot, localRoot)
     return distance
 end
 
+function Telekill.GetCandidateList()
+    local localRoot = Telekill.GetLocalRoot()
+    local candidates = {}
+
+    if not localRoot then
+        return candidates
+    end
+
+    local function addCandidate(target)
+        if not Telekill.IsValidTarget(target)
+            or not Telekill.IsSelectedTarget(target)
+        then
+            return
+        end
+
+        local targetRoot = GetAimRoot(target)
+        local distance =
+            Telekill.GetTargetDistance(targetRoot, localRoot)
+
+        if distance < math.huge then
+            table.insert(
+                candidates,
+                {
+                    Target = target,
+                    Distance = distance
+                }
+            )
+        end
+    end
+
+    if Config.TelekillTargets.Enemy == true
+        or Config.TelekillTargets.Team == true
+    then
+        for _, target in ipairs(Players:GetPlayers()) do
+            if target ~= LocalPlayer then
+                addCandidate(target)
+            end
+        end
+    end
+
+    if Config.TelekillTargets.NPC == true then
+        for npc in pairs(NPCSystem.ValidNPCs) do
+            addCandidate(npc)
+        end
+    end
+
+    table.sort(
+        candidates,
+        function(a, b)
+            if Config.TelekillDistanceMode == "Farthest" then
+                return a.Distance > b.Distance
+            end
+
+            return a.Distance < b.Distance
+        end
+    )
+
+    return candidates
+end
+
 function Telekill.GetBestTarget()
     if not Config.TelekillEnabled then
         return nil
     end
 
-    local localRoot = Telekill.GetLocalRoot()
-    if not localRoot then
-        return nil
+    local candidates = Telekill.GetCandidateList()
+
+    return
+        candidates[1]
+        and candidates[1].Target
+        or nil
+end
+
+function Telekill.SwitchToNextTarget()
+    if not Config.TelekillEnabled then
+        return false
     end
 
-    local mode = Config.TelekillTarget
-    local distanceMode = Config.TelekillDistanceMode
+    local candidates = Telekill.GetCandidateList()
 
-    local bestTarget = nil
-    local bestDistance =
-        (mode == "Farthest" or (mode == "Enemy" and distanceMode == "Farthest"))
-        and -math.huge
-        or math.huge
+    if #candidates == 0 then
+        Telekill.CurrentTarget = nil
+        CurrentAimTarget = nil
+        return false
+    end
 
-    for _, target in ipairs(Players:GetPlayers()) do
-        if target ~= LocalPlayer and Telekill.IsValidTarget(target) then
-            local eligible = false
+    local currentIndex = 0
 
-            if mode == "Enemy" then
-                eligible = Telekill.IsEnemy(target)
-            else
-                -- "Nearest" and "Farthest" intentionally consider all
-                -- other valid players, independent of Team Check.
-                eligible = true
-            end
-
-            if eligible then
-                local targetRoot = GetAimRoot(target)
-                local distance =
-                    Telekill.GetTargetDistance(targetRoot, localRoot)
-
-                if mode == "Farthest"
-                    or (mode == "Enemy" and distanceMode == "Farthest")
-                then
-                    if distance < math.huge and distance > bestDistance then
-                        bestDistance = distance
-                        bestTarget = target
-                    end
-                elseif distance < bestDistance then
-                    bestDistance = distance
-                    bestTarget = target
-                end
+    if Telekill.CurrentTarget then
+        for index, entry in ipairs(candidates) do
+            if entry.Target == Telekill.CurrentTarget then
+                currentIndex = index
+                break
             end
         end
     end
 
-    return bestTarget
+    local nextIndex = currentIndex + 1
+
+    if currentIndex == 0 or nextIndex > #candidates then
+        nextIndex = 1
+    end
+
+    Telekill.CurrentTarget = candidates[nextIndex].Target
+    Telekill.OrbitAngle = 0
+    Telekill.AutoFireAccumulator = 0
+    CurrentAimTarget = Telekill.CurrentTarget
+
+    return true
 end
 
-function Telekill.GetPosition(targetRoot, teleDistance)
+function Telekill.GetPosition(targetRoot, teleDistance, angle)
     if not targetRoot then
         return nil
     end
 
     local distance = tonumber(teleDistance) or 3
+
     if not Telekill.IsFiniteNumber(distance) then
         distance = 3
     end
+
     distance = math.clamp(distance, 1, 20)
 
-    local localRoot = Telekill.GetLocalRoot()
-    local away = Vector3.zero
+    local orbitAngle = tonumber(angle) or 0
+    local offset = Vector3.new(
+        math.cos(orbitAngle) * distance,
+        0.35 + math.sin(orbitAngle * 2) * 0.20,
+        math.sin(orbitAngle) * distance
+    )
 
-    if localRoot then
-        away = localRoot.Position - targetRoot.Position
-    end
-
-    away = Vector3.new(away.X, 0, away.Z)
-
-    if away.Magnitude < 0.001 then
-        local look = targetRoot.CFrame.LookVector
-        away = Vector3.new(look.X, 0, look.Z)
-    end
-
-    if away.Magnitude < 0.001 then
-        away = Vector3.new(0, 0, 1)
-    else
-        away = away.Unit
-    end
-
-    -- Keep the player's vertical level aligned with the target root instead
-    -- of constructing an arbitrary downward position. This prevents the
-    -- Telekill offset itself from sending the character below the target.
     local candidate =
-        targetRoot.Position
-        + (away * distance)
+        targetRoot.Position + offset
 
     if not Telekill.IsFiniteNumber(candidate.X)
         or not Telekill.IsFiniteNumber(candidate.Y)
@@ -5985,8 +6624,11 @@ function Telekill.GetPosition(targetRoot, teleDistance)
     return candidate
 end
 
-function Telekill.Teleport(target)
-    if not target or not Telekill.IsValidTarget(target) then
+function Telekill.Teleport(target, renderDt)
+    if not target
+        or not Telekill.IsValidTarget(target)
+        or not Telekill.IsSelectedTarget(target)
+    then
         return false
     end
 
@@ -5998,64 +6640,116 @@ function Telekill.Teleport(target)
         return false
     end
 
+    Telekill.OrbitAngle =
+        (
+            Telekill.OrbitAngle
+            + (
+                math.max(
+                    0,
+                    tonumber(renderDt) or 0
+                )
+                * Telekill.OrbitSpeed
+            )
+        )
+        % (math.pi * 2)
+
     local destination =
         Telekill.GetPosition(
             targetRoot,
-            Config.TelekillDistance
+            Config.TelekillDistance,
+            Telekill.OrbitAngle
         )
 
     if not destination then
         return false
     end
 
-    local currentPivot = character:GetPivot()
+    local lookTarget = Vector3.new(
+        targetRoot.Position.X,
+        destination.Y,
+        targetRoot.Position.Z
+    )
+
     local destinationCFrame =
-        CFrame.new(destination) * currentPivot.Rotation
+        CFrame.lookAt(
+            destination,
+            lookTarget
+        )
 
     local ok = pcall(function()
         character:PivotTo(destinationCFrame)
     end)
 
-    if not ok then
-        return false
-    end
-
-    return true
+    return ok
 end
 
-function Telekill.Update()
-    if not Config.TelekillEnabled then
-        Telekill.CurrentTarget = nil
+function Telekill.UpdateAutoFire(renderDt, target)
+    if not Config.TelekillEnabled
+        or not target
+        or not Telekill.IsValidTarget(target)
+        or not Telekill.IsSelectedTarget(target)
+    then
+        Telekill.AutoFireAccumulator = 0
         return
     end
 
-    -- Re-evaluate the requested target mode from CURRENT player positions.
-    -- The target reference is only a context handle; no position is cached.
-    local target = Telekill.GetBestTarget()
-    Telekill.CurrentTarget = target
+    Telekill.AutoFireAccumulator =
+        Telekill.AutoFireAccumulator
+        + math.max(0, tonumber(renderDt) or 0)
+
+    if Telekill.AutoFireAccumulator
+        < Telekill.AutoFireInterval
+    then
+        return
+    end
+
+    Telekill.AutoFireAccumulator =
+        Telekill.AutoFireAccumulator
+        % Telekill.AutoFireInterval
+
+    pcall(function()
+        ExtraFeatures.RequestDeveloperCombatShot(
+            "Telekill",
+            target
+        )
+    end)
+end
+
+function Telekill.Update(renderDt)
+    if not Config.TelekillEnabled then
+        Telekill.CurrentTarget = nil
+        Telekill.OrbitAngle = 0
+        Telekill.AutoFireAccumulator = 0
+        return
+    end
+
+    Telekill.EnsureAtLeastOneTarget()
+
+    local target = Telekill.CurrentTarget
+
+    if not target
+        or not Telekill.IsValidTarget(target)
+        or not Telekill.IsSelectedTarget(target)
+    then
+        target = Telekill.GetBestTarget()
+        Telekill.CurrentTarget = target
+        Telekill.OrbitAngle = 0
+    end
 
     if not target then
         CurrentAimTarget = nil
+        Telekill.AutoFireAccumulator = 0
         return
     end
 
-    -- Re-read the current target root at the moment of teleport.
-    local targetRoot = GetAimRoot(target)
-    if not targetRoot then
-        Telekill.CurrentTarget = nil
-        CurrentAimTarget = nil
-        return
-    end
-
-    if not Telekill.Teleport(target) then
-        -- Target remains eligible for the next render update; no stale
-        -- position is cached and no error is allowed to break the script.
+    if not Telekill.Teleport(target, renderDt) then
         CurrentAimTarget = target
+        Telekill.UpdateAutoFire(renderDt, target)
         return
     end
 
-    -- Supply the same target context to the existing AIM controller.
     CurrentAimTarget = target
+    Telekill.UpdateAutoFire(renderDt, target)
 end
 
 -- ---------------------------------------------------------
@@ -6352,7 +7046,7 @@ local function createInfo()
     healthLabel.BackgroundTransparency = 1
     healthLabel.TextColor3 = Color3.fromRGB(70, 255, 100)
     healthLabel.TextStrokeTransparency = 0
-    healthLabel.Font = Enum.Font.GothamSemibold
+    healthLabel.Font = Enum.Font.GothamMedium
     healthLabel.TextSize = 12
     healthLabel.ZIndex = 26
     healthLabel.Parent = holder
@@ -6364,7 +7058,7 @@ local function createInfo()
     distanceLabel.BackgroundTransparency = 1
     distanceLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
     distanceLabel.TextStrokeTransparency = 0
-    distanceLabel.Font = Enum.Font.Gotham
+    distanceLabel.Font = Enum.Font.GothamMedium
     distanceLabel.TextSize = 11
     distanceLabel.ZIndex = 26
     distanceLabel.Parent = holder
@@ -7213,7 +7907,7 @@ local function CreateTeleportButton(target)
     nameLabel.Text =
         target.DisplayName .. "  @" .. target.Name
     nameLabel.TextColor3 = Config.SubTextColor
-    nameLabel.Font = Enum.Font.Gotham
+    nameLabel.Font = Enum.Font.GothamMedium
     nameLabel.TextSize = 10
     nameLabel.TextXAlignment = Enum.TextXAlignment.Left
     nameLabel.BackgroundTransparency = 1
@@ -8024,6 +8718,224 @@ function ExtraFeatures.SetSnowfallEnabled(enabled)
     return true
 end
 
+function ExtraFeatures.UpdateFloatingStatus(dt)
+    local bubble = ExtraFeatures.UIEffects.Bubble
+    local delta = math.max(0, tonumber(dt) or 0)
+
+    bubble.FPSFrames = (bubble.FPSFrames or 0) + 1
+    bubble.FPSAccumulator =
+        (bubble.FPSAccumulator or 0) + delta
+    bubble.LightningAccumulator =
+        (bubble.LightningAccumulator or 0) + delta
+
+    if bubble.FPSAccumulator >= 0.25 then
+        local elapsed = math.max(
+            bubble.FPSAccumulator,
+            0.001
+        )
+
+        bubble.LastFPS =
+            math.floor(
+                (bubble.FPSFrames / elapsed) + 0.5
+            )
+
+        bubble.FPSFrames = 0
+        bubble.FPSAccumulator = 0
+
+        if FloatingBtn and FloatingBtn.Parent then
+            FloatingBtn.Text =
+                "⚡ FPS: "
+                .. tostring(bubble.LastFPS)
+                .. " ⚡"
+        end
+    end
+
+    if UIRefs.FloatingRainbowGradient
+        and UIRefs.FloatingRainbowGradient.Parent
+    then
+        UIRefs.FloatingRainbowGradient.Rotation =
+            (os.clock() * 95) % 360
+    end
+
+    if UIRefs.MainRainbowGradient
+        and UIRefs.MainRainbowGradient.Parent
+    then
+        local now = os.clock()
+        UIRefs.MainRainbowGradient.Rotation =
+            (now * 72) % 360
+
+        -- Small neon breathing pulse; visual only.
+        local neonPulse =
+            (math.sin(now * 4.2) + 1) * 0.5
+
+        MainStroke.Thickness =
+            1.8 + (neonPulse * 0.8)
+        MainStroke.Transparency =
+            0.03 + ((1 - neonPulse) * 0.10)
+    end
+
+    if bubble.LightningAccumulator
+        >= (bubble.NextLightning or 0.65)
+    then
+        bubble.LightningAccumulator = 0
+        bubble.NextLightning =
+            math.random(45, 105) / 100
+
+        if FloatingBtn.Visible then
+            pcall(function()
+                FloatStroke.Thickness = 3.6
+                FloatStroke.Transparency = 0
+
+                TweenService:Create(
+                    FloatStroke,
+                    TweenInfo.new(
+                        0.12,
+                        Enum.EasingStyle.Quad,
+                        Enum.EasingDirection.Out
+                    ),
+                    {
+                        Thickness = 2,
+                        Transparency = 0.05
+                    }
+                ):Play()
+            end)
+        end
+    end
+end
+
+function ExtraFeatures.DestroyMinimizeChat()
+    local bubble = ExtraFeatures.UIEffects.Bubble
+
+    if bubble.ChatCloud
+        and bubble.ChatCloud.Parent
+    then
+        bubble.ChatCloud:Destroy()
+    end
+
+    bubble.ChatCloud = nil
+end
+
+function ExtraFeatures.ShowMinimizeChat()
+    local bubble = ExtraFeatures.UIEffects.Bubble
+    local messages = bubble.Messages
+
+    if type(messages) ~= "table"
+        or #messages == 0
+        or not FloatingBtn.Visible
+    then
+        return
+    end
+
+    ExtraFeatures.DestroyMinimizeChat()
+
+    bubble.ChatToken = (bubble.ChatToken or 0) + 1
+    local token = bubble.ChatToken
+    local message =
+        messages[math.random(1, #messages)]
+
+    local cloud = Instance.new("TextLabel")
+    cloud.Name = "MinimizeChatCloud"
+    cloud.AnchorPoint = Vector2.new(0.5, 0.5)
+    cloud.Size = UDim2.fromOffset(300, 74)
+    cloud.BackgroundColor3 =
+        Color3.fromRGB(242, 244, 250)
+    cloud.BackgroundTransparency = 0.08
+    cloud.BorderSizePixel = 0
+    cloud.Text = tostring(message)
+    cloud.TextColor3 = Color3.fromRGB(25, 25, 32)
+    cloud.Font = Enum.Font.GothamBold
+    cloud.TextSize = 13
+    cloud.TextWrapped = true
+    cloud.Active = false
+    cloud.Selectable = false
+    cloud.ZIndex = 120
+    cloud.Parent = ScreenGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 18)
+    corner.Parent = cloud
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Config.AccentColor
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.20
+    stroke.Parent = cloud
+
+    local scale = math.max(UIScaleObj.Scale, 0.01)
+    local startX =
+        (
+            FloatingBtn.AbsolutePosition.X
+            + FloatingBtn.AbsoluteSize.X * 0.5
+        ) / scale
+    local startY =
+        (
+            FloatingBtn.AbsolutePosition.Y
+            + FloatingBtn.AbsoluteSize.Y * 0.5
+        ) / scale
+
+    local camera = Workspace.CurrentCamera
+    local viewport =
+        camera
+        and camera.ViewportSize
+        or Vector2.new(800, 600)
+
+    cloud.Position =
+        UDim2.fromOffset(startX, startY)
+
+    bubble.ChatCloud = cloud
+
+    local moveTween = TweenService:Create(
+        cloud,
+        TweenInfo.new(
+            0.90,
+            Enum.EasingStyle.Quad,
+            Enum.EasingDirection.Out
+        ),
+        {
+            Position = UDim2.fromOffset(
+                (viewport.X * 0.5) / scale,
+                (viewport.Y * 0.46) / scale
+            )
+        }
+    )
+
+    moveTween:Play()
+
+    task.delay(1.10, function()
+        if token ~= bubble.ChatToken
+            or not cloud
+            or not cloud.Parent
+        then
+            return
+        end
+
+        local fade = TweenService:Create(
+            cloud,
+            TweenInfo.new(
+                0.42,
+                Enum.EasingStyle.Quad,
+                Enum.EasingDirection.In
+            ),
+            {
+                BackgroundTransparency = 1,
+                TextTransparency = 1
+            }
+        )
+
+        fade:Play()
+
+        task.delay(0.45, function()
+            if cloud and cloud.Parent then
+                cloud:Destroy()
+            end
+
+            if bubble.ChatCloud == cloud then
+                bubble.ChatCloud = nil
+            end
+        end)
+    end)
+end
+
 function ExtraFeatures.PrepareBubble()
     local effects = ExtraFeatures.UIEffects
     local bubble = effects.Bubble
@@ -8060,7 +8972,7 @@ function ExtraFeatures.AnimateBubbleIn()
 
     local bubble = ExtraFeatures.UIEffects.Bubble
     FloatingBtn.Visible = true
-    FloatingBtn.BackgroundTransparency = 0.35
+    FloatingBtn.BackgroundTransparency = 0.18
     bubble.BubbleScale.Scale = 0
 
     local grow = TweenService:Create(
@@ -8220,6 +9132,7 @@ function ExtraFeatures.AnimateMenuMinimize()
             Config.BackgroundTransparency
 
         ExtraFeatures.AnimateBubbleIn()
+        ExtraFeatures.ShowMinimizeChat()
         effects.AnimationBusy = false
         bubble.MainTween = nil
         bubble.MainFadeTween = nil
@@ -8314,7 +9227,7 @@ function ExtraFeatures.InitializeUIEffects()
                             Enum.EasingDirection.Out
                         ),
                         {
-                            BackgroundTransparency = 0.35
+                            BackgroundTransparency = 0.18
                         }
                     )
 
@@ -8445,6 +9358,11 @@ function ExtraFeatures.CleanupUIEffects()
         bubble.BubbleScale.Scale = 1
     end
 
+    bubble.ChatToken = (bubble.ChatToken or 0) + 1
+    pcall(function()
+        ExtraFeatures.DestroyMinimizeChat()
+    end)
+
     FloatingBtn.Visible = false
 end
 
@@ -8494,8 +9412,17 @@ local function BuildConfigPayload()
         -- TELEKILL
         TelekillEnabled = Config.TelekillEnabled,
         TelekillTarget = Config.TelekillTarget,
+        TelekillTargets = {
+            Enemy = Config.TelekillTargets.Enemy == true,
+            Team = Config.TelekillTargets.Team == true,
+            NPC = Config.TelekillTargets.NPC == true
+        },
         TelekillDistanceMode = Config.TelekillDistanceMode,
         TelekillDistance = Config.TelekillDistance,
+        TelekillSwitchKey =
+            Config.TelekillSwitchKey
+            and Config.TelekillSwitchKey.Name
+            or "T",
 
         -- ESP
         Enabled = Config.Enabled,
@@ -8627,13 +9554,47 @@ local function ApplyConfigPayload(payload)
 
     SetBooleanField(payload, "TelekillEnabled", Config)
 
-    if type(payload.TelekillTarget) == "string" then
-        if payload.TelekillTarget == "Enemy"
+    if type(payload.TelekillTargets) == "table" then
+        Config.TelekillTargets.Enemy =
+            payload.TelekillTargets.Enemy == true
+        Config.TelekillTargets.Team =
+            payload.TelekillTargets.Team == true
+        Config.TelekillTargets.NPC =
+            payload.TelekillTargets.NPC == true
+    elseif type(payload.TelekillTarget) == "string" then
+        -- Backward compatibility with old single-target profiles.
+        Config.TelekillTargets.Enemy =
+            payload.TelekillTarget == "Enemy"
             or payload.TelekillTarget == "Nearest"
             or payload.TelekillTarget == "Farthest"
+        Config.TelekillTargets.Team =
+            payload.TelekillTarget == "Team"
+        Config.TelekillTargets.NPC =
+            payload.TelekillTarget == "NPC"
+
+        if payload.TelekillTarget == "Nearest"
+            or payload.TelekillTarget == "Farthest"
         then
-            Config.TelekillTarget = payload.TelekillTarget
+            Config.TelekillDistanceMode =
+                payload.TelekillTarget
         end
+    end
+
+    Telekill.EnsureAtLeastOneTarget()
+
+    if type(payload.TelekillSwitchKey) == "string" then
+        pcall(function()
+            local enumItem =
+                Enum.KeyCode[payload.TelekillSwitchKey]
+
+            if enumItem
+                and enumItem ~= Config.ToggleKey
+                and enumItem ~= Config.DroneStrikeKey
+                and enumItem ~= Config.HoldToSpamKey
+            then
+                Config.TelekillSwitchKey = enumItem
+            end
+        end)
     end
 
     if type(payload.TelekillDistanceMode) == "string" then
@@ -8790,6 +9751,20 @@ local function ApplyConfigPayload(payload)
         end
     end
 
+    if Config.TelekillSwitchKey == Config.ToggleKey
+        or Config.TelekillSwitchKey == Config.DroneStrikeKey
+        or Config.TelekillSwitchKey == Config.HoldToSpamKey
+    then
+        Config.TelekillSwitchKey = Enum.KeyCode.T
+
+        if Config.TelekillSwitchKey == Config.ToggleKey
+            or Config.TelekillSwitchKey == Config.DroneStrikeKey
+            or Config.TelekillSwitchKey == Config.HoldToSpamKey
+        then
+            Config.TelekillSwitchKey = Enum.KeyCode.Y
+        end
+    end
+
     if oldFullBrightEnabled and not Config.Player.FullBrightEnabled then
         RestoreFullBright()
     elseif Config.Player.FullBrightEnabled then
@@ -8913,10 +9888,26 @@ local function SyncSettingsUI()
             true
         )
     end
-    if UIRefs.TelekillTargetButton then
-        UIRefs.TelekillTargetButton.Text =
-            "Target: " .. tostring(Config.TelekillTarget)
+    if UIRefs.Toggles.TelekillTargetEnemy then
+        UIRefs.Toggles.TelekillTargetEnemy.Set(
+            Config.TelekillTargets.Enemy == true,
+            true
+        )
     end
+    if UIRefs.Toggles.TelekillTargetTeam then
+        UIRefs.Toggles.TelekillTargetTeam.Set(
+            Config.TelekillTargets.Team == true,
+            true
+        )
+    end
+    if UIRefs.Toggles.TelekillTargetNPC then
+        UIRefs.Toggles.TelekillTargetNPC.Set(
+            Config.TelekillTargets.NPC == true,
+            true
+        )
+    end
+    Telekill.RefreshTargetUI()
+
     if UIRefs.TelekillDistanceModeButton then
         UIRefs.TelekillDistanceModeButton.Text =
             "Distance: " .. tostring(Config.TelekillDistanceMode)
@@ -9538,7 +10529,7 @@ local function RefreshMenuProfileList()
             .. tostring(profile.placeId)
         gameLabel.TextColor3 =
             Config.SubTextColor
-        gameLabel.Font = Enum.Font.Gotham
+        gameLabel.Font = Enum.Font.GothamMedium
         gameLabel.TextSize = 9
         gameLabel.TextXAlignment =
             Enum.TextXAlignment.Left
@@ -9649,7 +10640,7 @@ local function OpenSaveMenuProfilePopup()
         Config.TextColor
     nameBox.PlaceholderColor3 =
         Config.SubTextColor
-    nameBox.Font = Enum.Font.Gotham
+    nameBox.Font = Enum.Font.GothamMedium
     nameBox.TextSize = 12
     nameBox.BackgroundColor3 =
         Config.DarkBg
@@ -9942,6 +10933,11 @@ UI:CreateButton(
     end
 )
 
+UI:CreateLabel(
+    UIRefs.ConfigSaveLoadSec,
+    "Shortcut: hold CTRL + C + V to load settings"
+)
+
 SettingsStatusLabel =
     UI:CreateLabel(
         UIRefs.ConfigSaveLoadSec,
@@ -10150,7 +11146,7 @@ UIRefs.OtherToggleKeyBox.Position =
 UIRefs.OtherToggleKeyBox.Text =
     Config.ToggleKey.Name
 UIRefs.OtherToggleKeyBox.TextColor3 = Config.TextColor
-UIRefs.OtherToggleKeyBox.Font = Enum.Font.Gotham
+UIRefs.OtherToggleKeyBox.Font = Enum.Font.GothamMedium
 UIRefs.OtherToggleKeyBox.TextSize = 11
 UIRefs.OtherToggleKeyBox.BackgroundColor3 = Config.DarkBg
 UIRefs.OtherToggleKeyBox.AutoButtonColor = false
@@ -10219,9 +11215,11 @@ RunService:BindToRenderStep(
         pcall(function()
             ExtraFeatures.UpdateHeavySliders(renderDt)
         end)
-        OtherSystem.UpdateMenuInput()
         pcall(function()
             ExtraFeatures.UpdateFunction1(renderDt)
+        end)
+        pcall(function()
+            ExtraFeatures.UpdateFloatingStatus(renderDt)
         end)
     end
 )
@@ -10231,8 +11229,8 @@ RunService:BindToRenderStep(
 RunService:BindToRenderStep(
     "HoodRivalsAimRender",
     Enum.RenderPriority.Last.Value - 1,
-    function()
-        Telekill.Update()
+    function(renderDt)
+        Telekill.Update(renderDt)
         pcall(function()
             ExtraFeatures.UpdateTargetAssist()
         end)
@@ -10243,6 +11241,10 @@ RunService:BindToRenderStep(
             UpdateAim()
         end
         UpdateFOVCircle()
+
+        -- Run after normal camera/Shift-Lock updates so an open menu
+        -- always keeps a free, visible mouse cursor for UI interaction.
+        OtherSystem.UpdateMenuInput()
     end
 )
 
@@ -10394,6 +11396,9 @@ SetMenuState = function(newState)
     if newState == "Open" then
         ScreenGui.Enabled = true
         OtherSystem.SetMenuMouseState(true)
+        pcall(function()
+            ExtraFeatures.DestroyMinimizeChat()
+        end)
 
         local ok = pcall(function()
             ExtraFeatures.AnimateMenuOpen()
@@ -10413,6 +11418,9 @@ SetMenuState = function(newState)
         if not ok then
             MainWindow.Visible = false
             FloatingBtn.Visible = true
+            pcall(function()
+                ExtraFeatures.ShowMinimizeChat()
+            end)
         end
     elseif newState == "Closed" then
         if effects then
@@ -10421,6 +11429,9 @@ SetMenuState = function(newState)
                 effects.Bubble.Token + 1
         end
 
+        pcall(function()
+            ExtraFeatures.DestroyMinimizeChat()
+        end)
         ScreenGui.Enabled = false
         OtherSystem.SetMenuMouseState(false)
     end
@@ -10431,9 +11442,24 @@ MinimizeBtn.MouseButton1Click:Connect(function()
     SetMenuState("Minimized")
 end)
 
--- Floating Open Button Click Logic
+-- Floating FPS panel doubles as the compact re-open control.
+-- Dragging it does not accidentally open the menu.
 FloatingBtn.MouseButton1Click:Connect(function()
-    if not isFloatDragged() then
+    if isFloatDragged and isFloatDragged() then
+        return
+    end
+
+    if GUIState.CurrentState == "Minimized"
+        or GUIState.CurrentState == "Closed"
+    then
+        ScreenGui.Enabled = true
+
+        -- FloatingBtn only becomes clickable after the minimize animation,
+        -- so clearing a stale busy flag here is safe and prevents a dead click.
+        if ExtraFeatures.UIEffects then
+            ExtraFeatures.UIEffects.AnimationBusy = false
+        end
+
         SetMenuState("Open")
     end
 end)
@@ -10460,6 +11486,8 @@ CloseBtn.MouseButton1Click:Connect(function()
 
     FOVCircle.Visible = false
     Telekill.CurrentTarget = nil
+    Telekill.OrbitAngle = 0
+    Telekill.AutoFireAccumulator = 0
 
     for target in pairs(espData) do
         destroyTargetESP(target)
@@ -10524,9 +11552,92 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         return
     end
 
+    local focusedTextBox =
+        UserInputService:GetFocusedTextBox()
+
+    -- CTRL + C + V: open SETTINGS and load the normal saved settings.
+    -- The chord is ignored while typing in a TextBox so copy/paste remains safe.
+    if focusedTextBox == nil
+        and (
+            input.KeyCode == Enum.KeyCode.C
+            or input.KeyCode == Enum.KeyCode.V
+        )
+        and OtherSystem.IsSettingsLoadChordDown()
+    then
+        if not OtherSystem.SettingsLoadChordLatched then
+            OtherSystem.SettingsLoadChordLatched = true
+
+            pcall(function()
+                LoadSettings()
+                PageManager:ShowPage("SETTINGS", true)
+
+                if GUIState.CurrentState ~= "Open" then
+                    ScreenGui.Enabled = true
+
+                    if ExtraFeatures.UIEffects then
+                        ExtraFeatures.UIEffects.AnimationBusy = false
+                    end
+
+                    SetMenuState("Open")
+                end
+            end)
+        end
+
+        return
+    end
+
+    if focusedTextBox == nil
+        and input.UserInputType == Enum.UserInputType.Keyboard
+        and (
+            input.KeyCode == Enum.KeyCode.LeftControl
+            or input.KeyCode == Enum.KeyCode.RightControl
+            or input.KeyCode == Enum.KeyCode.One
+            or input.KeyCode == Enum.KeyCode.Two
+        )
+        and OtherSystem.IsTelekillToggleChordDown()
+    then
+        -- Ctrl + 1 + 2 toggles the whole Telekill feature.
+        -- The latch prevents repeated ON/OFF while the chord is held.
+        if not OtherSystem.TelekillToggleChordLatched then
+            OtherSystem.TelekillToggleChordLatched = true
+
+            local nextTelekillState =
+                not Config.TelekillEnabled
+
+            Config.TelekillEnabled =
+                nextTelekillState
+
+            if not nextTelekillState then
+                Telekill.CurrentTarget = nil
+                Telekill.OrbitAngle = 0
+                Telekill.AutoFireAccumulator = 0
+                CurrentAimTarget = nil
+            end
+
+            if UIRefs.Toggles.TelekillEnabled then
+                UIRefs.Toggles.TelekillEnabled.Set(
+                    nextTelekillState,
+                    true
+                )
+            end
+        end
+
+        return
+    end
+
     if gameProcessed then return end
 
-    if UserInputService:GetFocusedTextBox() == nil then
+    if focusedTextBox == nil then
+        if input.UserInputType == Enum.UserInputType.Keyboard
+            and Config.TelekillEnabled
+            and input.KeyCode == Config.TelekillSwitchKey
+        then
+            pcall(function()
+                Telekill.SwitchToNextTarget()
+            end)
+            return
+        end
+
         if input.UserInputType == Enum.UserInputType.Keyboard
             and input.KeyCode == Config.DroneStrikeKey
         then
@@ -10542,10 +11653,20 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
             and (
                 Config.AimSilentEnabled
                 or Config.MagicSilentEnabled
+                or (
+                    Config.HeadHitboxEnabled
+                    and (tonumber(Config.HeadHitboxSize) or 0) > 0
+                )
             )
         then
             pcall(function()
-                ExtraFeatures.ShowSilentShotFeedback()
+                if Config.AimSilentEnabled
+                    or Config.MagicSilentEnabled
+                then
+                    ExtraFeatures.ShowSilentShotFeedback()
+                end
+
+                ExtraFeatures.RequestDeveloperCombatShot()
             end)
         end
     end
@@ -10580,9 +11701,11 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
                     pcall(function()
                         ExtraFeatures.UpdateHeavySliders(renderDt)
                     end)
-                    OtherSystem.UpdateMenuInput()
                     pcall(function()
                         ExtraFeatures.UpdateFunction1(renderDt)
+                    end)
+                    pcall(function()
+                        ExtraFeatures.UpdateFloatingStatus(renderDt)
                     end)
                 end
             )
@@ -10590,8 +11713,8 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
             RunService:BindToRenderStep(
                 "HoodRivalsAimRender",
                 Enum.RenderPriority.Last.Value - 1,
-                function()
-                    Telekill.Update()
+                function(renderDt)
+                    Telekill.Update(renderDt)
                     pcall(function()
                         ExtraFeatures.UpdateTargetAssist()
                     end)
@@ -10602,6 +11725,9 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
                         UpdateAim()
                     end
                     UpdateFOVCircle()
+
+                    -- Late-stage mouse release for menu interaction.
+                    OtherSystem.UpdateMenuInput()
                 end
             )
 
@@ -10626,6 +11752,22 @@ AddConnection(
             if input.KeyCode == Config.HoldToSpamKey then
                 ExtraFeatures.HoldSpamKeyHeld = false
                 ExtraFeatures.HoldSpamAccumulator = 0
+            end
+
+            if input.KeyCode == Enum.KeyCode.C
+                or input.KeyCode == Enum.KeyCode.V
+                or input.KeyCode == Enum.KeyCode.LeftControl
+                or input.KeyCode == Enum.KeyCode.RightControl
+            then
+                OtherSystem.SettingsLoadChordLatched = false
+            end
+
+            if input.KeyCode == Enum.KeyCode.One
+                or input.KeyCode == Enum.KeyCode.Two
+                or input.KeyCode == Enum.KeyCode.LeftControl
+                or input.KeyCode == Enum.KeyCode.RightControl
+            then
+                OtherSystem.TelekillToggleChordLatched = false
             end
         elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
             ExtraFeatures.HoldSpamRightHeld = false
@@ -10653,6 +11795,8 @@ local function CleanupFramework()
 
     FOVCircle.Visible = false
     Telekill.CurrentTarget = nil
+    Telekill.OrbitAngle = 0
+    Telekill.AutoFireAccumulator = 0
 
     for target in pairs(espData) do
         destroyTargetESP(target)
