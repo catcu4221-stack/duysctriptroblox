@@ -71,8 +71,8 @@ end
 -- 2. CONFIGURATION & STATE
 -- ==========================================
 local Config = {
-    Title = "[TPD] 陈福维",
-    Author = "Made By @duytpvipro_",
+    Title = "[UPD] Hood Rivals",
+    Author = "Made By @rullzsy_",
     ToggleKey = Enum.KeyCode.RightControl,
     ToggleKeyEnabled = true,
     UIScale = 1.0,
@@ -782,8 +782,7 @@ local ExtraFeatures = {
         Initialized = false
     },
 
-    NotificationText = "Ctrl + C + V =Load setting;
-    Ctrl + 1 + 2 =on telekill",
+    NotificationText = "NHẬP THÔNG BÁO Ở ĐÂY",
     NotificationView = nil,
     NotificationPreviousPage = nil
 }
