@@ -6085,29 +6085,6 @@ function ExtraFeatures.UpdateDroneStrike(dt)
     end
 end
 
-function ExtraFeatures.SyncDroneFromCamera()
-    local state = ExtraFeatures.Function1.DroneStrike
-
-    if not state.Active then
-        return
-    end
-
-    local camera = Workspace.CurrentCamera
-    if not camera then
-        return
-    end
-
-    -- Other systems (especially the existing AIM engine) are allowed to
-    -- modify the Drone camera.  Adopt that final camera CFrame back into
-    -- Drone state so the next freecam frame continues from the new view
-    -- instead of snapping back to the previous yaw/pitch.
-    state.CFrame = camera.CFrame
-
-    local pitch, yaw = camera.CFrame:ToOrientation()
-    state.Pitch = math.clamp(pitch, -1.45, 1.45)
-    state.Yaw = yaw
-end
-
 function ExtraFeatures.UpdateMagicSilent(dt)
     local state = ExtraFeatures.Function1.MagicSilent
 
@@ -6214,7 +6191,7 @@ UIRefs.DroneTargetLabel = UI:CreateLabel(
 )
 UI:CreateLabel(
     UIRefs.Function1DroneSection,
-    "W/A/S/D/Q/E move the freecam. Existing AIM/ESP/game input remain active while Drone is ON."
+    "W/A/S/D/Q/E move the safe freecam. Target tracking is visual only."
 )
 
 UIRefs.Function1MagicSection = UI:CreateSection(
@@ -11272,18 +11249,9 @@ RunService:BindToRenderStep(
         pcall(function()
             ExtraFeatures.UpdateAimSilent()
         end)
-        -- AIM remains functional while Drone Strike is active.
-        -- UpdateAim() operates on CurrentCamera as usual; immediately after,
-        -- Drone adopts the resulting CFrame so the next freecam frame keeps
-        -- the AIM-adjusted direction instead of snapping back.
-        UpdateAim()
-
-        if ExtraFeatures.Function1.DroneStrike.Active then
-            pcall(function()
-                ExtraFeatures.SyncDroneFromCamera()
-            end)
+        if not ExtraFeatures.Function1.DroneStrike.Active then
+            UpdateAim()
         end
-
         UpdateFOVCircle()
 
         -- Run after normal camera/Shift-Lock updates so an open menu
