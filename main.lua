@@ -6020,23 +6020,32 @@ function ExtraFeatures.UpdateDroneStrike(dt)
         1.45
     )
 
-    local rotation = CFrame.Angles(state.Pitch, state.Yaw, 0)
+    -- FPS / Minecraft-Creative style camera rotation:
+    -- yaw around world Y first, then pitch around the camera's local X axis.
+    local rotation =
+        CFrame.Angles(0, state.Yaw, 0)
+        * CFrame.Angles(state.Pitch, 0, 0)
+
+    -- Camera-relative freecam movement.
+    -- W/S follow the FULL LookVector, so looking up/down makes the drone
+    -- climb/dive naturally just like flying in Minecraft Creative.
+    -- A/D strafe relative to the camera. Q/E remain world-down/world-up.
     local move = Vector3.new(0, 0, 0)
 
     if UserInputService:IsKeyDown(Enum.KeyCode.W) then
-        move = move + Vector3.new(0, 0, -1)
+        move = move + rotation.LookVector
     end
     if UserInputService:IsKeyDown(Enum.KeyCode.S) then
-        move = move + Vector3.new(0, 0, 1)
+        move = move - rotation.LookVector
     end
     if UserInputService:IsKeyDown(Enum.KeyCode.A) then
-        move = move + Vector3.new(-1, 0, 0)
+        move = move - rotation.RightVector
     end
     if UserInputService:IsKeyDown(Enum.KeyCode.D) then
-        move = move + Vector3.new(1, 0, 0)
+        move = move + rotation.RightVector
     end
     if UserInputService:IsKeyDown(Enum.KeyCode.Q) then
-        move = move + Vector3.new(0, -1, 0)
+        move = move - Vector3.new(0, 1, 0)
     end
     if UserInputService:IsKeyDown(Enum.KeyCode.E) then
         move = move + Vector3.new(0, 1, 0)
@@ -6044,8 +6053,12 @@ function ExtraFeatures.UpdateDroneStrike(dt)
 
     local position = state.CFrame.Position
     if move.Magnitude > 0 then
-        local worldMove = rotation:VectorToWorldSpace(move.Unit)
-        position = position + worldMove * state.Speed * (tonumber(dt) or 0)
+        -- Normalize combined directions so diagonal flight is not faster.
+        position =
+            position
+            + move.Unit
+            * state.Speed
+            * (tonumber(dt) or 0)
     end
 
     state.CFrame = CFrame.new(position) * rotation
@@ -6070,6 +6083,29 @@ function ExtraFeatures.UpdateDroneStrike(dt)
                 or "Target: None"
         end
     end
+end
+
+function ExtraFeatures.SyncDroneFromCamera()
+    local state = ExtraFeatures.Function1.DroneStrike
+
+    if not state.Active then
+        return
+    end
+
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    -- Other systems (especially the existing AIM engine) are allowed to
+    -- modify the Drone camera.  Adopt that final camera CFrame back into
+    -- Drone state so the next freecam frame continues from the new view
+    -- instead of snapping back to the previous yaw/pitch.
+    state.CFrame = camera.CFrame
+
+    local pitch, yaw = camera.CFrame:ToOrientation()
+    state.Pitch = math.clamp(pitch, -1.45, 1.45)
+    state.Yaw = yaw
 end
 
 function ExtraFeatures.UpdateMagicSilent(dt)
@@ -6178,7 +6214,7 @@ UIRefs.DroneTargetLabel = UI:CreateLabel(
 )
 UI:CreateLabel(
     UIRefs.Function1DroneSection,
-    "W/A/S/D/Q/E move the safe freecam. Target tracking is visual only."
+    "W/A/S/D/Q/E move the freecam. Existing AIM/ESP/game input remain active while Drone is ON."
 )
 
 UIRefs.Function1MagicSection = UI:CreateSection(
@@ -11236,9 +11272,18 @@ RunService:BindToRenderStep(
         pcall(function()
             ExtraFeatures.UpdateAimSilent()
         end)
-        if not ExtraFeatures.Function1.DroneStrike.Active then
-            UpdateAim()
+        -- AIM remains functional while Drone Strike is active.
+        -- UpdateAim() operates on CurrentCamera as usual; immediately after,
+        -- Drone adopts the resulting CFrame so the next freecam frame keeps
+        -- the AIM-adjusted direction instead of snapping back.
+        UpdateAim()
+
+        if ExtraFeatures.Function1.DroneStrike.Active then
+            pcall(function()
+                ExtraFeatures.SyncDroneFromCamera()
+            end)
         end
+
         UpdateFOVCircle()
 
         -- Run after normal camera/Shift-Lock updates so an open menu
