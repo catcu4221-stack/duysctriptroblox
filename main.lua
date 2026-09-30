@@ -37,9 +37,10 @@ end)
 
 -- Dọn dẹp GUI cũ nếu đã tồn tại để tránh lặp GUI (Cleanup)
 local GUI_NAME = "HoodRivals_GUI_Framework"
-if TargetParent:FindFirstChild(GUI_NAME) then
-    TargetParent[GUI_NAME]:Destroy()
-end
+pcall(function()
+    local old = TargetParent:FindFirstChild(GUI_NAME)
+    if old then old:Destroy() end
+end)
 
 -- Remove highlight objects left by previous reference versions.
 pcall(function()
@@ -79,15 +80,35 @@ local Config = {
     BackgroundTransparency = 0.15,
 
     -- Color Palette
-    DarkBg = Color3.fromRGB(15, 15, 18),
-    SidebarBg = Color3.fromRGB(20, 20, 24),
-    CardBg = Color3.fromRGB(26, 26, 32),
-    AccentColor = Color3.fromRGB(0, 140, 255),
-    TextColor = Color3.fromRGB(240, 240, 245),
-    SubTextColor = Color3.fromRGB(160, 160, 170),
-    BorderColor = Color3.fromRGB(45, 45, 55),
+    DarkBg = Color3.fromRGB(11, 16, 28),
+    SidebarBg = Color3.fromRGB(14, 20, 34),
+    CardBg = Color3.fromRGB(22, 30, 47),
+    AccentColor = Color3.fromRGB(75, 190, 255),
+    TextColor = Color3.fromRGB(237, 244, 255),
+    SubTextColor = Color3.fromRGB(143, 163, 190),
+    BorderColor = Color3.fromRGB(44, 62, 87),
+
+    -- Interface preferences are separate from gameplay configuration.
+    Interface = {
+        Language = "EN",
+        ReducedMotion = false,
+        ClickEffects = true,
+        SoundEffects = true,
+        SoundVolume = 0.45,
+        RememberLayout = true,
+        CompactSidebar = false,
+        Favorites = {},
+        CollapsedSections = {},
+        Window = {Width = 720, Height = 520},
+        LastPage = "ESP"
+    },
 
     StartPage = "ESP",
+    AimPriority = "Crosshair",
+    Classification = {Mode = "Auto", Attribute = "TeamId"},
+    WeaponTuning = {InfiniteAmmo = false, SkipReload = false, RecoilEnabled = false,
+        RecoilScale = 0, SpreadEnabled = false, SpreadScale = 0},
+    Proximity = {Enabled = false, Radius = 35, IncludeNPC = false},
 
     -- OTHER / SETTINGS
     ThirdPersonLock = false,
@@ -188,7 +209,28 @@ local SetMenuState
 local UIRefs = {
     Toggles = {},
     Sliders = {},
-    Textboxes = {}
+    Textboxes = {},
+    Experience = {
+        Controls = {},
+        ByFrame = {},
+        Sections = {},
+        SectionByFrame = {},
+        Pages = {},
+        Query = "",
+        FavoritesOnly = false,
+        History = {},
+        Errors = {},
+        TweenSlots = setmetatable({}, {__mode = "k"}),
+        DragResetters = {},
+        OverlayOpen = false,
+        Ready = false,
+        RenderRunning = false,
+        Destroyed = false,
+        StatusAccumulator = 0,
+        HighlightWasEnabled = false,
+        ClosedSnapshot = nil,
+        ProfileAction = nil
+    }
 }
 
 -- NPC integration namespace.
@@ -222,7 +264,15 @@ pcall(function()
     ScreenGui.ScreenInsets = Enum.ScreenInsets.None
 end)
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-ScreenGui.Parent = TargetParent
+do
+    local ok = pcall(function() ScreenGui.Parent = TargetParent end)
+    if not ok then
+        TargetParent = LocalPlayer:WaitForChild("PlayerGui")
+        local old = TargetParent:FindFirstChild(GUI_NAME)
+        if old then old:Destroy() end
+        ScreenGui.Parent = TargetParent
+    end
+end
 
 local UIScaleObj = Instance.new("UIScale")
 UIScaleObj.Scale = Config.UIScale
@@ -290,99 +340,97 @@ end
 -- ==========================================
 local function MakeDraggable(guiObject, dragHandle, cleanupOnDestroy)
     dragHandle = dragHandle or guiObject
-    cleanupOnDestroy = cleanupOnDestroy == true
-
-    local dragging = false
-    local dragInput, dragStart, startPos
+    local dragging, activeInput, endedConnection = false, nil, nil
+    local dragStart, startPos
     local wasDragged = false
+    local owned = {}
 
-    local conn1 = dragHandle.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = guiObject.Position
-            wasDragged = false
-
-            local connEnded
-            connEnded = input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                    connEnded:Disconnect()
-                end
-            end)
-        end
-    end)
-
-    local conn2 = dragHandle.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            dragInput = input
-        end
-    end)
-
-    local conn3 = UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging then
-            local delta = input.Position - dragStart
-            if delta.Magnitude > 5 then
-                wasDragged = true
-            end
-            guiObject.Position = UDim2.new(
-                startPos.X.Scale, 
-                startPos.X.Offset + delta.X, 
-                startPos.Y.Scale, 
-                startPos.Y.Offset + delta.Y
-            )
-        end
-    end)
-
-    AddConnection(conn1)
-    AddConnection(conn2)
-    AddConnection(conn3)
-
-    -- Optional per-object cleanup used by transient floating controls.
-    -- Existing drag behavior is unchanged for all existing callers.
-    if cleanupOnDestroy then
-        local cleanupConn
-        cleanupConn = guiObject.AncestryChanged:Connect(
-            function(_, parent)
-                if parent == nil then
-                    pcall(function() conn1:Disconnect() end)
-                    pcall(function() conn2:Disconnect() end)
-                    pcall(function() conn3:Disconnect() end)
-                    pcall(function() cleanupConn:Disconnect() end)
-                end
-            end
-        )
-
-        AddConnection(cleanupConn)
+    local function stop()
+        dragging = false
+        activeInput = nil
+        if endedConnection then endedConnection:Disconnect(); endedConnection = nil end
+        if UIRefs.Experience.ClampFrame then UIRefs.Experience.ClampFrame(guiObject) end
     end
 
+    local function own(connection)
+        table.insert(owned, connection)
+        if not cleanupOnDestroy then AddConnection(connection) end
+        return connection
+    end
+
+    own(dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if UIRefs.Experience.OverlayOpen then return end
+        if dragging then return end
+        activeInput, dragging = input, true
+        dragStart, startPos, wasDragged = input.Position, guiObject.Position, false
+        endedConnection = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then stop() end
+        end)
+    end))
+
+    own(UserInputService.InputChanged:Connect(function(input)
+        if not dragging or not guiObject.Parent then return end
+        if input ~= activeInput and not (
+            activeInput and activeInput.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement
+        ) then return end
+        local delta = input.Position - dragStart
+        if delta.Magnitude > 5 then wasDragged = true end
+        local scale = math.max(UIScaleObj.Scale, 0.01)
+        local parent = guiObject.Parent
+        while parent and parent ~= ScreenGui do
+            for _, child in ipairs(parent:GetChildren()) do
+                if child:IsA("UIScale") then scale = scale * math.max(child.Scale, 0.01) end
+            end
+            parent = parent.Parent
+        end
+        guiObject.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X / scale,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y / scale)
+        if UIRefs.Experience.ClampFrame then UIRefs.Experience.ClampFrame(guiObject) end
+    end))
+
+    own(UserInputService.InputEnded:Connect(function(input)
+        if input == activeInput then stop() end
+    end))
+
+    if cleanupOnDestroy then
+        local cleanup
+        cleanup = guiObject.AncestryChanged:Connect(function(_, parent)
+            if parent ~= nil then return end
+            stop()
+            for _, connection in ipairs(owned) do connection:Disconnect() end
+            cleanup:Disconnect()
+        end)
+    else
+        table.insert(UIRefs.Experience.DragResetters, stop)
+    end
     return function() return wasDragged end
 end
 
--- Auto Update Canvas Size cho ScrollingFrame
-local function AutoCanvasSize(scrollingFrame, uiListLayout)
-    local function update()
-        scrollingFrame.CanvasSize = UDim2.new(0, 0, 0, uiListLayout.AbsoluteContentSize.Y + 15)
-    end
-    uiListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(update)
-    update()
+local function AutoCanvasSize(scrollingFrame, _uiListLayout)
+    scrollingFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scrollingFrame.CanvasSize = UDim2.new()
 end
+
 
 -- ==========================================
 -- 5. MAIN WINDOW BUILD
 -- ==========================================
 local MainWindow = Instance.new("Frame")
 MainWindow.Name = "MainWindow"
-MainWindow.Size = UDim2.new(0, 560, 0, 390)
-MainWindow.Position = UDim2.new(0.5, -280, 0.5, -195)
+MainWindow.Size = UDim2.fromOffset(720, 520)
+MainWindow.Position = UDim2.new(0.5, -360, 0.5, -260)
 MainWindow.BackgroundColor3 = Config.DarkBg
 MainWindow.BackgroundTransparency = Config.BackgroundTransparency
 MainWindow.BorderSizePixel = 0
 MainWindow.ClipsDescendants = true
+MainWindow.ZIndex = 60
 MainWindow.Parent = ScreenGui
 
 local MainCorner = Instance.new("UICorner")
-MainCorner.CornerRadius = UDim.new(0, 8)
+MainCorner.CornerRadius = UDim.new(0, 12)
 MainCorner.Parent = MainWindow
 
 local MainStroke = Instance.new("UIStroke")
@@ -537,12 +585,17 @@ SidebarDivider.Parent = Sidebar
 
 -- Khung riêng cho các TAB.
 -- Tách khỏi SidebarList để Divider/Author không chiếm chỗ của tab buttons.
-local TabContainer = Instance.new("Frame")
+local TabContainer = Instance.new("ScrollingFrame")
 TabContainer.Name = "TabContainer"
 TabContainer.Size = UDim2.new(1, -16, 1, -58)
 TabContainer.Position = UDim2.new(0, 8, 0, 10)
 TabContainer.BackgroundTransparency = 1
 TabContainer.BorderSizePixel = 0
+TabContainer.ScrollBarThickness = 2
+TabContainer.ScrollBarImageColor3 = Config.BorderColor
+TabContainer.ScrollingDirection = Enum.ScrollingDirection.Y
+TabContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+TabContainer.CanvasSize = UDim2.new()
 TabContainer.Parent = Sidebar
 
 local SidebarList = Instance.new("UIListLayout")
@@ -617,6 +670,8 @@ local isFloatDragged = MakeDraggable(FloatingBtn, FloatingBtn)
 -- =========================================================
 local OtherSystem = {
     XRayCache = {},
+    XRayActive = false,
+    ActiveFireTouches = {},
     ServerActionBusy = false,
     MenuMouseState = nil,
     KeybindListening = false,
@@ -795,6 +850,138 @@ local ExtraFeatures = {
 -- pipeline. No second PageManager, toggle engine, slider engine or ScreenGui.
 -- =========================================================
 
+-- Shared configuration and classification helpers; no new render loops.
+ExtraFeatures.V8 = {
+    Version = 8, OwnerUserId = LocalPlayer.UserId, CustomCharacters = {},
+    Registry = setmetatable({}, {__mode = "k"}), TranslationGuard = false,
+    InterfaceRevision = 0, ProfilesRevision = 0, SettingsRevision = 0,
+    RequestSerial = 0, ServerReady = false, ServerStatus = "Not connected",
+    WeaponStatus = "Controller not connected", WeaponAdapters = {},
+    ScanAccumulator = 0, ProfileAccumulator = 0, JoinedAt = os.clock(),
+    FavoriteChordLatched = false, Destroyed = false, Restoring = false
+}
+
+function ExtraFeatures.V8.Normalize(text)
+    text = string.lower(tostring(text or ""))
+    for _, group in ipairs({{"a", "àáạảãâầấậẩẫăằắặẳẵÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴ"},
+        {"e", "èéẹẻẽêềếệểễÈÉẸẺẼÊỀẾỆỂỄ"}, {"i", "ìíịỉĩÌÍỊỈĨ"},
+        {"o", "òóọỏõôồốộổỗơờớợởỡÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠ"},
+        {"u", "ùúụủũưừứựửữÙÚỤỦŨƯỪỨỰỬỮ"}, {"y", "ỳýỵỷỹỲÝỴỶỸ"}, {"d", "đĐ"}}) do
+        for character in string.gmatch(group[2], "[\1-\127\194-\244][\128-\191]*") do
+            text = string.gsub(text, character, group[1])
+        end
+    end
+    return text
+end
+
+function ExtraFeatures.V8.TeamValue(value)
+    if typeof(value) == "Instance" and value:IsA("Team") then value = value.Name end
+    if type(value) ~= "string" and type(value) ~= "number" then return nil end
+    local token = string.lower(tostring(value):match("^%s*(.-)%s*$"))
+    if token == "" or token == "0" or token == "none" or token == "neutral"
+        or token == "unassigned" or token == "spectator" or token == "spectators"
+        or token == "lobby" or token == "default" or token == "players" or token == "player" then return nil end
+    return token
+end
+
+function ExtraFeatures.V8.ResolvePlayerModel(model)
+    if not model or not model:IsA("Model") then return nil end
+    local owner = Players:GetPlayerFromCharacter(model)
+    if owner then return owner end
+    local kind = string.lower(tostring(model:GetAttribute("EntityType") or model:GetAttribute("CharacterType") or ""))
+    if kind == "npc" or kind == "dummy" or model:GetAttribute("IsNPC") == true then return nil end
+    local id = model:GetAttribute("PlayerUserId") or model:GetAttribute("PlayerId")
+    if id == nil and (kind == "player" or model:GetAttribute("IsPlayer") == true) then id = model:GetAttribute("UserId") end
+    id = tonumber(id)
+    if not id or id ~= id then return nil end
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.UserId == id then
+            ExtraFeatures.V8.CustomCharacters[player] = model
+            return player
+        end
+    end
+    return nil
+end
+
+function ExtraFeatures.V8.Character(player)
+    local native = player.Character
+    if native and native.Parent and native:IsDescendantOf(Workspace) then return native end
+    local custom = ExtraFeatures.V8.CustomCharacters[player]
+    if custom and custom.Parent and custom:IsDescendantOf(Workspace) then return custom end
+    ExtraFeatures.V8.CustomCharacters[player] = nil
+    return native
+end
+
+function ExtraFeatures.V8.TeamToken(player)
+    if not NPCSystem.IsPlayer(player) then return nil, nil end
+    local mode = Config.Classification.Mode
+    if mode == "FFA" then return nil, nil end
+    if type(ExtraFeatures.V8.TeamResolver) == "function" then
+        local ok, token = pcall(ExtraFeatures.V8.TeamResolver, player, ExtraFeatures.V8.Character(player))
+        token = ok and ExtraFeatures.V8.TeamValue(token) or nil
+        if token then return "ADAPTER", token end
+    end
+    if mode ~= "RobloxTeams" then
+        local names = {Config.Classification.Attribute, "CombatTeamId", "CombatTeam", "TeamId", "TeamID",
+            "FactionId", "Faction", "TeamName", "Team", "Side", "SquadId"}
+        local character = ExtraFeatures.V8.Character(player)
+        for _, key in ipairs(names) do
+            if type(key) == "string" and key ~= "" then
+                local value = player:GetAttribute(key)
+                if value == nil and character then value = character:GetAttribute(key) end
+                if value == nil then
+                    for _, parent in pairs({Player = player, Character = character}) do
+                        local folder = parent:FindFirstChild("leaderstats") or parent:FindFirstChild("Stats")
+                        local object = parent:FindFirstChild(key) or (folder and folder:FindFirstChild(key))
+                        if object and (object:IsA("StringValue") or object:IsA("IntValue") or object:IsA("NumberValue")
+                            or object:IsA("ObjectValue")) then value = object.Value; break end
+                    end
+                end
+                local token = ExtraFeatures.V8.TeamValue(value)
+                if token then return "CUSTOM:" .. string.lower(key), token end
+            end
+        end
+    end
+    if mode ~= "Custom" and player.Neutral ~= true then
+        local team = player.Team
+        local token = team and ExtraFeatures.V8.TeamValue(team.Name)
+        if token then return "ROBLOX", token end
+        local ok, teams = pcall(function() return game:GetService("Teams"):GetTeams() end)
+        if ok and player.TeamColor ~= nil then
+            for _, candidate in ipairs(teams) do
+                if candidate.TeamColor == player.TeamColor then
+                    token = ExtraFeatures.V8.TeamValue(candidate.Name)
+                    if token then return "ROBLOX", token end
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+function ExtraFeatures.V8.AimMetric(target, screenDistance, part)
+    local mode = Config.AimPriority
+    if mode == "Nearest" then
+        local character = ExtraFeatures.V8.Character(LocalPlayer)
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        return root and (part.Position - root.Position).Magnitude or math.huge
+    elseif mode == "LowestHealth" then
+        local character = NPCSystem.GetCharacter(target)
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        return humanoid and humanoid.Health or math.huge
+    elseif mode == "PlayersFirst" then return NPCSystem.IsPlayer(target) and 0 or 1
+    elseif mode == "NPCFirst" then return NPCSystem.IsNPCModel(target) and 0 or 1 end
+    return screenDistance
+end
+
+function ExtraFeatures.V8.BetterAim(target, screenDistance, part, bestTarget, bestPart, bestScreenDistance)
+    if Config.AimPriority == "Crosshair" then return screenDistance < bestScreenDistance end
+    local value = ExtraFeatures.V8.AimMetric(target, screenDistance, part)
+    local best = bestTarget and bestPart and ExtraFeatures.V8.AimMetric(bestTarget, bestScreenDistance, bestPart) or math.huge
+    return value < best or (value == best and screenDistance < bestScreenDistance)
+end
+
+
 function ExtraFeatures.EnsureUIEffectOverlay()
     local effects = ExtraFeatures.UIEffects
     local state = effects.ToggleFX
@@ -836,6 +1023,7 @@ function ExtraFeatures.EnsureToggleFXSound()
 end
 
 function ExtraFeatures.PlayToggleFXSound()
+    if not Config.Interface.SoundEffects then return end
     local state = ExtraFeatures.UIEffects.ToggleFX
     local soundId = tostring(state.SoundId or "")
 
@@ -849,6 +1037,7 @@ function ExtraFeatures.PlayToggleFXSound()
     pcall(function()
         local sound = ExtraFeatures.EnsureToggleFXSound()
         sound:Stop()
+        sound.Volume = Config.Interface.SoundVolume
         sound.SoundId = soundId
         sound.TimePosition = 0
         sound:Play()
@@ -1176,6 +1365,11 @@ function ExtraFeatures.ReactVirtualPet()
 end
 
 function ExtraFeatures.OnUserToggleClicked(guiObject)
+    if not Config.Interface.ClickEffects then return end
+    if Config.Interface.ReducedMotion then
+        ExtraFeatures.PlayToggleFXSound()
+        return
+    end
     pcall(function()
         ExtraFeatures.PlayToggleFXSound()
     end)
@@ -1193,7 +1387,7 @@ function ExtraFeatures.OnUserToggleClicked(guiObject)
     end)
 end
 
-function ExtraFeatures.OnTabChanged(previousPage, pageName)
+function ExtraFeatures.OnTabChangedLegacy(previousPage, pageName)
     if previousPage == pageName then
         return
     end
@@ -1935,6 +2129,7 @@ end
 
 function OtherSystem.EnableXRay()
     Config.XRayEnabled = true
+    OtherSystem.XRayActive = true
 
     for _, instance in ipairs(Workspace:GetDescendants()) do
         if instance:IsA("BasePart") then
@@ -1945,6 +2140,7 @@ end
 
 function OtherSystem.DisableXRay()
     Config.XRayEnabled = false
+    OtherSystem.XRayActive = false
 
     for part, originalTransparency in pairs(OtherSystem.XRayCache) do
         if part and part.Parent then
@@ -1979,13 +2175,14 @@ function OtherSystem.SetXRay(enabled)
     enabled = enabled == true
 
     if enabled then
-        if not Config.XRayEnabled then
+        if not OtherSystem.XRayActive then
             OtherSystem.EnableXRay()
         else
+            Config.XRayEnabled = true
             OtherSystem.UpdateXRayTransparency()
         end
     else
-        if Config.XRayEnabled then
+        if OtherSystem.XRayActive or next(OtherSystem.XRayCache) ~= nil then
             OtherSystem.DisableXRay()
         else
             Config.XRayEnabled = false
@@ -2221,6 +2418,10 @@ function OtherSystem.HandleKeybindInput(input)
     end
 
     local mode = OtherSystem.KeybindCaptureMode or "MenuToggle"
+    if input.KeyCode ~= Enum.KeyCode.Escape and not ExtraFeatures.ValidateShortcut(input.KeyCode, mode) then
+        OtherSystem.ConsumeNextToggleInput = true
+        return true
+    end
     local box = OtherSystem.KeybindBox
 
     if input.KeyCode == Enum.KeyCode.Escape then
@@ -2733,6 +2934,12 @@ function PageManager:AddPage(pageName, options)
 end
 
 function PageManager:ShowPage(pageName, suppressEffects)
+    if not GUIState.Pages[pageName] then return false end
+    if UIRefs.Experience.OverlayOpen then return false end
+    if ExtraFeatures.NotificationView then
+        ExtraFeatures.NotificationView.Visible = false
+    end
+    ExtraFeatures.NotificationPreviousPage = nil
     local previousPage = GUIState.ActivePage
 
     for name, page in pairs(GUIState.Pages) do
@@ -2744,6 +2951,7 @@ function PageManager:ShowPage(pageName, suppressEffects)
                 btn.TextColor3 = Color3.fromRGB(255, 255, 255)
             end
             GUIState.ActivePage = name
+            Config.Interface.LastPage = name
         else
             page.Visible = false
             if btn then
@@ -2767,97 +2975,76 @@ function PageManager:ShowPage(pageName, suppressEffects)
 end
 
 function ExtraFeatures.BuildNotificationView()
-    if ExtraFeatures.NotificationView
-        and ExtraFeatures.NotificationView.Parent
-    then
+    if ExtraFeatures.NotificationView and ExtraFeatures.NotificationView.Parent then
         return ExtraFeatures.NotificationView
     end
-
     local view = Instance.new("Frame")
     view.Name = "NotificationInternalView"
-    view.Size = UDim2.new(1, 0, 1, 0)
+    view.Size = UDim2.fromScale(1, 1)
     view.BackgroundTransparency = 1
     view.Visible = false
     view.Parent = ContentArea
-
-    local backButton = Instance.new("TextButton")
-    backButton.Name = "Back"
-    backButton.Size = UDim2.new(0, 38, 0, 28)
-    backButton.Position = UDim2.new(0, 12, 0, 10)
-    backButton.Text = "←"
-    backButton.TextColor3 = Config.TextColor
-    backButton.TextSize = 18
-    backButton.Font = Enum.Font.GothamBold
-    backButton.BackgroundColor3 = Config.CardBg
-    backButton.AutoButtonColor = false
-    backButton.Parent = view
-
-    local backCorner = Instance.new("UICorner")
-    backCorner.CornerRadius = UDim.new(0, 6)
-    backCorner.Parent = backButton
-
-    local backStroke = Instance.new("UIStroke")
-    backStroke.Color = Config.BorderColor
-    backStroke.Thickness = 1
-    backStroke.Parent = backButton
-
-    local messageLabel = Instance.new("TextLabel")
-    messageLabel.Name = "NotificationText"
-    messageLabel.Size = UDim2.new(1, -24, 1, -58)
-    messageLabel.Position = UDim2.new(0, 12, 0, 48)
-    messageLabel.BackgroundColor3 = Config.CardBg
-    messageLabel.BorderSizePixel = 0
-    messageLabel.Text = ExtraFeatures.NotificationText
-    messageLabel.TextColor3 = Config.TextColor
-    messageLabel.TextSize = 13
-    messageLabel.Font = Enum.Font.GothamMedium
-    messageLabel.TextWrapped = true
-    messageLabel.TextXAlignment = Enum.TextXAlignment.Left
-    messageLabel.TextYAlignment = Enum.TextYAlignment.Top
-    messageLabel.Parent = view
-
-    local messageCorner = Instance.new("UICorner")
-    messageCorner.CornerRadius = UDim.new(0, 6)
-    messageCorner.Parent = messageLabel
-
-    local messagePadding = Instance.new("UIPadding")
-    messagePadding.PaddingTop = UDim.new(0, 12)
-    messagePadding.PaddingLeft = UDim.new(0, 12)
-    messagePadding.PaddingRight = UDim.new(0, 12)
-    messagePadding.PaddingBottom = UDim.new(0, 12)
-    messagePadding.Parent = messageLabel
-
-    AddConnection(backButton.MouseButton1Click:Connect(function()
-        view.Visible = false
-        local previousPage = ExtraFeatures.NotificationPreviousPage
-        ExtraFeatures.NotificationPreviousPage = nil
-
-        if previousPage and GUIState.Pages[previousPage] then
-            PageManager:ShowPage(previousPage, true)
-        elseif Config.StartPage and GUIState.Pages[Config.StartPage] then
-            PageManager:ShowPage(Config.StartPage, true)
-        end
+    local back = Instance.new("TextButton")
+    back.Name = "Back"; back.Size = UDim2.fromOffset(36, 32)
+    back.Position = UDim2.fromOffset(12, 10); back.Text = "←"
+    back.TextColor3 = Config.TextColor; back.TextSize = 18; back.Font = Enum.Font.GothamBold
+    back.BackgroundColor3 = Config.CardBg; back.AutoButtonColor = false; back.Parent = view
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 7); corner.Parent = back
+    local heading = Instance.new("TextLabel")
+    heading.Name = "Heading"; heading.Position = UDim2.fromOffset(58, 10)
+    heading.Size = UDim2.new(1, -70, 0, 32); heading.BackgroundTransparency = 1
+    heading.Text = "NOTIFICATIONS"; heading.TextSize = 14; heading.Font = Enum.Font.GothamBold
+    heading.TextColor3 = Config.TextColor; heading.TextXAlignment = Enum.TextXAlignment.Left; heading.Parent = view
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Name = "MessageScroll"; scroll.Position = UDim2.fromOffset(12, 52)
+    scroll.Size = UDim2.new(1, -24, 1, -64); scroll.BackgroundColor3 = Config.CardBg
+    scroll.BorderSizePixel = 0; scroll.ScrollBarThickness = 3
+    scroll.ScrollBarImageColor3 = Config.SubTextColor; scroll.CanvasSize = UDim2.new()
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; scroll.Parent = view
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop, padding.PaddingBottom = UDim.new(0, 12), UDim.new(0, 12)
+    padding.PaddingLeft, padding.PaddingRight = UDim.new(0, 12), UDim.new(0, 12); padding.Parent = scroll
+    local message = Instance.new("TextLabel")
+    message.Name = "NotificationText"; message.Size = UDim2.new(1, -6, 0, 0)
+    message.AutomaticSize = Enum.AutomaticSize.Y; message.BackgroundTransparency = 1
+    message.Text = ""; message.TextColor3 = Config.TextColor; message.Font = Enum.Font.GothamMedium
+    message.TextSize = 13; message.TextWrapped = true
+    message.TextXAlignment = Enum.TextXAlignment.Left; message.TextYAlignment = Enum.TextYAlignment.Top
+    message.Parent = scroll
+    UIRefs.Experience.NotificationLabel = message
+    AddConnection(back.MouseButton1Click:Connect(function()
+        local previous = ExtraFeatures.NotificationPreviousPage or Config.StartPage
+        PageManager:ShowPage(previous, true)
     end))
-
     ExtraFeatures.NotificationView = view
     return view
 end
 
-function ExtraFeatures.OpenNotificationView()
+function ExtraFeatures.OpenNotificationView(override, title)
+    if UIRefs.Experience.OverlayOpen then return end
     local view = ExtraFeatures.BuildNotificationView()
-    ExtraFeatures.NotificationPreviousPage = GUIState.ActivePage
-
-    for _, page in pairs(GUIState.Pages) do
-        page.Visible = false
+    if not view.Visible then ExtraFeatures.NotificationPreviousPage = GUIState.ActivePage end
+    for _, page in pairs(GUIState.Pages) do page.Visible = false end
+    local text = override
+    if text == nil then
+        local lines = {tostring(ExtraFeatures.NotificationText or "")}
+        local history = UIRefs.Experience.History
+        if #history > 0 then
+            table.insert(lines, "\nRECENT ACTIVITY")
+            for index = #history, 1, -1 do
+                local entry = history[index]
+                table.insert(lines, os.date("%H:%M:%S", entry.Time) .. "  " .. entry.Text)
+            end
+        end
+        text = table.concat(lines, "\n\n")
     end
-
-    local messageLabel = view:FindFirstChild("NotificationText")
-    if messageLabel then
-        messageLabel.Text = ExtraFeatures.NotificationText
-    end
-
+    UIRefs.Experience.NotificationLabel.Text = tostring(text)
+    view.Heading.Text = title or "NOTIFICATIONS"
+    view.MessageScroll.CanvasPosition = Vector2.zero
     view.Visible = true
 end
+
+
 
 AddConnection(UIRefs.NotificationButton.MouseButton1Click:Connect(function()
     ExtraFeatures.OpenNotificationView()
@@ -2867,6 +3054,170 @@ end))
 -- 7. COMPONENT ENGINE (MODULAR BUILDER)
 -- ==========================================
 local UI = {}
+
+function UI:ConnectOwned(object, signal, callback)
+    local connection = signal:Connect(callback)
+    object.Destroying:Connect(function() connection:Disconnect() end)
+    return connection
+end
+
+-- Define this before startup calls that can yield (for example game metadata).
+function ExtraFeatures.ValidateShortcut(key, owner)
+    local message
+    if key == Enum.KeyCode.Unknown or key == Enum.KeyCode.F4 then
+        message = "F4 is reserved for unloading the framework."
+    else
+        local keys = {MenuToggle = Config.ToggleKey, DroneStrike = Config.DroneStrikeKey,
+            TelekillSwitch = Config.TelekillSwitchKey, HoldToSpam = Config.HoldToSpamKey}
+        for name, assigned in pairs(keys) do
+            if name ~= owner and key == assigned then message = "Key already assigned to " .. name .. "."; break end
+        end
+    end
+    if message then
+        if ExtraFeatures.Notify then ExtraFeatures.Notify(message)
+        elseif ExtraFeatures.SetStatus then ExtraFeatures.SetStatus(message) end
+        return false
+    end
+    return true
+end
+
+function UI:Invoke(callback, context, ...)
+    if type(callback) ~= "function" then return true end
+    local ok, result = pcall(callback, ...)
+    if not ok then
+        local message = tostring(context or "UI") .. ": " .. tostring(result)
+        table.insert(UIRefs.Experience.Errors, {Time = os.time(), Text = message})
+        if #UIRefs.Experience.Errors > 40 then table.remove(UIRefs.Experience.Errors, 1) end
+        warn("[Hood Rivals UI] " .. message)
+        if ExtraFeatures.Notify then ExtraFeatures.Notify("Action failed. See diagnostics.", "error") end
+    end
+    return ok, result
+end
+
+function UI:Tween(object, slot, duration, goals)
+    if not object or not object.Parent then return end
+    local slots = UIRefs.Experience.TweenSlots[object]
+    if not slots then slots = {}; UIRefs.Experience.TweenSlots[object] = slots end
+    if slots[slot] then slots[slot]:Cancel(); slots[slot] = nil end
+    if Config.Interface.ReducedMotion then
+        for key, value in pairs(goals) do object[key] = value end
+        return
+    end
+    local tween = TweenService:Create(object, TweenInfo.new(duration, Enum.EasingStyle.Quint,
+        Enum.EasingDirection.Out), goals)
+    slots[slot] = tween
+    tween:Play()
+end
+
+function UI:RegisterControl(frame, text, kind, api, options)
+    local parent, section, page = frame.Parent, nil, nil
+    while parent and parent ~= ContentArea do
+        if not section then section = UIRefs.Experience.SectionByFrame[parent] end
+        for name, instance in pairs(GUIState.Pages) do
+            if parent == instance then page = name; break end
+        end
+        parent = parent.Parent
+    end
+    if not page or not section then return nil end
+    -- Nested player/profile list items stay dynamic and are not search controls.
+    if frame.Parent ~= section.Frame then return nil end
+    local record = {Frame = frame, Text = tostring(text or ""), Kind = kind, API = api,
+        Options = options or {}, Section = section, Page = page}
+    record.Id = page .. "/" .. section.Title .. "/" .. kind .. "/" .. record.Text
+    record.Search = string.lower(page .. " " .. section.Title .. " " .. record.Text)
+    table.insert(UIRefs.Experience.Controls, record)
+    UIRefs.Experience.ByFrame[frame] = record
+    return record
+end
+
+function UI:ApplyFilter()
+    local state = UIRefs.Experience
+    local query = ExtraFeatures.V8.Normalize(state.Query or "")
+    local filtering = query ~= "" or state.FavoritesOnly
+    local counts = {}
+    for _, record in ipairs(state.Controls) do
+        if record.Frame.Parent then
+            local match = query == "" or string.find(record.SearchNormalized or ExtraFeatures.V8.Normalize(record.Search), query, 1, true) ~= nil
+            if state.FavoritesOnly and not Config.Interface.Favorites[record.Id] then match = false end
+            record.Matches = match
+            counts[record.Page] = (counts[record.Page] or 0) + (match and 1 or 0)
+            record.Frame.Visible = match
+            if record.Star then
+                record.Star.Text = Config.Interface.Favorites[record.Id] and "★" or "☆"
+                record.Star.TextColor3 = Config.Interface.Favorites[record.Id]
+                    and Color3.fromRGB(255, 206, 103) or Config.SubTextColor
+            end
+        end
+    end
+    -- Process nested sections before their parents, preserving user-opened panels.
+    for index = #state.Sections, 1, -1 do
+        local section = state.Sections[index]
+        if not section.Frame.Parent then continue end
+        local match = not filtering
+        if filtering then
+            for _, record in ipairs(state.Controls) do
+                if record.Matches and record.Frame:IsDescendantOf(section.Frame) then match = true; break end
+            end
+        end
+        if section.TopLevel then
+            section.Frame.Visible = match
+        elseif filtering then
+            if section.SearchRestore == nil then section.SearchRestore = section.Frame.Visible end
+            section.Frame.Visible = match
+        elseif section.SearchRestore ~= nil then
+            section.Frame.Visible = section.SearchRestore
+            section.SearchRestore = nil
+        end
+        local collapsed = Config.Interface.CollapsedSections[section.Id] == true and not filtering
+        if section.Header then section.Header.Text = (collapsed and "+  " or "−  ") .. section.Title end
+        for _, child in ipairs(section.Frame:GetChildren()) do
+            if child:IsA("GuiObject") and child ~= section.Header then
+                if collapsed then
+                    if section.Restore[child] == nil then section.Restore[child] = child.Visible end
+                    child.Visible = false
+                elseif section.Restore[child] ~= nil then
+                    child.Visible = section.Restore[child]
+                    section.Restore[child] = nil
+                    local record = state.ByFrame[child]
+                    if record then child.Visible = record.Matches end
+                end
+            end
+        end
+    end
+    state.Counts = counts
+    for page, record in pairs(state.Pages) do
+        if record.Empty then record.Empty.Visible = filtering and (counts[page] or 0) == 0 end
+    end
+    if state.SearchCount then
+        local total = 0
+        for _, value in pairs(counts) do total = total + value end
+        state.SearchCount.Text = filtering and (tostring(total) .. " results") or "ALL FEATURES"
+    end
+end
+
+function UI:AddFavorite(record, anchor)
+    if not record or record.Star then return end
+    local star = Instance.new("TextButton")
+    star.Name = "Favorite"
+    star.Text = "☆"
+    star.Font = Enum.Font.GothamBold
+    star.TextSize = 18
+    star.BackgroundTransparency = 1
+    star.AutoButtonColor = false
+    star.Size = UDim2.fromOffset(26, 28)
+    star.Position = anchor or UDim2.new(1, -82, 0, 0)
+    star.ZIndex = 5
+    star.Parent = record.Frame
+    record.Star = star
+    AddConnection(star.MouseButton1Click:Connect(function()
+        if UIRefs.Experience.OverlayOpen then return end
+        Config.Interface.Favorites[record.Id] = not Config.Interface.Favorites[record.Id] or nil
+        UI:ApplyFilter()
+        if ExtraFeatures.V8.SaveInterface then ExtraFeatures.V8.SaveInterface() end
+
+    end))
+end
+
 
 function UI:CreateSection(parent, titleText)
     local sectionFrame = Instance.new("Frame")
@@ -2899,9 +3250,13 @@ function UI:CreateSection(parent, titleText)
     sPadding.Parent = sectionFrame
 
     if titleText and titleText ~= "" then
-        local secTitle = Instance.new("TextLabel")
+        local secTitle = Instance.new("TextButton")
         secTitle.Size = UDim2.new(1, 0, 0, 18)
-        secTitle.Text = "-=" .. titleText .. "=-"
+        secTitle.Name = "SectionHeader"
+        secTitle.Text = titleText
+        secTitle.LayoutOrder = -1000
+        secTitle.TextXAlignment = Enum.TextXAlignment.Left
+        secTitle.AutoButtonColor = false
         secTitle.TextColor3 = Config.TextColor
         secTitle.Font = Enum.Font.GothamBold
         secTitle.TextSize = 12
@@ -2946,11 +3301,16 @@ function UI:CreateButton(parent, text, callback)
     bStroke.Thickness = 1
     bStroke.Parent = btn
 
-    btn.MouseButton1Click:Connect(function()
-        TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3 = Config.AccentColor}):Play()
-        task.wait(0.1)
-        TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3 = Config.DarkBg}):Play()
-        if callback then callback() end
+    local busy = false
+    UI:ConnectOwned(btn, btn.MouseButton1Click, function()
+        if busy or not btn.Parent then return end
+        busy = true
+        UI:Tween(btn, "Press", 0.12, {BackgroundColor3 = Config.AccentColor})
+        UI:Invoke(callback, "Button: " .. tostring(text))
+        if btn.Parent then
+            UI:Tween(btn, "Press", 0.18, {BackgroundColor3 = Config.DarkBg})
+        end
+        busy = false
     end)
 
     return btn
@@ -3074,7 +3434,7 @@ function UI:CreateToggle(parent, options)
             or UDim2.new(0, 3, 0.5, -9)
 
         local backgroundTweenInfo = TweenInfo.new(
-            0.24,
+            Config.Interface.ReducedMotion and 0 or 0.24,
             Enum.EasingStyle.Quint,
             Enum.EasingDirection.Out
         )
@@ -3083,7 +3443,7 @@ function UI:CreateToggle(parent, options)
 
         if userInitiated then
             indicatorTweenInfo = TweenInfo.new(
-                0.34,
+                Config.Interface.ReducedMotion and 0 or 0.34,
                 Enum.EasingStyle.Bounce,
                 Enum.EasingDirection.Out
             )
@@ -3103,7 +3463,7 @@ function UI:CreateToggle(parent, options)
             {Position = targetPos}
         ):Play()
 
-        if usePop then
+        if usePop and not Config.Interface.ReducedMotion then
             pop(userInitiated == true)
         end
 
@@ -3116,7 +3476,7 @@ function UI:CreateToggle(parent, options)
         end
 
         if invokeCallback ~= false then
-            callback(state)
+            UI:Invoke(callback, "Toggle: " .. text, state)
         end
     end
 
@@ -3132,6 +3492,10 @@ function UI:CreateToggle(parent, options)
     )
 
     return {
+        Frame = toggleFrame,
+        Label = label,
+        Switch = switch,
+        Default = default,
         Set = function(val, silent)
             if type(val) ~= "boolean" then
                 return
@@ -3292,6 +3656,16 @@ function UI:CreateSlider(parent, options)
     knobStroke.Parent = knob
 
     local dragging = false
+    local activeInput = nil
+    local hitArea = Instance.new("TextButton")
+    hitArea.Name = "SliderHitArea"
+    hitArea.Text = ""
+    hitArea.BackgroundTransparency = 1
+    hitArea.AutoButtonColor = false
+    hitArea.Size = UDim2.new(1, 12, 0, 24)
+    hitArea.Position = UDim2.new(0, -6, 1, -20)
+    hitArea.ZIndex = knob.ZIndex + 1
+    hitArea.Parent = sliderFrame
 
     local visualState = {
         Fill = fill,
@@ -3345,7 +3719,7 @@ function UI:CreateSlider(parent, options)
         valueBox.Text = FormatValue(currentValue)
         visualState.TargetPercentage = percentage
 
-        if immediate == true then
+        if immediate == true or Config.Interface.ReducedMotion then
             visualState.ActiveVisual = false
             ApplyVisualPercentage(percentage)
         else
@@ -3455,12 +3829,14 @@ function UI:CreateSlider(parent, options)
     end
 
     AddConnection(
-        track.InputBegan:Connect(function(input)
+        hitArea.InputBegan:Connect(function(input)
             if
                 input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch
             then
+                if dragging or UIRefs.Experience.OverlayOpen then return end
                 dragging = true
+                activeInput = input
                 updateFromSlider(input.Position)
             end
         end)
@@ -3470,6 +3846,7 @@ function UI:CreateSlider(parent, options)
         UserInputService.InputChanged:Connect(function(input)
             if
                 dragging
+                and (input == activeInput or (activeInput and activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement))
                 and (
                     input.UserInputType
                         == Enum.UserInputType.MouseMovement
@@ -3485,18 +3862,29 @@ function UI:CreateSlider(parent, options)
     AddConnection(
         UserInputService.InputEnded:Connect(function(input)
             if
-                input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch
+                input == activeInput
             then
                 dragging = false
+                activeInput = nil
             end
         end)
     )
 
+    table.insert(UIRefs.Experience.DragResetters, function()
+        dragging = false
+        activeInput = nil
+    end)
     updateVisuals(true)
 
     return {
         Frame = sliderFrame,
+        Label = label,
+        Value = valueBox,
+        HitArea = hitArea,
+        Default = currentValue,
+        OriginalDefault = default,
+        Min = min,
+        Max = max,
         Set = SetValue,
         Get = function()
             return currentValue
@@ -3543,17 +3931,173 @@ function UI:CreateTextbox(parent, options)
     bCorner.CornerRadius = UDim.new(0, 5)
     bCorner.Parent = box
 
-    box.FocusLost:Connect(function(enterPressed)
+    AddConnection(box.FocusLost:Connect(function(enterPressed)
         local num = tonumber(box.Text)
         if num then
             callback(num, enterPressed)
         else
             callback(box.Text, enterPressed)
         end
-    end)
+    end))
 
     return box
 end
+
+-- Decorate the existing component API without replacing its gameplay callbacks.
+UIRefs.Experience.BaseUI = {
+    Section = UI.CreateSection,
+    Toggle = UI.CreateToggle,
+    Slider = UI.CreateSlider,
+    Button = UI.CreateButton,
+    Label = UI.CreateLabel,
+    Textbox = UI.CreateTextbox
+}
+
+function UI:CreateSection(parent, titleText)
+    local frame = UIRefs.Experience.BaseUI.Section(self, parent, titleText or "")
+    local page = parent
+    while page.Parent and page.Parent ~= ContentArea do page = page.Parent end
+    local title = tostring(titleText or "")
+    local record = {Frame = frame, Title = title, Header = frame:FindFirstChild("SectionHeader"),
+        Id = page.Name .. "/" .. title, TopLevel = parent.Parent == ContentArea, Restore = {}}
+    UIRefs.Experience.SectionByFrame[frame] = record
+    table.insert(UIRefs.Experience.Sections, record)
+    frame:FindFirstChildOfClass("UICorner").CornerRadius = UDim.new(0, 9)
+    local padding = frame:FindFirstChildOfClass("UIPadding")
+    padding.PaddingTop, padding.PaddingBottom = UDim.new(0, 12), UDim.new(0, 12)
+    padding.PaddingLeft, padding.PaddingRight = UDim.new(0, 12), UDim.new(0, 12)
+    if record.Header then
+        record.Header.Size = UDim2.new(1, 0, 0, 25)
+        record.Header.TextSize = 13
+        record.Header.TextColor3 = Config.AccentColor
+        AddConnection(record.Header.MouseButton1Click:Connect(function()
+            if UIRefs.Experience.OverlayOpen then return end
+            Config.Interface.CollapsedSections[record.Id] = not Config.Interface.CollapsedSections[record.Id] or nil
+            UI:ApplyFilter()
+            if ExtraFeatures.V8.SaveInterface then ExtraFeatures.V8.SaveInterface() end
+        end))
+    end
+    return frame
+end
+
+function UI:CreateToggle(parent, options)
+    local api = UIRefs.Experience.BaseUI.Toggle(self, parent, options)
+    local frame, label = api.Frame, api.Label
+    local record = UI:RegisterControl(frame, (options or {}).Text, "Toggle", api, options)
+    if record then
+        frame.Size = UDim2.new(1, 0, 0, 46)
+        label.Size = UDim2.new(1, -94, 0, 23)
+        label.TextSize = 14
+        label.TextTruncate = Enum.TextTruncate.AtEnd
+        api.Switch.Position = UDim2.new(1, -46, 0, 2)
+        local hint = Instance.new("TextLabel")
+        hint.Name = "ControlHint"
+        hint.BackgroundTransparency = 1
+        hint.Size = UDim2.new(1, -4, 0, 17)
+        hint.Position = UDim2.fromOffset(0, 25)
+        hint.Text = ""
+        hint.TextColor3 = Config.SubTextColor
+        hint.Font = Enum.Font.GothamMedium
+        hint.TextSize = 11
+        hint.TextXAlignment = Enum.TextXAlignment.Left
+        hint.TextTruncate = Enum.TextTruncate.AtEnd
+        hint.Parent = frame
+        record.Hint = hint
+        local hit = Instance.new("TextButton")
+        hit.Name = "RowHitArea"
+        hit.BackgroundTransparency = 1
+        hit.Text = ""
+        hit.AutoButtonColor = false
+        hit.Size = UDim2.new(1, -94, 1, 0)
+        hit.ZIndex = 3
+        hit.Parent = frame
+        AddConnection(hit.MouseButton1Click:Connect(function()
+            if UIRefs.Experience.OverlayOpen then return end
+            api.Set(not api.Get())
+            ExtraFeatures.OnUserToggleClicked(api.Switch)
+        end))
+        UI:AddFavorite(record)
+    end
+    return api
+end
+
+function UI:CreateSlider(parent, options)
+    local api = UIRefs.Experience.BaseUI.Slider(self, parent, options)
+    local record = UI:RegisterControl(api.Frame, (options or {}).Text, "Slider", api, options)
+    if record then
+        api.Frame.Size = UDim2.new(1, 0, 0, 62)
+        api.Label.TextSize = 14
+        api.Label.Size = UDim2.new(1, -160, 0, 22)
+        api.Label.TextTruncate = Enum.TextTruncate.AtEnd
+        api.Value.Size = UDim2.fromOffset(70, 22)
+        api.Value.Position = UDim2.new(1, -150, 0, 0)
+        api.Value.TextSize = 13
+        local reset = Instance.new("TextButton")
+        reset.Name = "ResetValue"
+        reset.Text = "↺"
+        reset.TextSize = 18
+        reset.Font = Enum.Font.GothamBold
+        reset.TextColor3 = Config.SubTextColor
+        reset.BackgroundTransparency = 1
+        reset.AutoButtonColor = false
+        reset.Size = UDim2.fromOffset(28, 26)
+        reset.Position = UDim2.new(1, -58, 0, -2)
+        reset.Parent = api.Frame
+        AddConnection(reset.MouseButton1Click:Connect(function() api.Set(api.OriginalDefault) end))
+        local hint = Instance.new("TextLabel")
+        hint.Name = "ControlHint"
+        hint.Text = ""
+        hint.BackgroundTransparency = 1
+        hint.Size = UDim2.new(1, 0, 0, 17)
+        hint.Position = UDim2.fromOffset(0, 24)
+        hint.Font = Enum.Font.GothamMedium
+        hint.TextSize = 11
+        hint.TextColor3 = Config.SubTextColor
+        hint.TextXAlignment = Enum.TextXAlignment.Left
+        hint.TextTruncate = Enum.TextTruncate.AtEnd
+        hint.Parent = api.Frame
+        record.Hint = hint
+        UI:AddFavorite(record, UDim2.new(1, -28, 0, -2))
+    end
+    return api
+end
+
+function UI:CreateButton(parent, text, callback)
+    local button = UIRefs.Experience.BaseUI.Button(self, parent, text, callback)
+    local record = UI:RegisterControl(button, text, "Button", button)
+    if record then
+        button.Size = UDim2.new(1, 0, 0, 36)
+        button.TextSize = 13
+        button.TextTruncate = Enum.TextTruncate.AtEnd
+    end
+    UI:ConnectOwned(button, button.MouseEnter, function()
+        UI:Tween(button, "Hover", 0.14, {BackgroundColor3 = Color3.fromRGB(30, 45, 67)})
+    end)
+    UI:ConnectOwned(button, button.MouseLeave, function()
+        UI:Tween(button, "Hover", 0.14, {BackgroundColor3 = button:GetAttribute("Selected") and Config.AccentColor or Config.DarkBg})
+    end)
+    return button
+end
+
+function UI:CreateLabel(parent, text)
+    local label = UIRefs.Experience.BaseUI.Label(self, parent, text)
+    label.Size = UDim2.new(1, 0, 0, 0)
+    label.AutomaticSize = Enum.AutomaticSize.Y
+    label.TextSize = 12
+    return label
+end
+
+function UI:CreateTextbox(parent, options)
+    local box = UIRefs.Experience.BaseUI.Textbox(self, parent, options)
+    box.Size = UDim2.new(0.5, 0, 1, 0)
+    box.Position = UDim2.new(0.5, 0, 0, 0)
+    box.TextSize = 13
+    local label = box.Parent:FindFirstChildOfClass("TextLabel")
+    if label then label.TextSize = 13 end
+    UI:RegisterControl(box.Parent, (options or {}).Text, "Textbox", box, options)
+    return box
+end
+
 
 -- ==========================================
 -- 8. INITIALIZE PAGES & DEFAULT CONTENT
@@ -4945,7 +5489,7 @@ function NPCSystem.IsNPCModel(target)
         typeof(target) == "Instance"
         and target:IsA("Model")
         and target:IsDescendantOf(Workspace)
-        and Players:GetPlayerFromCharacter(target) == nil
+        and ExtraFeatures.V8.ResolvePlayerModel(target) == nil
 end
 
 function NPCSystem.GetHumanoid(model)
@@ -5112,7 +5656,7 @@ function NPCSystem.GetCharacter(target)
     end
 
     if NPCSystem.IsPlayer(target) then
-        return target.Character
+        return ExtraFeatures.V8.Character(target)
     end
 
     return nil
@@ -5159,52 +5703,7 @@ end
 -- Robust Player Team Classification
 -- ---------------------------------------------------------
 function NPCSystem.GetTeamToken(player)
-    if not NPCSystem.IsPlayer(player) then
-        return nil, nil
-    end
-
-    if player.Team ~= nil then
-        return "TEAM", player.Team
-    end
-
-    -- TeamColor is used only when the game actually exposes Teams and the
-    -- player is non-neutral, avoiding the common "all white = teammate" bug.
-    local hasTeams = false
-    pcall(function()
-        hasTeams = #game:GetService("Teams"):GetTeams() > 0
-    end)
-
-    if hasTeams and player.Neutral == false and player.TeamColor ~= nil then
-        return "TEAMCOLOR", player.TeamColor
-    end
-
-    -- Conservative fallback for games that expose custom team/faction state.
-    local attributeNames = {
-        "Team",
-        "TeamName",
-        "Faction"
-    }
-
-    for _, name in ipairs(attributeNames) do
-        local value = player:GetAttribute(name)
-        if value ~= nil then
-            return "ATTRIBUTE:" .. name, tostring(value)
-        end
-    end
-
-    local character = player.Character
-    if character then
-        for _, name in ipairs(attributeNames) do
-            local valueObject = character:FindFirstChild(name)
-            if valueObject and valueObject:IsA("StringValue") then
-                return
-                    "CHARACTER:" .. name,
-                    valueObject.Value
-            end
-        end
-    end
-
-    return nil, nil
+    return ExtraFeatures.V8.TeamToken(player)
 end
 
 function NPCSystem.ClassifyPlayer(player)
@@ -5550,7 +6049,7 @@ local function GetBestTarget(options)
 
                 if screenDistance < math.huge
                     and ((not requireFOV) or onScreen)
-                    and screenDistance < bestScreenDistance
+                    and ExtraFeatures.V8.BetterAim(target, screenDistance, targetPart, bestTarget, bestAimPart, bestScreenDistance)
                 then
                     bestScreenDistance = screenDistance
                     bestTarget = target
@@ -5581,7 +6080,7 @@ local function GetBestTarget(options)
 
                     if screenDistance < math.huge
                         and ((not requireFOV) or onScreen)
-                        and screenDistance < bestScreenDistance
+                        and ExtraFeatures.V8.BetterAim(npc, screenDistance, targetPart, bestTarget, bestAimPart, bestScreenDistance)
                     then
                         bestScreenDistance = screenDistance
                         bestTarget = npc
@@ -5781,7 +6280,7 @@ function ExtraFeatures.GetFunction1PlayerPart(target)
         return nil
     end
 
-    local character = target.Character
+    local character = NPCSystem.GetCharacter(target)
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     if not character or not humanoid or humanoid.Health <= 0 then
         return nil
@@ -5816,7 +6315,7 @@ function ExtraFeatures.FindFunction1VisualTarget(
                 local passesWorldDistance = true
 
                 if useAimMaxDistance then
-                    local character = target.Character
+                    local character = NPCSystem.GetCharacter(target)
                     local targetRoot =
                         character and (
                             character:FindFirstChild("HumanoidRootPart")
@@ -6235,6 +6734,7 @@ AddConnection(
         end
 
         if input.UserInputType == Enum.UserInputType.Touch then
+            OtherSystem.ActiveFireTouches[input] = true
             TouchFireActive = true
         end
     end)
@@ -6243,7 +6743,8 @@ AddConnection(
 AddConnection(
     UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch then
-            TouchFireActive = false
+            OtherSystem.ActiveFireTouches[input] = nil
+            TouchFireActive = next(OtherSystem.ActiveFireTouches) ~= nil
         end
     end)
 )
@@ -6408,7 +6909,7 @@ function Telekill.IsValidTarget(target)
         return false
     end
 
-    local character = target.Character
+    local character = NPCSystem.GetCharacter(target)
     local humanoid =
         character and character:FindFirstChildOfClass("Humanoid")
     local root = character and (
@@ -6856,9 +7357,10 @@ local function ApplyESPScreenOffset(position)
         return nil
     end
 
+    local scale = math.max(UIScaleObj.Scale, 0.01)
     return Vector2.new(
-        position.X,
-        position.Y
+        position.X / scale,
+        position.Y / scale
     )
 end
 
@@ -6990,8 +7492,8 @@ function NPCSystem.UpdateESPBox(box, character, camera)
 
     box.Size =
         UDim2.fromOffset(
-            width,
-            height
+            width / math.max(UIScaleObj.Scale, 0.01),
+            height / math.max(UIScaleObj.Scale, 0.01)
         )
 
     box.Visible = true
@@ -7099,6 +7601,9 @@ local function EnsureSkeletonLines(data, character)
     end
 
     local skeletonList = GetSkeletonDefinition(character)
+    if data.skeletonCharacter == character and data.skeletonDefinition == skeletonList then return end
+    data.skeletonCharacter = character
+    data.skeletonDefinition = skeletonList
     local existing = {}
 
     for _, skeleton in ipairs(data.skeleton or {}) do
@@ -7136,7 +7641,7 @@ local function createTargetESP(target)
     data.box = NPCSystem.CreateScreenBox()
     data.skeleton = {}
 
-    EnsureSkeletonLines(data, data.character)
+    if Config.ShowSkeleton then EnsureSkeletonLines(data, data.character) end
 
     return data
 end
@@ -7301,7 +7806,7 @@ local function updateTargetESP(target, camera)
     if not data then
         data = createTargetESP(target)
         espData[target] = data
-    else
+    elseif Config.ShowSkeleton then
         EnsureSkeletonLines(data, character)
     end
 
@@ -7448,11 +7953,11 @@ local function updateTargetESP(target, camera)
                 maxHP = 100
             end
 
-            healthLabel.Text =
-                "HP: "
-                .. currentHP
-                .. " / "
-                .. maxHP
+            if ExtraFeatures.V8.StyleHealth then
+                ExtraFeatures.V8.StyleHealth(data, humanoid, targetColor)
+            else
+                healthLabel.Text = "HP: " .. currentHP .. " / " .. maxHP
+            end
         end
 
         if distanceLabel then
@@ -7603,7 +8108,7 @@ local function destroyESPHighlight(target)
         return
     end
 
-    local character = target and target.Character
+    local character = target and NPCSystem.GetCharacter(target)
     if character then
         local orphan = character:FindFirstChild(ESPHighlightName)
         if orphan and orphan:IsA("Highlight") then
@@ -7625,7 +8130,7 @@ local function destroyAllESPHighlights()
 
     -- Also remove orphaned objects from any character.
     for _, target in ipairs(Players:GetPlayers()) do
-        local character = target.Character
+        local character = NPCSystem.GetCharacter(target)
         if character then
             local orphan = character:FindFirstChild(ESPHighlightName)
             if orphan and orphan:IsA("Highlight") then
@@ -7640,7 +8145,7 @@ local function IsESPHighlightTargetValid(target)
         return false
     end
 
-    local character = target.Character
+    local character = NPCSystem.GetCharacter(target)
     local humanoid =
         character and
         character:FindFirstChildOfClass("Humanoid")
@@ -7693,9 +8198,11 @@ end
 local function UpdateESPHighlight()
     -- ESP Highlight follows the existing Master ESP switch too.
     if not Config.Enabled or not Config.ESPHighlightEnabled then
-        destroyAllESPHighlights()
+        if UIRefs.Experience.HighlightWasEnabled then destroyAllESPHighlights() end
+        UIRefs.Experience.HighlightWasEnabled = false
         return
     end
+    UIRefs.Experience.HighlightWasEnabled = true
 
     for _, target in ipairs(Players:GetPlayers()) do
         if target ~= LocalPlayer then
@@ -7964,6 +8471,16 @@ local function CreateTeleportButton(target)
             data.active = not data.active
 
             if data.active then
+                -- Multiple floating controls are retained; only the active follow target is exclusive.
+                for otherTarget, otherData in pairs(ActiveTpButtons) do
+                    if otherTarget ~= target and otherData.active then
+                        otherData.active = false
+                        if otherData.button and otherData.button.Parent then
+                            otherData.button.Text = "TP OFF"
+                            otherData.button.BackgroundColor3 = Config.DarkBg
+                        end
+                    end
+                end
                 tpButton.Text = "TP ON"
                 tpButton.BackgroundColor3 = Config.AccentColor
             else
@@ -8013,6 +8530,8 @@ local function RefreshTeleportPlayerList()
                     end
                 )
 
+            if ExtraFeatures.StylePlayerButton then ExtraFeatures.StylePlayerButton(button, target) end
+            button:SetAttribute("Selected", Config.Teleport.SelectedPlayer == target)
             if Config.Teleport.SelectedPlayer == target then
                 button.BackgroundColor3 =
                     Config.AccentColor
@@ -8030,6 +8549,7 @@ local function RefreshTeleportPlayerList()
             TeleportListLayout.AbsoluteContentSize.Y + 8
         )
 
+    if ExtraFeatures.FilterPlayers then ExtraFeatures.FilterPlayers() end
     UpdateSelectedPlayerLabel()
 end
 
@@ -8055,7 +8575,7 @@ local function UpdateTeleport()
         then
             table.insert(invalidTargets, target)
         elseif data.active then
-            local targetCharacter = target.Character
+            local targetCharacter = NPCSystem.GetCharacter(target)
             local targetRoot =
                 targetCharacter
                 and targetCharacter:FindFirstChild(
@@ -8086,7 +8606,7 @@ local SettingsPage = PageManager:AddPage("SETTINGS")
 
 local SettingsStatusLabel
 
-local CONFIG_FILE = "HoodRivals_Settings.json"
+local CONFIG_FILE = "HoodRivals_Settings_u" .. tostring(LocalPlayer.UserId) .. "_p" .. tostring(game.PlaceId) .. ".json"
 
 local SessionConfigBackup = nil
 local CurrentGameName = "Unknown"
@@ -8195,9 +8715,8 @@ local function SafeWriteFile(path, data)
 end
 
 local function SetSettingsStatus(message)
-    if SettingsStatusLabel then
-        SettingsStatusLabel.Text = tostring(message or "")
-    end
+    if SettingsStatusLabel then SettingsStatusLabel.Text = tostring(message or "") end
+    if ExtraFeatures.Notify then ExtraFeatures.Notify(message) end
 end
 
 ExtraFeatures.SetStatus = function(message)
@@ -8754,7 +9273,7 @@ function ExtraFeatures.UpdateFloatingStatus(dt)
         bubble.FPSFrames = 0
         bubble.FPSAccumulator = 0
 
-        if FloatingBtn and FloatingBtn.Parent then
+        if FloatingBtn and FloatingBtn.Parent and not ExtraFeatures.V8.FPSLabel then
             FloatingBtn.Text =
                 "⚡ FPS: "
                 .. tostring(bubble.LastFPS)
@@ -9344,11 +9863,11 @@ function ExtraFeatures.CleanupUIEffects()
     local bubble = effects.Bubble
     bubble.Token = bubble.Token + 1
 
-    for _, tween in ipairs({
-        bubble.HoverTween,
-        bubble.ScaleTween,
-        bubble.MainTween,
-        bubble.MainFadeTween
+    for _, tween in pairs({
+        Hover = bubble.HoverTween,
+        Scale = bubble.ScaleTween,
+        Main = bubble.MainTween,
+        Fade = bubble.MainFadeTween
     }) do
         if tween then
             pcall(function()
@@ -9401,7 +9920,13 @@ CurrentGameName, CurrentPlaceId = GetCurrentGameMetadata()
 
 local function BuildConfigPayload()
     return {
-        version = 6,
+        version = 8,
+        OwnerUserId = LocalPlayer.UserId,
+        AimPriority = Config.AimPriority,
+        Classification = {Mode = Config.Classification.Mode, Attribute = Config.Classification.Attribute},
+        WeaponTuning = table.clone(Config.WeaponTuning),
+        Proximity = table.clone(Config.Proximity),
+        Interface = ExtraFeatures.BuildInterfacePayload(),
 
         -- AIM
         AimEnabled = Config.AimEnabled,
@@ -9520,6 +10045,10 @@ local function ApplyConfigPayload(payload)
         return false, "Invalid config root"
     end
 
+    if payload.OwnerUserId ~= nil and payload.OwnerUserId ~= LocalPlayer.UserId then
+        return false, "Saved data belongs to another player"
+    end
+    if ExtraFeatures.V8.ApplyFeatures then ExtraFeatures.V8.ApplyFeatures(payload) end
     local oldFullBrightEnabled = Config.Player.FullBrightEnabled
 
     SetBooleanField(payload, "AimEnabled", Config)
@@ -9830,10 +10359,13 @@ local function ApplyConfigPayload(payload)
         ExtraFeatures.HoldSpamAccumulator = 0
     end
 
+    ExtraFeatures.ApplyInterfacePayload(payload.Interface)
+
     -- Apply menu-level persistent values directly after validation.
     UIScaleObj.Scale = Config.UIScale
     MainWindow.BackgroundTransparency =
         Config.BackgroundTransparency
+    if ExtraFeatures.ApplyInterfaceLayout then ExtraFeatures.ApplyInterfaceLayout(true) end
 
     return true
 end
@@ -10118,72 +10650,45 @@ end
 local function SaveSettings()
     local payload = BuildConfigPayload()
     SessionConfigBackup = payload
-
+    ExtraFeatures.SessionBackupPreferred = true
     local encoded = SafeEncodeJSON(payload)
-    if not encoded then
-        SetSettingsStatus(
-            "Settings saved for this session; JSON encoding unavailable"
-        )
-        return
-    end
-
-    local ok = false
-    if FileAPI.Available then
-        ok = SafeWriteFile(CONFIG_FILE, encoded)
-    end
-
-    if ok then
-        SetSettingsStatus("Settings saved")
-    else
-        SetSettingsStatus(
-            "Settings saved for this session; filesystem unavailable or write failed"
-        )
-    end
+    local saved = encoded and SafeWriteFile(CONFIG_FILE, encoded) == true or false
+    ExtraFeatures.SessionBackupPreferred = not saved
+    if ExtraFeatures.V8.SaveSettingsToStorage then ExtraFeatures.V8.SaveSettingsToStorage(payload) end
+    if saved then SetSettingsStatus("Settings saved")
+    elseif ExtraFeatures.V8.ServerReady then SetSettingsStatus("Saving settings on server...")
+    else SetSettingsStatus("Settings saved for this session") end
 end
 
 local function LoadSettings()
-    local payload = nil
-
+    local function apply(payload)
+        if type(payload) ~= "table" then SetSettingsStatus("No saved settings found"); return end
+        local ok, reason = ApplyConfigPayload(payload)
+        if not ok then SetSettingsStatus("Settings load failed: " .. tostring(reason)); return end
+        SyncSettingsUI()
+        if ExtraFeatures.V8.SyncControls then ExtraFeatures.V8.SyncControls() end
+        if ExtraFeatures.V8.ApplyLanguage then ExtraFeatures.V8.ApplyLanguage() end
+        SetSettingsStatus("Settings loaded")
+    end
+    if ExtraFeatures.SessionBackupPreferred and SessionConfigBackup then apply(SessionConfigBackup); return end
+    local payload
     if FileAPI.Available and FileExists(CONFIG_FILE) then
-        local raw, readReason = SafeReadFile(CONFIG_FILE)
-
-        if not raw then
-            SetSettingsStatus("Settings load failed: " .. tostring(readReason))
-            return
-        end
-
-        local decoded, decodeReason = SafeDecodeJSON(raw)
-        if not decoded then
-            SetSettingsStatus(
-                "Settings load failed: " .. tostring(decodeReason)
-            )
-            return
-        end
-
-        payload = decoded
-    elseif SessionConfigBackup then
-        -- Session backup is also used when file persistence is unavailable
-        -- or the previous write failed.
-        payload = SessionConfigBackup
+        local raw = SafeReadFile(CONFIG_FILE); payload = raw and SafeDecodeJSON(raw)
+    end
+    if payload then apply(payload); return end
+    local state = ExtraFeatures.V8
+    if state.ServerReady and state.Request then
+        state.Request("ReadSettings", {PlaceId = game.PlaceId}, function(ok, response)
+            if ok and response.Ok then apply(response.Settings or SessionConfigBackup)
+            else apply(SessionConfigBackup or (state.Session().Settings or {})[tostring(game.PlaceId)]) end
+        end)
     else
-        SetSettingsStatus("No saved settings found")
-        return
+        apply(SessionConfigBackup or (state.Session and state.Session().Settings[tostring(game.PlaceId)]))
     end
-
-    local ok, err = ApplyConfigPayload(payload)
-    if not ok then
-        SetSettingsStatus(
-            "Settings load failed: " .. tostring(err)
-        )
-        return
-    end
-
-    SyncSettingsUI()
-    SetSettingsStatus("Settings loaded")
 end
 
 
-local MenuProfilesFile = "HoodRivals_MenuProfiles.json"
+local MenuProfilesFile = "HoodRivals_MenuProfiles_u" .. tostring(LocalPlayer.UserId) .. ".json"
 local MenuProfiles = {}
 local MenuProfileConnections = {}
 local MenuProfilePopupConnections = {}
@@ -10223,6 +10728,8 @@ local function DisconnectMenuProfilePopupConnections()
 end
 
 local function SaveMenuProfiles()
+    for _, profile in ipairs(MenuProfiles) do profile.OwnerUserId = LocalPlayer.UserId end
+    if ExtraFeatures.V8.SaveProfilesToStorage then ExtraFeatures.V8.SaveProfilesToStorage() end
     local encoded = SafeEncodeJSON(MenuProfiles)
 
     if not encoded then
@@ -10284,7 +10791,7 @@ local function LoadMenuProfiles()
     local usedIds = {}
 
     for _, profile in ipairs(decoded) do
-        if type(profile) == "table" then
+        if type(profile) == "table" and (profile.OwnerUserId == nil or profile.OwnerUserId == LocalPlayer.UserId) then
             local rawName =
                 type(profile.ProfileName) == "string"
                 and profile.ProfileName
@@ -10350,6 +10857,7 @@ local function LoadMenuProfiles()
 
                 if name ~= "" then
                     table.insert(cleaned, {
+                        OwnerUserId = LocalPlayer.UserId,
                         ProfileId = profileId,
                         ProfileName = name,
                         GameName = gameName,
@@ -10479,289 +10987,45 @@ local function DestroyMenuProfilePopup()
 end
 
 local function RefreshMenuProfileList()
-    if not MenuProfileList then
-        return
-    end
-
+    if not MenuProfileList then return end
     DisconnectMenuProfileConnections()
-
     for _, child in ipairs(MenuProfileList:GetChildren()) do
-        if not child:IsA("UIListLayout")
-            and not child:IsA("UIPadding")
-        then
-            child:Destroy()
-        end
+        if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then child:Destroy() end
     end
-
-    local visibleProfiles = {}
-
-    for _, profile in ipairs(MenuProfiles) do
-        table.insert(visibleProfiles, profile)
-    end
-
-    for index, profile in ipairs(visibleProfiles) do
+    for index, profile in ipairs(MenuProfiles) do
         local item = Instance.new("Frame")
-        item.Name =
-            "MenuProfile_" .. tostring(index)
-        item.Size =
-            UDim2.new(1, -4, 0, 56)
-        item.BackgroundColor3 = Config.DarkBg
-        item.BorderSizePixel = 0
-        item.Parent = MenuProfileList
-
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 5)
-        corner.Parent = item
-
-        local nameLabel = Instance.new("TextLabel")
-        nameLabel.Size =
-            UDim2.new(1, -155, 0, 22)
-        nameLabel.Position =
-            UDim2.new(0, 8, 0, 5)
-        nameLabel.Text = profile.name
-        nameLabel.TextColor3 = Config.TextColor
-        nameLabel.Font = Enum.Font.GothamBold
-        nameLabel.TextSize = 11
-        nameLabel.TextXAlignment =
-            Enum.TextXAlignment.Left
-        nameLabel.TextTruncate =
-            Enum.TextTruncate.AtEnd
-        nameLabel.BackgroundTransparency = 1
-        nameLabel.Parent = item
-
-        local gameLabel = Instance.new("TextLabel")
-        gameLabel.Size =
-            UDim2.new(1, -155, 0, 18)
-        gameLabel.Position =
-            UDim2.new(0, 8, 0, 28)
-        gameLabel.Text =
-            "Saved from: "
-            .. tostring(profile.gameName)
-            .. " | PlaceId: "
-            .. tostring(profile.placeId)
-        gameLabel.TextColor3 =
-            Config.SubTextColor
-        gameLabel.Font = Enum.Font.GothamMedium
-        gameLabel.TextSize = 9
-        gameLabel.TextXAlignment =
-            Enum.TextXAlignment.Left
-        gameLabel.TextTruncate =
-            Enum.TextTruncate.AtEnd
-        gameLabel.BackgroundTransparency = 1
-        gameLabel.Parent = item
-
-        local runButton =
-            UI:CreateButton(
-                item,
-                "RUN",
-                function()
-                    ApplyMenuProfile(profile)
-                end
-            )
-
-        runButton.Size =
-            UDim2.new(0, 58, 0, 24)
-        runButton.Position =
-            UDim2.new(1, -132, 0, 16)
-
-        local deleteButton =
-            UI:CreateButton(
-                item,
-                "DELETE",
-                function()
-                    if DeleteMenuProfile(profile.ProfileId or profile.profileId or profile.name) then
-                        RefreshMenuProfileList()
-                        SetSettingsStatus(
-                            "Profile deleted: "
-                            .. tostring(profile.name)
-                        )
-                    end
-                end
-            )
-
-        deleteButton.Size =
-            UDim2.new(0, 66, 0, 24)
-        deleteButton.Position =
-            UDim2.new(1, -70, 0, 16)
-
-        
+        item.Name = "MenuProfile_" .. index
+        item.Size = UDim2.new(1, -4, 0, 84)
+        item.BackgroundColor3 = Config.DarkBg; item.BorderSizePixel = 0; item.Parent = MenuProfileList
+        local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 7); corner.Parent = item
+        local name = Instance.new("TextLabel")
+        name.Name = "ProfileTitle"; name.Size = UDim2.new(1, -16, 0, 20); name.Position = UDim2.fromOffset(8, 5)
+        name.BackgroundTransparency = 1; name.Text = tostring(profile.ProfileName or profile.name)
+        name.Font = Enum.Font.GothamBold; name.TextSize = 13; name.TextColor3 = Config.TextColor
+        name.TextXAlignment = Enum.TextXAlignment.Left; name.TextTruncate = Enum.TextTruncate.AtEnd; name.Parent = item
+        local metadata = name:Clone()
+        metadata.Name = "ProfileMetadata"; metadata.Position = UDim2.fromOffset(8, 25)
+        metadata.Text = tostring(profile.GameName or profile.gameName) .. "  ·  Place " .. tostring(profile.PlaceId or profile.placeId)
+        metadata.Font = Enum.Font.GothamMedium; metadata.TextSize = 10; metadata.TextColor3 = Config.SubTextColor
+        metadata.Parent = item
+        local run = UI:CreateButton(item, "RUN", function() ApplyMenuProfile(profile) end)
+        run.Name = "RunProfile"; run.Size = UDim2.new(0.35, -8, 0, 28); run.Position = UDim2.fromOffset(8, 49)
+        local options = UI:CreateButton(item, "…", function() ExtraFeatures.ProfileActions(profile) end)
+        options.Name = "ProfileOptions"; options.Size = UDim2.new(0.2, -8, 0, 28); options.Position = UDim2.new(0.35, 4, 0, 49)
+        local remove = UI:CreateButton(item, "DELETE", function() ExtraFeatures.ConfirmProfileDelete(profile) end)
+        remove.Name = "DeleteProfile"; remove.Size = UDim2.new(0.45, -12, 0, 28); remove.Position = UDim2.new(0.55, 0, 0, 49)
+        run.TextTruncate, remove.TextTruncate = Enum.TextTruncate.AtEnd, Enum.TextTruncate.AtEnd
+        remove.TextColor3 = Color3.fromRGB(255, 147, 147)
     end
-
-    MenuProfileList.CanvasSize =
-        UDim2.new(
-            0,
-            0,
-            0,
-            #visibleProfiles * 62 + 4
-        )
+    MenuProfileList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    MenuProfileList.CanvasSize = UDim2.new()
 end
+
 
 local function OpenSaveMenuProfilePopup()
-    DestroyMenuProfilePopup()
-
-    local popup = Instance.new("Frame")
-    MenuProfilePopup = popup
-    popup.Name =
-        "SaveMenuProfilePopup"
-    popup.Size =
-        UDim2.new(0, 300, 0, 150)
-    popup.AnchorPoint =
-        Vector2.new(0.5, 0.5)
-    popup.Position =
-        UDim2.new(0.5, 0, 0.5, 0)
-    popup.BackgroundColor3 =
-        Config.CardBg
-    popup.BorderSizePixel = 0
-    popup.ZIndex = 200
-    popup.Parent = MainWindow
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = popup
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Config.BorderColor
-    stroke.Thickness = 1
-    stroke.Parent = popup
-
-    local title = Instance.new("TextLabel")
-    title.Size =
-        UDim2.new(1, -20, 0, 24)
-    title.Position =
-        UDim2.new(0, 10, 0, 9)
-    title.Text = "SAVE MENU"
-    title.TextColor3 =
-        Config.TextColor
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 12
-    title.TextXAlignment =
-        Enum.TextXAlignment.Left
-    title.BackgroundTransparency = 1
-    title.ZIndex = 201
-    title.Parent = popup
-
-    local nameBox = Instance.new("TextBox")
-    nameBox.Size =
-        UDim2.new(1, -20, 0, 32)
-    nameBox.Position =
-        UDim2.new(0, 10, 0, 38)
-    nameBox.PlaceholderText =
-        "Nhập tên profile..."
-    nameBox.Text = ""
-    nameBox.TextColor3 =
-        Config.TextColor
-    nameBox.PlaceholderColor3 =
-        Config.SubTextColor
-    nameBox.Font = Enum.Font.GothamMedium
-    nameBox.TextSize = 12
-    nameBox.BackgroundColor3 =
-        Config.DarkBg
-    nameBox.BorderSizePixel = 0
-    nameBox.ClearTextOnFocus = false
-    nameBox.ZIndex = 201
-    nameBox.Parent = popup
-
-    local boxCorner = Instance.new("UICorner")
-    boxCorner.CornerRadius =
-        UDim.new(0, 5)
-    boxCorner.Parent = nameBox
-
-    local saveButton =
-        UI:CreateButton(
-            popup,
-            "SAVE",
-            function()
-                local profileName =
-                    TrimString(nameBox.Text)
-
-                if profileName == "" then
-                    SetSettingsStatus(
-                        "Enter a profile name first"
-                    )
-                    return
-                end
-
-                local profile =
-                    FindMenuProfile(profileName)
-                local payload =
-                    BuildConfigPayload()
-
-                if profile then
-                    SetSettingsStatus(
-                        "Profile name already exists. DELETE it first or use another name."
-                    )
-                    return
-                end
-
-                local profileId = GenerateMenuProfileId()
-
-                table.insert(
-                    MenuProfiles,
-                    {
-                        ProfileId = profileId,
-                        ProfileName = profileName,
-                        GameName = CurrentGameName,
-                        PlaceId = CurrentPlaceId,
-                        ConfigData = payload,
-                        Version = 1,
-                        CreatedAt = os.time(),
-
-                        -- Compatibility aliases for older profile readers.
-                        profileId = profileId,
-                        name = profileName,
-                        gameName = CurrentGameName,
-                        placeId = CurrentPlaceId,
-                        config = payload,
-                        version = 1,
-                        createdAt = os.time()
-                    }
-                )
-
-                SaveMenuProfiles()
-                RefreshMenuProfileList()
-                DestroyMenuProfilePopup()
-
-                SetSettingsStatus(
-                    "Profile saved: "
-                    .. profileName
-                )
-            end
-        )
-
-    saveButton.Size =
-        UDim2.new(0, 120, 0, 30)
-    saveButton.Position =
-        UDim2.new(0, 18, 1, -40)
-
-    local cancelButton =
-        UI:CreateButton(
-            popup,
-            "CANCEL",
-            function()
-                DestroyMenuProfilePopup()
-            end
-        )
-
-    cancelButton.Size =
-        UDim2.new(0, 120, 0, 30)
-    cancelButton.Position =
-        UDim2.new(1, -138, 1, -40)
-
-    table.insert(
-        MenuProfilePopupConnections,
-        nameBox.FocusLost:Connect(
-            function(enterPressed)
-                if enterPressed then
-                    saveButton:Activate()
-                end
-            end
-        )
-    )
-
-    pcall(function()
-        nameBox:CaptureFocus()
-    end)
+    ExtraFeatures.OpenProfileEditor("Create")
 end
+
 
 LoadMenuProfiles()
 
@@ -10965,12 +11229,12 @@ UIRefs.MenuProfileSec =
 
 UI:CreateLabel(
     UIRefs.MenuProfileSec,
-    "GLOBAL MENU PROFILES"
+    "YOUR MENU PROFILES"
         .. "\nCurrent Game: "
         .. tostring(CurrentGameName)
         .. "\nCurrent PlaceId: "
         .. tostring(CurrentPlaceId)
-        .. "\nProfiles saved here are available in every game."
+        .. "\nProfiles belong to your User ID."
 )
 
 UI:CreateButton(
@@ -11019,7 +11283,7 @@ RefreshMenuProfileList()
 
 if not FileAPI.Available then
     SetSettingsStatus(
-        "Filesystem persistence unavailable; session-only profiles"
+        "Connecting player storage..."
     )
 end
 
@@ -11207,70 +11471,103 @@ end)
 -- made earlier in the frame.
 -- =========================================================
 
-pcall(function()
+function ExtraFeatures.SafeFrameStep(name, callback, ...)
+    local ok, reason = pcall(callback, ...)
+    if ok then return end
+    local state = UIRefs.Experience
+    state.LastRenderError = state.LastRenderError or {}
+    local last = state.LastRenderError[name] or -math.huge
+    if os.clock() - last < 5 then return end
+    state.LastRenderError[name] = os.clock()
+    local message = name .. ": " .. tostring(reason)
+    table.insert(state.Errors, {Time = os.time(), Text = message})
+    if #state.Errors > 40 then table.remove(state.Errors, 1) end
+    warn("[Hood Rivals] " .. message)
+end
+
+function ExtraFeatures.StopRenderPipeline()
+    UIRefs.Experience.RenderRunning = false
     RunService:UnbindFromRenderStep("HoodRivalsUnifiedRender")
     RunService:UnbindFromRenderStep("HoodRivalsAimRender")
     RunService:UnbindFromRenderStep("HoodRivalsESPRender")
-end)
+end
 
--- Existing Player + Teleport runtime remains isolated from AIM/ESP timing.
-RunService:BindToRenderStep(
-    "HoodRivalsUnifiedRender",
-    Enum.RenderPriority.Character.Value + 1,
-    function(renderDt)
-        UpdatePlayer(renderDt)
-        UpdateTeleport()
-        pcall(function()
-            ExtraFeatures.UpdateHeadHitboxes(renderDt, false)
+function ExtraFeatures.StartRenderPipeline()
+    if UIRefs.Experience.Destroyed or UIRefs.Experience.RenderRunning then return end
+    ExtraFeatures.StopRenderPipeline()
+    UIRefs.Experience.RenderRunning = true
+    RunService:BindToRenderStep("HoodRivalsUnifiedRender", Enum.RenderPriority.Character.Value + 1,
+        function(renderDt)
+            ExtraFeatures.SafeFrameStep("PLAYER", UpdatePlayer, renderDt)
+            ExtraFeatures.SafeFrameStep("TELEPORT", UpdateTeleport)
+            ExtraFeatures.SafeFrameStep("Head Hitbox", ExtraFeatures.UpdateHeadHitboxes, renderDt, false)
+            ExtraFeatures.SafeFrameStep("Hold to Spam", ExtraFeatures.UpdateHoldSpam, renderDt)
+            ExtraFeatures.SafeFrameStep("Sliders", ExtraFeatures.UpdateHeavySliders, renderDt)
+            ExtraFeatures.SafeFrameStep("FUNCTION 1", ExtraFeatures.UpdateFunction1, renderDt)
+            ExtraFeatures.SafeFrameStep("UI effects", ExtraFeatures.UpdateFloatingStatus, renderDt)
+            if ExtraFeatures.UpdateInterfaceStatus then
+                ExtraFeatures.SafeFrameStep("Interface status", ExtraFeatures.UpdateInterfaceStatus, renderDt)
+            end
         end)
-        ExtraFeatures.UpdateHoldSpam(renderDt)
-        pcall(function()
-            ExtraFeatures.UpdateHeavySliders(renderDt)
+    RunService:BindToRenderStep("HoodRivalsAimRender", Enum.RenderPriority.Last.Value - 1,
+        function(renderDt)
+            ExtraFeatures.SafeFrameStep("Telekill", Telekill.Update, renderDt)
+            ExtraFeatures.SafeFrameStep("Target Assist", ExtraFeatures.UpdateTargetAssist)
+            ExtraFeatures.SafeFrameStep("AimSilent", ExtraFeatures.UpdateAimSilent)
+            if not ExtraFeatures.Function1.DroneStrike.Active then
+                ExtraFeatures.SafeFrameStep("AIM", UpdateAim)
+            end
+            ExtraFeatures.SafeFrameStep("FOV", UpdateFOVCircle)
+            ExtraFeatures.SafeFrameStep("Menu input", OtherSystem.UpdateMenuInput)
         end)
-        pcall(function()
-            ExtraFeatures.UpdateFunction1(renderDt)
+    RunService:BindToRenderStep("HoodRivalsESPRender", Enum.RenderPriority.Last.Value,
+        function()
+            local camera = Workspace.CurrentCamera
+            ExtraFeatures.SafeFrameStep("ESP", updateESP, camera)
+            ExtraFeatures.SafeFrameStep("Highlight", UpdateESPHighlight)
+            if ExtraFeatures.V8.Update then ExtraFeatures.SafeFrameStep("V8 overlays", ExtraFeatures.V8.Update, camera) end
         end)
-        pcall(function()
-            ExtraFeatures.UpdateFloatingStatus(renderDt)
-        end)
+end
+
+function ExtraFeatures.PauseRuntime()
+    if UIRefs.Experience.ClosedSnapshot then return end
+    local saved = {XRay = Config.XRayEnabled, ThirdPerson = Config.ThirdPersonLock,
+        AntiAFK = Config.AntiAFKEnabled}
+    UIRefs.Experience.ClosedSnapshot = saved
+    ExtraFeatures.StopRenderPipeline()
+    if ExtraFeatures.V8.Pause then ExtraFeatures.V8.Pause() end
+    OtherSystem.Cleanup()
+    ExtraFeatures.SetAntiAFK(false)
+    ExtraFeatures.StopVirtualPet()
+    ExtraFeatures.DestroySnowfall()
+    Config.XRayEnabled, Config.ThirdPersonLock, Config.AntiAFKEnabled = saved.XRay, saved.ThirdPerson, saved.AntiAFK
+    ExtraFeatures.HoldSpamKeyHeld, ExtraFeatures.HoldSpamRightHeld = false, false
+    ExtraFeatures.HoldSpamListening, ExtraFeatures.HoldSpamKeyBox = false, nil
+    table.clear(OtherSystem.ActiveFireTouches)
+    TouchFireActive = false
+    if MenuProfilePopup then DestroyMenuProfilePopup() end
+    for _, reset in ipairs(UIRefs.Experience.DragResetters) do pcall(reset) end
+end
+
+function ExtraFeatures.ResumeRuntime()
+    if UIRefs.Experience.Destroyed then return end
+    if UIRefs.Experience.ClosedSnapshot then
+        local character, humanoid, root = GetLocalCharacterParts()
+        PlayerRuntime.Character, PlayerRuntime.Humanoid, PlayerRuntime.RootPart = character, humanoid, root
+        CaptureOriginalJumpPower(humanoid)
+        OtherSystem.SetThirdPerson(Config.ThirdPersonLock)
+        OtherSystem.SetXRay(Config.XRayEnabled)
+        ExtraFeatures.SetAntiAFK(Config.AntiAFKEnabled)
+        if Config.VirtualPetEnabled and not ExtraFeatures.UIEffects.VirtualPet.Enabled then ExtraFeatures.StartVirtualPet() end
+        if Config.SnowfallEnabled and not ExtraFeatures.UIEffects.Snowfall.Enabled then ExtraFeatures.StartSnowfall() end
+        UIRefs.Experience.ClosedSnapshot = nil
     end
-)
+    ExtraFeatures.StartRenderPipeline()
+    if ExtraFeatures.V8.SyncWeapon then ExtraFeatures.V8.SyncWeapon() end
+end
 
--- AIM runs late enough to observe the final weapon/camera state,
--- and one stage before ESP so ESP can project from the post-AIM camera.
-RunService:BindToRenderStep(
-    "HoodRivalsAimRender",
-    Enum.RenderPriority.Last.Value - 1,
-    function(renderDt)
-        Telekill.Update(renderDt)
-        pcall(function()
-            ExtraFeatures.UpdateTargetAssist()
-        end)
-        pcall(function()
-            ExtraFeatures.UpdateAimSilent()
-        end)
-        if not ExtraFeatures.Function1.DroneStrike.Active then
-            UpdateAim()
-        end
-        UpdateFOVCircle()
+ExtraFeatures.StartRenderPipeline()
 
-        -- Run after normal camera/Shift-Lock updates so an open menu
-        -- always keeps a free, visible mouse cursor for UI interaction.
-        OtherSystem.UpdateMenuInput()
-    end
-)
-
--- ESP is the final projection stage and reads one CurrentCamera snapshot
--- for the whole frame.
-RunService:BindToRenderStep(
-    "HoodRivalsESPRender",
-    Enum.RenderPriority.Last.Value,
-    function()
-        local camera = Workspace.CurrentCamera
-        updateESP(camera)
-        UpdateESPHighlight()
-    end
-)
 
 -- =========================================================
 -- SHARED PLAYER LIFECYCLE
@@ -11406,6 +11703,7 @@ SetMenuState = function(newState)
     GUIState.CurrentState = newState
 
     if newState == "Open" then
+        ExtraFeatures.ResumeRuntime()
         ScreenGui.Enabled = true
         OtherSystem.SetMenuMouseState(true)
         pcall(function()
@@ -11435,6 +11733,7 @@ SetMenuState = function(newState)
             end)
         end
     elseif newState == "Closed" then
+        ExtraFeatures.PauseRuntime()
         if effects then
             effects.AnimationBusy = false
             effects.Bubble.Token =
@@ -11530,6 +11829,7 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
             return
         end
 
+        if not ExtraFeatures.ValidateShortcut(input.KeyCode, "HoldToSpam") then return end
         Config.HoldToSpamKey = input.KeyCode
         ExtraFeatures.HoldSpamListening = false
 
@@ -11545,14 +11845,24 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         return
     end
 
+    local focusedTextBox = UserInputService:GetFocusedTextBox()
+
     if input.UserInputType == Enum.UserInputType.Keyboard then
         if input.KeyCode == Config.HoldToSpamKey
             and Config.HoldToSpamEnabled
+            and focusedTextBox == nil
+            and not gameProcessed
+            and GUIState.CurrentState ~= "Closed"
+            and not UIRefs.Experience.OverlayOpen
         then
             ExtraFeatures.HoldSpamKeyHeld = true
         end
     elseif input.UserInputType == Enum.UserInputType.MouseButton2
         and Config.HoldToSpamEnabled
+        and focusedTextBox == nil
+        and not gameProcessed
+        and GUIState.CurrentState ~= "Closed"
+        and not UIRefs.Experience.OverlayOpen
     then
         ExtraFeatures.HoldSpamRightHeld = true
     end
@@ -11564,9 +11874,15 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         return
     end
 
-    local focusedTextBox =
-        UserInputService:GetFocusedTextBox()
-
+    if focusedTextBox == nil and not gameProcessed and not UIRefs.Experience.OverlayOpen
+        and (input.KeyCode == Enum.KeyCode.S or input.KeyCode == Enum.KeyCode.V)
+        and ExtraFeatures.V8.FavoriteChordDown and ExtraFeatures.V8.FavoriteChordDown() then
+        if not ExtraFeatures.V8.FavoriteChordLatched then
+            ExtraFeatures.V8.FavoriteChordLatched = true
+            ExtraFeatures.V8.OpenFavorites()
+        end
+        return
+    end
     -- CTRL + C + V: open SETTINGS and load the normal saved settings.
     -- The chord is ignored while typing in a TextBox so copy/paste remains safe.
     if focusedTextBox == nil
@@ -11638,6 +11954,8 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 
     if gameProcessed then return end
+    if UIRefs.Experience.OverlayOpen then return end
+    if GUIState.CurrentState == "Closed" and input.KeyCode ~= Config.ToggleKey then return end
 
     if focusedTextBox == nil then
         if input.UserInputType == Enum.UserInputType.Keyboard
@@ -11689,70 +12007,6 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         elseif GUIState.CurrentState == "Minimized" or GUIState.CurrentState == "Closed" then
             ScreenGui.Enabled = true
 
-            -- Rebind the render pipeline safely.
-            pcall(function()
-                RunService:UnbindFromRenderStep(
-                    "HoodRivalsUnifiedRender"
-                )
-                RunService:UnbindFromRenderStep(
-                    "HoodRivalsAimRender"
-                )
-                RunService:UnbindFromRenderStep(
-                    "HoodRivalsESPRender"
-                )
-            end)
-
-            RunService:BindToRenderStep(
-                "HoodRivalsUnifiedRender",
-                Enum.RenderPriority.Character.Value + 1,
-                function(renderDt)
-                    UpdatePlayer(renderDt)
-                    UpdateTeleport()
-                    ExtraFeatures.UpdateHeadHitboxes(renderDt, false)
-                    ExtraFeatures.UpdateHoldSpam(renderDt)
-                    pcall(function()
-                        ExtraFeatures.UpdateHeavySliders(renderDt)
-                    end)
-                    pcall(function()
-                        ExtraFeatures.UpdateFunction1(renderDt)
-                    end)
-                    pcall(function()
-                        ExtraFeatures.UpdateFloatingStatus(renderDt)
-                    end)
-                end
-            )
-
-            RunService:BindToRenderStep(
-                "HoodRivalsAimRender",
-                Enum.RenderPriority.Last.Value - 1,
-                function(renderDt)
-                    Telekill.Update(renderDt)
-                    pcall(function()
-                        ExtraFeatures.UpdateTargetAssist()
-                    end)
-                    pcall(function()
-                        ExtraFeatures.UpdateAimSilent()
-                    end)
-                    if not ExtraFeatures.Function1.DroneStrike.Active then
-                        UpdateAim()
-                    end
-                    UpdateFOVCircle()
-
-                    -- Late-stage mouse release for menu interaction.
-                    OtherSystem.UpdateMenuInput()
-                end
-            )
-
-            RunService:BindToRenderStep(
-                "HoodRivalsESPRender",
-                Enum.RenderPriority.Last.Value,
-                function()
-                    local camera = Workspace.CurrentCamera
-                    updateESP(camera)
-                    UpdateESPHighlight()
-                end
-            )
-
             SetMenuState("Open")
         end
     end
@@ -11792,6 +12046,10 @@ AddConnection(
 local function CleanupFramework()
     CleanupPlayerRuntime()
     OtherSystem.Cleanup()
+    if ExtraFeatures.V8.Cleanup then ExtraFeatures.V8.Cleanup() end
+    UIRefs.Experience.Destroyed = true
+    UIRefs.Experience.RenderRunning = false
+    if ExtraFeatures.DestroyInterface then ExtraFeatures.DestroyInterface() end
 
     pcall(function()
         RunService:UnbindFromRenderStep(
@@ -11844,6 +12102,7 @@ local function CleanupFramework()
             conn:Disconnect()
         end)
     end
+    table.clear(Connections)
 end
 
 _G.MyGUIFramework = {
@@ -11901,6 +12160,10 @@ AddConnection(
     UserInputService.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Keyboard
             and input.KeyCode == Enum.KeyCode.F4
+            and not OtherSystem.KeybindListening
+            and not ExtraFeatures.HoldSpamListening
+            and not UIRefs.Experience.OverlayOpen
+            and UserInputService:GetFocusedTextBox() == nil
         then
             if type(CleanupFramework) == "function" then
                 CleanupFramework()
@@ -11920,3 +12183,1723 @@ AddConnection(
 )
 
 print("[Hood Rivals Framework & ESP Integrated Successfully!]")
+
+
+-- Interface upgrade: all gameplay engines above retain their established logic.
+
+function ExtraFeatures.ViewBounds()
+    local camera = Workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+    local scale = math.max(UIScaleObj.Scale, 0.01)
+    local insetTop, insetBottom = Vector2.zero, Vector2.zero
+    pcall(function() insetTop, insetBottom = game:GetService("GuiService"):GetGuiInset() end)
+    local margin = 10 / scale
+    return viewport.X / scale, viewport.Y / scale, margin,
+        math.max(margin, insetTop.Y / scale + margin),
+        math.max(margin, insetBottom.Y / scale + margin)
+end
+
+function ExtraFeatures.ClampInterfaceFrame(frame)
+    if not frame or not frame.Parent then return end
+    local width, height, margin, top, bottom = ExtraFeatures.ViewBounds()
+    local fw = frame.Size.X.Scale * width + frame.Size.X.Offset
+    local fh = frame.Size.Y.Scale * height + frame.Size.Y.Offset
+    local x = frame.Position.X.Scale * width + frame.Position.X.Offset
+    local y = frame.Position.Y.Scale * height + frame.Position.Y.Offset
+    x = math.clamp(x, margin, math.max(margin, width - margin - fw))
+    y = math.clamp(y, top, math.max(top, height - bottom - fh))
+    frame.Position = UDim2.fromOffset(x, y)
+    if frame == MainWindow then
+        Config.Interface.Window.X = (x - margin) / math.max(1, width - margin * 2 - fw)
+        Config.Interface.Window.Y = (y - top) / math.max(1, height - bottom - top - fh)
+        if UIRefs.Experience.Shadow then
+            UIRefs.Experience.Shadow.Position = UDim2.fromOffset(x + 4, y + 7)
+            UIRefs.Experience.Shadow.Size = frame.Size
+        end
+    end
+end
+
+UIRefs.Experience.ClampFrame = ExtraFeatures.ClampInterfaceFrame
+
+function ExtraFeatures.ApplyInterfaceLayout(resetPosition)
+    local state = UIRefs.Experience
+    if not state.Ready then return end
+    local width, height, margin, top, bottom = ExtraFeatures.ViewBounds()
+    local preferred = Config.Interface.Window
+    local w = math.min(preferred.Width or 720, math.max(1, width - margin * 2))
+    local h = math.min(preferred.Height or 520, math.max(1, height - top - bottom))
+    MainWindow.Size = UDim2.fromOffset(w, h)
+    if resetPosition then
+        local nx = math.clamp(tonumber(preferred.X) or 0.5, 0, 1)
+        local ny = math.clamp(tonumber(preferred.Y) or 0.5, 0, 1)
+        MainWindow.Position = UDim2.fromOffset(margin + math.max(0, width - margin * 2 - w) * nx,
+            top + math.max(0, height - top - bottom - h) * ny)
+    end
+    local compact = Config.Interface.CompactSidebar or w < 560
+    local narrow = w < 400
+    local sidebarWidth = compact and 80 or 154
+    Header.Size = UDim2.new(1, 0, 0, 116)
+    TopRow.Size = UDim2.new(1, 0, 0, 42)
+    TitleLabel.Size = UDim2.new(1, -148, 1, 0)
+    TitleLabel.Position = UDim2.fromOffset(16, 0)
+    TitleLabel.TextSize = compact and 14 or 18
+    TitleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    ControlButtons.Size = UDim2.fromOffset(120, 34)
+    ControlButtons.Position = UDim2.new(1, -130, 0, 4)
+    for index, button in ipairs({MinimizeBtn, UIRefs.NotificationButton, CloseBtn}) do
+        button.Size = UDim2.fromOffset(32, 32)
+        button.Position = UDim2.fromOffset((index - 1) * 40, 0)
+        button.TextSize = 16
+    end
+    TopTabBar.Position = UDim2.fromOffset(16, 46)
+    TopTabBar.Size = UDim2.new(1, -32, 0, 28)
+    HeaderDivider.Position = UDim2.fromOffset(0, 115)
+    Sidebar.Position = UDim2.fromOffset(0, 116)
+    Sidebar.Size = UDim2.new(0, sidebarWidth, 1, -146)
+    ContentArea.Position = UDim2.fromOffset(sidebarWidth + 1, 116)
+    ContentArea.Size = UDim2.new(1, -sidebarWidth - 1, 1, -146)
+    TabContainer.Position = UDim2.fromOffset(8, 12)
+    TabContainer.Size = UDim2.new(1, -16, 1, -56)
+    if narrow then
+        Sidebar.Size = UDim2.new(1, 0, 0, 40)
+        ContentArea.Position = UDim2.fromOffset(0, 156)
+        ContentArea.Size = UDim2.new(1, 0, 1, -186)
+        TabContainer.Position = UDim2.fromOffset(8, 4)
+        TabContainer.Size = UDim2.new(1, -16, 1, -8)
+    end
+    TabContainer.ScrollingDirection = narrow and Enum.ScrollingDirection.X or Enum.ScrollingDirection.Y
+    TabContainer.AutomaticCanvasSize = narrow and Enum.AutomaticSize.X or Enum.AutomaticSize.Y
+    TabContainer:FindFirstChildOfClass("UIListLayout").FillDirection = narrow and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical
+    AuthorLabel.Visible = not narrow
+    AuthorLabel.TextSize = compact and 9 or 11
+    local short = {OVERVIEW = "HOME", PLAYER = "PLAYER", AIM = "AIM", ESP = "ESP", NPC = "NPC",
+        TELEPORT = "TP", SETTINGS = "SET", ["KHÁC"] = "KHÁC"}
+    for name, button in pairs(GUIState.TabButtons) do
+        if button.Parent == TabContainer then
+            button.Size = narrow and UDim2.fromOffset(64, 32) or UDim2.new(1, 0, 0, compact and 38 or 36)
+            button.TextSize = compact and 10 or 12
+            button.Text = compact and (short[name] or name) or name
+        end
+    end
+    if state.SearchBox then
+        state.SearchBox.Size = UDim2.new(1, -108, 1, 0)
+        state.SearchCount.Visible = not compact
+        state.SearchBox.PlaceholderText = compact and "Search..." or "Search features..."
+    end
+    if state.FooterRight then
+        state.FooterRight.Visible = not compact
+        state.FooterLeft.Size = UDim2.new(compact and 1 or 0.56, -20, 1, 0)
+    end
+    local controlWidth = w - (narrow and 0 or sidebarWidth + 1) - 48
+    local stacked = controlWidth < 270
+    for _, record in ipairs(state.Controls) do
+        if record.Kind == "Slider" then
+            local api = record.API
+            api.Frame.Size = UDim2.new(1, 0, 0, stacked and 84 or 62)
+            api.Label.Size = UDim2.new(1, stacked and -60 or -160, 0, 22)
+            api.Value.Size = stacked and UDim2.new(1, 0, 0, 22) or UDim2.fromOffset(70, 22)
+            api.Value.Position = stacked and UDim2.fromOffset(0, 24) or UDim2.new(1, -150, 0, 0)
+            if record.Hint then record.Hint.Position = UDim2.fromOffset(0, stacked and 47 or 24) end
+        elseif record.Kind == "Toggle" then
+            record.API.Label.Size = UDim2.new(1, stacked and -82 or -94, 0, 23)
+        end
+    end
+    ExtraFeatures.ClampInterfaceFrame(MainWindow)
+    ExtraFeatures.ClampInterfaceFrame(FloatingBtn)
+    for _, data in pairs(ActiveTpButtons) do ExtraFeatures.ClampInterfaceFrame(data.frame) end
+    if state.ModalCard then ExtraFeatures.ClampInterfaceFrame(state.ModalCard) end
+end
+
+function ExtraFeatures.BuildInterfacePayload()
+    local source = Config.Interface
+    local favorites, collapsed = {}, {}
+    for key, value in pairs(source.Favorites) do if value == true then favorites[key] = true end end
+    for key, value in pairs(source.CollapsedSections) do if value == true then collapsed[key] = true end end
+    return {ReducedMotion = source.ReducedMotion, ClickEffects = source.ClickEffects,
+        SoundEffects = source.SoundEffects, SoundVolume = source.SoundVolume,
+        Language = source.Language, OwnerUserId = LocalPlayer.UserId,
+        RememberLayout = source.RememberLayout, CompactSidebar = source.CompactSidebar,
+        Favorites = favorites, CollapsedSections = collapsed, LastPage = GUIState.ActivePage,
+        Window = source.RememberLayout and {Width = source.Window.Width, Height = source.Window.Height,
+            X = source.Window.X, Y = source.Window.Y} or nil}
+end
+
+function ExtraFeatures.ApplyInterfacePayload(payload)
+    if type(payload) ~= "table" then return end
+    if payload.OwnerUserId ~= nil and payload.OwnerUserId ~= LocalPlayer.UserId then return end
+    local target = Config.Interface
+    if payload.Language == "EN" or payload.Language == "VI" then target.Language = payload.Language end
+    for _, key in ipairs({"ReducedMotion", "ClickEffects", "SoundEffects", "RememberLayout", "CompactSidebar"}) do
+        if type(payload[key]) == "boolean" then target[key] = payload[key] end
+    end
+    if IsFiniteNumber(payload.SoundVolume) then target.SoundVolume = math.clamp(payload.SoundVolume, 0, 1) end
+    for _, key in ipairs({"Favorites", "CollapsedSections"}) do
+        if type(payload[key]) == "table" then
+            target[key] = {}
+            local count = 0
+            for id, enabled in pairs(payload[key]) do
+                if type(id) == "string" and #id <= 300 and enabled == true and count < 500 then
+                    target[key][id] = true; count = count + 1
+                end
+            end
+        end
+    end
+    if type(payload.Window) == "table" and target.RememberLayout then
+        local window = payload.Window
+        if IsFiniteNumber(window.Width) then target.Window.Width = math.clamp(window.Width, 280, 1200) end
+        if IsFiniteNumber(window.Height) then target.Window.Height = math.clamp(window.Height, 280, 900) end
+        if IsFiniteNumber(window.X) then target.Window.X = math.clamp(window.X, 0, 1) end
+        if IsFiniteNumber(window.Y) then target.Window.Y = math.clamp(window.Y, 0, 1) end
+    end
+    if type(payload.LastPage) == "string" and #payload.LastPage <= 32 then
+        ExtraFeatures.V8.PendingLastPage = payload.LastPage
+        if GUIState.Pages[payload.LastPage] then target.LastPage = payload.LastPage end
+    end
+    if UIRefs.Experience.Ready then
+        UI:ApplyFilter()
+        for key, api in pairs(UIRefs.Experience.PreferenceControls or {}) do api.Set(target[key], true) end
+        if UIRefs.Experience.VolumeControl then UIRefs.Experience.VolumeControl.Set(target.SoundVolume, true) end
+        if target.RememberLayout and type(payload.LastPage) == "string" then PageManager:ShowPage(target.LastPage, true) end
+        if ExtraFeatures.V8.ApplyLanguage then ExtraFeatures.V8.ApplyLanguage() end
+        if ExtraFeatures.V8.RefreshFavorites then ExtraFeatures.V8.RefreshFavorites() end
+    end
+end
+
+function ExtraFeatures.Notify(message, level)
+    local state = UIRefs.Experience
+    message = tostring(message or "")
+    if message == "" or state.Destroyed then return end
+    if state.LastMessage == message and os.clock() - (state.LastMessageTime or 0) < 0.4 then return end
+    state.LastMessage, state.LastMessageTime = message, os.clock()
+    table.insert(state.History, {Time = os.time(), Text = message, Level = level or "info"})
+    if #state.History > 30 then table.remove(state.History, 1) end
+    if state.FooterStatus then state.FooterStatus.Text = message end
+    if not state.Toast or not ScreenGui.Enabled then return end
+    state.ToastToken = (state.ToastToken or 0) + 1
+    local token = state.ToastToken
+    state.Toast.Text = message
+    state.Toast.TextColor3 = level == "error" and Color3.fromRGB(255, 147, 147) or Config.TextColor
+    state.Toast.Visible = true
+    task.delay(3.5, function()
+        if not state.Destroyed and token == state.ToastToken and state.Toast.Parent then state.Toast.Visible = false end
+    end)
+end
+
+function ExtraFeatures.OnTabChanged(previousPage, pageName)
+    if previousPage == pageName then return end
+    local state = ExtraFeatures.UIEffects.DynamicColor
+    if state.Tween then state.Tween:Cancel(); state.Tween = nil end
+    MainWindow.BackgroundColor3 = Config.DarkBg
+    local page = GUIState.Pages[pageName]
+    local padding = page and page:FindFirstChildOfClass("UIPadding")
+    if padding and not Config.Interface.ReducedMotion then
+        padding.PaddingTop = UDim.new(0, 18)
+        UI:Tween(padding, "PageEntry", 0.18, {PaddingTop = UDim.new(0, 10)})
+    end
+end
+
+function ExtraFeatures.NewDialog(title, subtitle, height)
+    DestroyMenuProfilePopup()
+    for _, reset in ipairs(UIRefs.Experience.DragResetters) do pcall(reset) end
+    ExtraFeatures.HoldSpamKeyHeld, ExtraFeatures.HoldSpamRightHeld = false, false
+    OtherSystem.KeybindListening = false
+    OtherSystem.KeybindBox, OtherSystem.KeybindCaptureMode = nil, nil
+    ExtraFeatures.HoldSpamListening, ExtraFeatures.HoldSpamKeyBox = false, nil
+    SyncSettingsUI()
+    local state = UIRefs.Experience
+    local width, viewportHeight, margin, top, bottom = ExtraFeatures.ViewBounds()
+    local root = Instance.new("Frame")
+    root.Name = "ProfileModal"
+    root.Size = UDim2.fromScale(1, 1)
+    root.BackgroundTransparency = 1
+    root.ZIndex = 210
+    root.Parent = ScreenGui
+    local backdrop = Instance.new("TextButton")
+    backdrop.Name = "Backdrop"
+    backdrop.Size = UDim2.fromScale(1, 1)
+    backdrop.Text = ""
+    backdrop.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    backdrop.BackgroundTransparency = 0.42
+    backdrop.AutoButtonColor = false
+    backdrop.Modal = true
+    backdrop.ZIndex = 210
+    backdrop.Parent = root
+    local card = Instance.new("Frame")
+    card.Name = "DialogCard"
+    local cw = math.min(368, width - margin * 2)
+    local ch = math.min(height or 236, viewportHeight - top - bottom)
+    card.Size = UDim2.fromOffset(cw, ch)
+    card.Position = UDim2.fromOffset((width - cw) * 0.5, top + (viewportHeight - top - bottom - ch) * 0.5)
+    card.BackgroundColor3 = Config.CardBg
+    card.BorderSizePixel = 0
+    card.ZIndex = 211
+    card.Parent = root
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 12); corner.Parent = card
+    local stroke = Instance.new("UIStroke"); stroke.Color = Config.AccentColor; stroke.Transparency = 0.4; stroke.Parent = card
+    local heading = Instance.new("TextLabel")
+    heading.Name = "Heading"; heading.Size = UDim2.new(1, -32, 0, 26); heading.Position = UDim2.fromOffset(16, 14)
+    heading.BackgroundTransparency = 1; heading.Text = title; heading.Font = Enum.Font.GothamBold
+    heading.TextSize = 17; heading.TextColor3 = Config.TextColor; heading.TextXAlignment = Enum.TextXAlignment.Left
+    heading.Parent = card
+    local description = Instance.new("TextLabel")
+    description.Name = "Description"; description.Size = UDim2.new(1, -32, 0, 34)
+    description.Position = UDim2.fromOffset(16, 44); description.BackgroundTransparency = 1
+    description.Text = subtitle or ""; description.TextWrapped = true; description.TextSize = 12
+    description.Font = Enum.Font.GothamMedium; description.TextColor3 = Config.SubTextColor
+    description.TextXAlignment = Enum.TextXAlignment.Left; description.Parent = card
+    MenuProfilePopup = root
+    state.ModalRoot, state.ModalCard, state.OverlayOpen = root, card, true
+    AddConnection(root.AncestryChanged:Connect(function(_, parent)
+        if parent == nil and state.ModalRoot == root then
+            state.ModalRoot, state.ModalCard, state.OverlayOpen = nil, nil, false
+        end
+    end))
+    return card
+end
+
+function ExtraFeatures.OpenProfileEditor(mode, source)
+    local card = ExtraFeatures.NewDialog(mode == "Rename" and "RENAME PROFILE"
+        or mode == "Duplicate" and "DUPLICATE PROFILE" or "SAVE MENU PROFILE",
+        "Your existing gameplay settings and key bindings are kept.", 232)
+    local box = Instance.new("TextBox")
+    box.Name = "ProfileName"; box.Size = UDim2.new(1, -32, 0, 36)
+    box.Position = UDim2.fromOffset(16, 88); box.BackgroundColor3 = Config.DarkBg
+    box.TextColor3 = Config.TextColor; box.PlaceholderColor3 = Config.SubTextColor
+    box.Font = Enum.Font.GothamMedium; box.TextSize = 14; box.ClearTextOnFocus = false
+    box.Text = source and tostring(source.ProfileName or source.name) .. (mode == "Duplicate" and " copy" or "") or ""
+    box.PlaceholderText = "Profile name..."; box.Parent = card
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 7); corner.Parent = box
+    local errorLabel = Instance.new("TextLabel")
+    errorLabel.Name = "Validation"; errorLabel.Position = UDim2.fromOffset(16, 130)
+    errorLabel.Size = UDim2.new(1, -32, 0, 22); errorLabel.BackgroundTransparency = 1
+    errorLabel.Text = ""; errorLabel.TextSize = 11; errorLabel.TextColor3 = Color3.fromRGB(255, 147, 147)
+    errorLabel.Font = Enum.Font.GothamMedium; errorLabel.TextXAlignment = Enum.TextXAlignment.Left; errorLabel.Parent = card
+    local saving = false
+    local function save()
+        if saving or not box.Parent then return end
+        local name = TrimString(box.Text)
+        if name == "" then errorLabel.Text = "Enter a profile name first."; return end
+        if #name > 96 then errorLabel.Text = "Use a shorter profile name."; return end
+        local existing = FindMenuProfile(name)
+        if existing and existing ~= source then errorLabel.Text = "That profile name already exists."; return end
+        if mode == "Duplicate" and existing then errorLabel.Text = "Choose a new name for the copy."; return end
+        saving = true
+        if mode == "Rename" and source then
+            source.ProfileName, source.name, source.UpdatedAt = name, name, os.time()
+        else
+            local payload = BuildConfigPayload()
+            if mode == "Duplicate" and source then
+                payload = SafeDecodeJSON(SafeEncodeJSON(source.ConfigData or source.config)) or payload
+            end
+            local id, time = GenerateMenuProfileId(), os.time()
+            table.insert(MenuProfiles, {ProfileId = id, ProfileName = name, GameName = CurrentGameName,
+                PlaceId = CurrentPlaceId, ConfigData = payload, Version = 1, CreatedAt = time, UpdatedAt = time,
+                profileId = id, name = name, gameName = CurrentGameName, placeId = CurrentPlaceId,
+                config = payload, version = 1, createdAt = time})
+        end
+        local persisted = SaveMenuProfiles()
+        RefreshMenuProfileList()
+        DestroyMenuProfilePopup()
+        SetSettingsStatus(persisted and ("Profile saved: " .. name) or ("Profile kept for this session: " .. name))
+    end
+    local saveButton = UI:CreateButton(card, "SAVE", save)
+    saveButton.Name = "SaveProfile"; saveButton.Size = UDim2.new(0.5, -22, 0, 34)
+    saveButton.Position = UDim2.new(0, 16, 1, -48)
+    local cancel = UI:CreateButton(card, "CANCEL", DestroyMenuProfilePopup)
+    cancel.Size = UDim2.new(0.5, -22, 0, 34); cancel.Position = UDim2.new(0.5, 6, 1, -48)
+    UI:ConnectOwned(box, box.FocusLost, function(enterPressed) if enterPressed then save() end end)
+    box:CaptureFocus()
+end
+
+function ExtraFeatures.ProfileActions(profile)
+    local card = ExtraFeatures.NewDialog("PROFILE OPTIONS", tostring(profile.ProfileName or profile.name), 310)
+    local body = Instance.new("ScrollingFrame")
+    body.Position = UDim2.fromOffset(16, 84); body.Size = UDim2.new(1, -32, 1, -134)
+    body.BackgroundTransparency = 1; body.BorderSizePixel = 0; body.ScrollBarThickness = 2
+    body.AutomaticCanvasSize = Enum.AutomaticSize.Y; body.CanvasSize = UDim2.new(); body.Parent = card
+    local list = Instance.new("UIListLayout"); list.Padding = UDim.new(0, 7); list.Parent = body
+    UI:CreateButton(body, "Rename", function() ExtraFeatures.OpenProfileEditor("Rename", profile) end)
+    UI:CreateButton(body, "Duplicate", function() ExtraFeatures.OpenProfileEditor("Duplicate", profile) end)
+    UI:CreateButton(body, "Update with current settings", function()
+        local payload = BuildConfigPayload()
+        profile.ConfigData, profile.config, profile.UpdatedAt = payload, payload, os.time()
+        local persisted = SaveMenuProfiles(); RefreshMenuProfileList(); DestroyMenuProfilePopup()
+        SetSettingsStatus(persisted and "Profile updated." or "Profile updated for this session.")
+    end)
+    local cancel = UI:CreateButton(card, "CLOSE", DestroyMenuProfilePopup)
+    cancel.Size = UDim2.new(1, -32, 0, 34); cancel.Position = UDim2.new(0, 16, 1, -48)
+end
+
+function ExtraFeatures.ConfirmProfileDelete(profile)
+    local card = ExtraFeatures.NewDialog("DELETE PROFILE?", tostring(profile.ProfileName or profile.name), 190)
+    local remove = UI:CreateButton(card, "DELETE", function()
+        if DeleteMenuProfile(profile.ProfileId or profile.profileId or profile.name) then
+            RefreshMenuProfileList(); DestroyMenuProfilePopup(); SetSettingsStatus("Profile deleted: " .. profile.name)
+        end
+    end)
+    remove.Size = UDim2.new(0.5, -22, 0, 34); remove.Position = UDim2.new(0, 16, 1, -48)
+    local cancel = UI:CreateButton(card, "CANCEL", DestroyMenuProfilePopup)
+    cancel.Size = UDim2.new(0.5, -22, 0, 34); cancel.Position = UDim2.new(0.5, 6, 1, -48)
+end
+
+function ExtraFeatures.ShowTooltip(message, anchor)
+    local state = UIRefs.Experience
+    if state.Destroyed or state.OverlayOpen or not MainWindow.Visible then return end
+    if not state.Tooltip then
+        local tip = Instance.new("TextLabel")
+        tip.Name = "FeatureTooltip"; tip.Size = UDim2.fromOffset(280, 64)
+        tip.BackgroundColor3 = Config.CardBg; tip.TextColor3 = Config.TextColor
+        tip.Font = Enum.Font.GothamMedium; tip.TextSize = 12; tip.TextWrapped = true
+        tip.TextXAlignment = Enum.TextXAlignment.Left; tip.BorderSizePixel = 0; tip.ZIndex = 180
+        tip.Parent = ScreenGui
+        local pad = Instance.new("UIPadding"); pad.PaddingLeft = UDim.new(0, 12); pad.PaddingRight = UDim.new(0, 12); pad.Parent = tip
+        local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 8); corner.Parent = tip
+        state.Tooltip = tip
+    end
+    local scale = math.max(UIScaleObj.Scale, 0.01)
+    local position = anchor and anchor.AbsolutePosition or UserInputService:GetMouseLocation()
+    state.Tooltip.Text = message
+    state.Tooltip.Position = UDim2.fromOffset(position.X / scale + 12, position.Y / scale + 28)
+    state.Tooltip.Visible = true
+    ExtraFeatures.ClampInterfaceFrame(state.Tooltip)
+end
+
+function ExtraFeatures.BindTooltip(object, message)
+    AddConnection(object.MouseEnter:Connect(function() ExtraFeatures.ShowTooltip(message, object) end))
+    AddConnection(object.MouseLeave:Connect(function()
+        if UIRefs.Experience.Tooltip then UIRefs.Experience.Tooltip.Visible = false end
+    end))
+end
+
+function ExtraFeatures.FilterPlayers()
+    local state = UIRefs.Experience
+    local query = state.PlayerSearch and string.lower(state.PlayerSearch.Text) or ""
+    for _, button in ipairs(TeleportList:GetChildren()) do
+        if button:IsA("TextButton") then
+            button.Visible = query == "" or string.find(string.lower(button.Text), query, 1, true) ~= nil
+        end
+    end
+    TeleportList.CanvasSize = UDim2.new()
+end
+
+function ExtraFeatures.StylePlayerButton(button, target)
+    local state = UIRefs.Experience
+    button.Size = UDim2.new(1, 0, 0, 38)
+    button.TextSize = 12; button.TextXAlignment = Enum.TextXAlignment.Left
+    button.TextTruncate = Enum.TextTruncate.AtEnd
+    local pad = Instance.new("UIPadding"); pad.PaddingLeft = UDim.new(0, 42); pad.Parent = button
+    local avatar = Instance.new("ImageLabel")
+    avatar.Name = "Avatar"; avatar.BackgroundColor3 = Config.CardBg; avatar.BorderSizePixel = 0
+    avatar.Size = UDim2.fromOffset(28, 28); avatar.Position = UDim2.fromOffset(-36, 5); avatar.Parent = button
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(1, 0); corner.Parent = avatar
+    state.Portraits = state.Portraits or {}
+    local cached = state.Portraits[target.UserId]
+    if cached then avatar.Image = cached else
+        task.defer(function()
+            local ok, content = pcall(function()
+                return Players:GetUserThumbnailAsync(target.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+            end)
+            if ok and type(content) == "string" then
+                state.Portraits[target.UserId] = content
+                if avatar.Parent then avatar.Image = content end
+            end
+        end)
+    end
+end
+
+function ExtraFeatures.UpdateInterfaceStatus(dt)
+    local state = UIRefs.Experience
+    if not state.Ready or state.Destroyed then return end
+    state.StatusAccumulator = state.StatusAccumulator + (tonumber(dt) or 0)
+    if state.StatusAccumulator < 0.35 then return end
+    state.StatusAccumulator = 0
+    local enabled, npcCount = 0, 0
+    for _, record in ipairs(state.Controls) do
+        if record.Kind == "Toggle" and record.API.Get() then enabled = enabled + 1 end
+    end
+    for _ in pairs(NPCSystem.ValidNPCs) do npcCount = npcCount + 1 end
+    if state.FooterLeft then state.FooterLeft.Text = tostring(GUIState.ActivePage or "MENU") .. "  ·  " .. enabled .. " toggles ON" end
+    if state.FooterRight then state.FooterRight.Text = "FPS " .. ExtraFeatures.UIEffects.Bubble.LastFPS .. "  |  " .. Config.ToggleKey.Name end
+    if state.Summary then
+        state.Summary.Text = "MENU READY  ·  " .. enabled .. " toggles ON\n"
+            .. tostring(#Players:GetPlayers()) .. " players  ·  " .. npcCount .. " NPCs tracked\n"
+            .. "Press " .. Config.ToggleKey.Name .. " to open the menu. F4 unloads it."
+    end
+    local bridge = game:GetService("ReplicatedStorage"):FindFirstChild(ExtraFeatures.DeveloperCombat.FolderName)
+    local remote = bridge and bridge:FindFirstChild(ExtraFeatures.DeveloperCombat.RemoteName)
+    local hasBridge = remote ~= nil and remote:IsA("RemoteEvent")
+    if state.BridgeStatus then state.BridgeStatus.Text = hasBridge and "Combat bridge: READY" or "Combat bridge: NOT CONNECTED" end
+    for _, record in ipairs(state.Controls) do
+        if record.Hint then
+            local text = record.Description or ""
+            if record.Key == "TargetAssist" and Config.TargetAssistEnabled then
+                text = not Config.AimEnabled and "Waiting: enable AIM." or not Config.UseFOV and "Waiting: enable FOV."
+                    or "Target: " .. (ExtraFeatures.TargetAssist.CurrentTarget and ExtraFeatures.TargetAssist.CurrentTarget.Name or "None")
+            elseif record.Key == "AimSilent" and Config.AimSilentEnabled then
+                text = not Config.UseFOV and "Waiting: enable FOV." or not hasBridge and "Waiting: combat bridge."
+                    or "Target: " .. (ExtraFeatures.AimSilent.CurrentTarget and ExtraFeatures.AimSilent.CurrentTarget.Name or "None")
+            elseif record.Key == "MagicSilent" and Config.MagicSilentEnabled and not hasBridge then text = "Waiting: combat bridge."
+            elseif record.Key == "HeadHitbox" and Config.HeadHitboxEnabled and Config.HeadHitboxSize <= 0 then text = "Waiting: set Head Size above 0." end
+            if record.Hint.Text ~= text then record.Hint.Text = text end
+        end
+    end
+end
+
+function ExtraFeatures.DestroyInterface()
+    local state = UIRefs.Experience
+    for _, object in pairs({Tooltip = state.Tooltip, Toast = state.Toast, Shadow = state.Shadow, Modal = state.ModalRoot}) do
+        if object then pcall(function() object:Destroy() end) end
+    end
+    for _, slots in pairs(state.TweenSlots) do for _, tween in pairs(slots) do pcall(function() tween:Cancel() end) end end
+    state.OverlayOpen = false
+    state.ToastToken = (state.ToastToken or 0) + 1
+    table.clear(state.DragResetters)
+end
+
+function ExtraFeatures.InitializeInterface()
+    local state = UIRefs.Experience
+    if state.Ready then return end
+    state.Ready = true
+    state.BaseAnimations = {Open = ExtraFeatures.AnimateMenuOpen, Minimize = ExtraFeatures.AnimateMenuMinimize}
+    ExtraFeatures.AnimateMenuOpen = function()
+        if not Config.Interface.ReducedMotion then return state.BaseAnimations.Open() end
+        local effects = ExtraFeatures.UIEffects
+        effects.Bubble.Token = effects.Bubble.Token + 1
+        effects.AnimationBusy = false
+        ExtraFeatures.PrepareBubble()
+        effects.Bubble.MainScale.Scale = 1
+        MainWindow.BackgroundTransparency = Config.BackgroundTransparency
+        MainWindow.Visible, FloatingBtn.Visible = true, false
+    end
+    ExtraFeatures.AnimateMenuMinimize = function()
+        if not Config.Interface.ReducedMotion then return state.BaseAnimations.Minimize() end
+        local effects = ExtraFeatures.UIEffects
+        effects.Bubble.Token = effects.Bubble.Token + 1
+        effects.AnimationBusy = false
+        MainWindow.Visible, FloatingBtn.Visible = false, true
+        effects.Bubble.BubbleScale.Scale = 1
+        ExtraFeatures.ShowMinimizeChat()
+    end
+    state.Shadow = Instance.new("Frame")
+    state.Shadow.Name = "WindowShadow"; state.Shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    state.Shadow.BackgroundTransparency = 0.56; state.Shadow.BorderSizePixel = 0
+    state.Shadow.ZIndex = 59; state.Shadow.Parent = ScreenGui
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 14); corner.Parent = state.Shadow
+    AddConnection(MainWindow:GetPropertyChangedSignal("Visible"):Connect(function() state.Shadow.Visible = MainWindow.Visible end))
+    AddConnection(UIScaleObj:GetPropertyChangedSignal("Scale"):Connect(function() ExtraFeatures.ApplyInterfaceLayout(true) end))
+    MainStroke.Thickness = 1.5
+    UIRefs.MainRainbowGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(55, 198, 255)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(132, 115, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(55, 198, 255))})
+    local toolbar = Instance.new("Frame")
+    toolbar.Name = "SearchToolbar"; toolbar.BackgroundTransparency = 1
+    toolbar.Position = UDim2.fromOffset(16, 79); toolbar.Size = UDim2.new(1, -32, 0, 27); toolbar.Parent = Header
+    local search = Instance.new("TextBox")
+    search.Name = "FeatureSearch"; search.Size = UDim2.new(1, -108, 1, 0)
+    search.BackgroundColor3 = Config.CardBg; search.BorderSizePixel = 0
+    search.Text = ""; search.PlaceholderText = "Search features..."; search.ClearTextOnFocus = false
+    search.Font = Enum.Font.GothamMedium; search.TextSize = 12; search.TextColor3 = Config.TextColor
+    search.PlaceholderColor3 = Config.SubTextColor; search.Parent = toolbar
+    local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0, 7); sc.Parent = search
+    state.SearchBox = search
+    local favorites = Instance.new("TextButton")
+    favorites.Name = "FavoritesOnly"; favorites.Size = UDim2.fromOffset(98, 27); favorites.Position = UDim2.new(1, -98, 0, 0)
+    favorites.Text = "☆  Favorites"; favorites.BackgroundColor3 = Config.CardBg; favorites.AutoButtonColor = false
+    favorites.TextSize = 11; favorites.Font = Enum.Font.GothamMedium; favorites.TextColor3 = Config.SubTextColor
+    favorites.Parent = toolbar
+    local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 7); fc.Parent = favorites
+    state.SearchCount = Instance.new("TextLabel")
+    state.SearchCount.Name = "SearchResultCount"; state.SearchCount.BackgroundTransparency = 1
+    state.SearchCount.Size = UDim2.fromOffset(145, 28); state.SearchCount.Position = UDim2.new(1, -150, 0, 46)
+    state.SearchCount.TextColor3 = Config.SubTextColor; state.SearchCount.Font = Enum.Font.GothamMedium
+    state.SearchCount.TextSize = 10; state.SearchCount.TextXAlignment = Enum.TextXAlignment.Right
+    state.SearchCount.Parent = Header
+    AddConnection(search:GetPropertyChangedSignal("Text"):Connect(function()
+        state.Query = search.Text; UI:ApplyFilter()
+        if (state.Counts[GUIState.ActivePage] or 0) == 0 and state.Query ~= "" then
+            for _, name in ipairs({"AIM", "ESP", "PLAYER", "NPC", "TELEPORT", "SETTINGS", "KHÁC", "FUNCTION 1", "PROFILE", "FAVORITES", "OVERVIEW"}) do
+                if (state.Counts[name] or 0) > 0 then PageManager:ShowPage(name, true); break end
+            end
+        end
+    end))
+    AddConnection(favorites.MouseButton1Click:Connect(function()
+        state.FavoritesOnly = not state.FavoritesOnly
+        favorites.Text = state.FavoritesOnly and "★  Favorites" or "☆  Favorites"
+        favorites.TextColor3 = state.FavoritesOnly and Color3.fromRGB(255, 206, 103) or Config.SubTextColor
+        UI:ApplyFilter()
+    end))
+    local footer = Instance.new("Frame")
+    footer.Name = "StatusBar"; footer.Size = UDim2.new(1, 0, 0, 30); footer.Position = UDim2.new(0, 0, 1, -30)
+    footer.BackgroundColor3 = Config.SidebarBg; footer.BorderSizePixel = 0; footer.Parent = MainWindow
+    state.FooterLeft = Instance.new("TextLabel")
+    state.FooterLeft.BackgroundTransparency = 1; state.FooterLeft.Size = UDim2.new(0.56, -20, 1, 0)
+    state.FooterLeft.Position = UDim2.fromOffset(12, 0); state.FooterLeft.Text = "MENU READY"
+    state.FooterLeft.TextColor3 = Config.SubTextColor; state.FooterLeft.Font = Enum.Font.GothamMedium
+    state.FooterLeft.TextSize = 10; state.FooterLeft.TextXAlignment = Enum.TextXAlignment.Left; state.FooterLeft.Parent = footer
+    state.FooterRight = state.FooterLeft:Clone(); state.FooterRight.Size = UDim2.new(0.44, -20, 1, 0)
+    state.FooterRight.Position = UDim2.new(0.56, 0, 0, 0); state.FooterRight.TextXAlignment = Enum.TextXAlignment.Right
+    state.FooterRight.Parent = footer
+    state.Toast = Instance.new("TextLabel")
+    state.Toast.Name = "StatusToast"; state.Toast.Size = UDim2.new(1, -36, 0, 52)
+    state.Toast.Position = UDim2.new(0, 18, 1, -88); state.Toast.BackgroundColor3 = Config.CardBg
+    state.Toast.TextColor3 = Config.TextColor; state.Toast.Font = Enum.Font.GothamMedium
+    state.Toast.TextSize = 12; state.Toast.TextWrapped = true; state.Toast.Visible = false
+    state.Toast.ZIndex = 150; state.Toast.Parent = MainWindow
+    local tc = Instance.new("UICorner"); tc.CornerRadius = UDim.new(0, 9); tc.Parent = state.Toast
+    local resize = Instance.new("TextButton")
+    resize.Name = "ResizeHandle"; resize.Text = "◢"; resize.Size = UDim2.fromOffset(20, 20)
+    resize.Position = UDim2.new(1, -21, 1, -23); resize.BackgroundTransparency = 1
+    resize.TextColor3 = Config.SubTextColor; resize.TextSize = 14; resize.ZIndex = 70; resize.Parent = MainWindow
+    local resizeInput, resizeStart, resizeSize
+    AddConnection(resize.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        resizeInput, resizeStart, resizeSize = input, input.Position, MainWindow.Size
+    end))
+    AddConnection(UserInputService.InputChanged:Connect(function(input)
+        if not resizeInput or state.OverlayOpen then return end
+        if input ~= resizeInput and not (resizeInput.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement) then return end
+        local delta = (input.Position - resizeStart) / math.max(UIScaleObj.Scale, 0.01)
+        Config.Interface.Window.Width = math.clamp(resizeSize.X.Offset + delta.X, 280, 1200)
+        Config.Interface.Window.Height = math.clamp(resizeSize.Y.Offset + delta.Y, 280, 900)
+        ExtraFeatures.ApplyInterfaceLayout(false)
+    end))
+    AddConnection(UserInputService.InputEnded:Connect(function(input) if input == resizeInput then resizeInput = nil end end))
+    table.insert(state.DragResetters, function() resizeInput = nil end)
+
+    local overview = PageManager:AddPage("OVERVIEW")
+    GUIState.TabButtons.OVERVIEW.LayoutOrder = -10
+    local summary = UI:CreateSection(overview, "SESSION OVERVIEW")
+    state.Summary = UI:CreateLabel(summary, "MENU READY")
+    state.BridgeStatus = UI:CreateLabel(summary, "Combat bridge: checking...")
+    local shortcuts = UI:CreateSection(overview, "QUICK NAVIGATION")
+    for _, name in ipairs({"AIM", "ESP", "PLAYER", "TELEPORT", "SETTINGS"}) do
+        UI:CreateButton(shortcuts, "Open " .. name, function() PageManager:ShowPage(name) end)
+    end
+    local preferences = UI:CreateSection(SettingsPage, "INTERFACE")
+    state.PreferenceControls = {}
+    for _, entry in ipairs({{"ReducedMotion", "Reduced Motion"}, {"ClickEffects", "Toggle Effects"},
+        {"SoundEffects", "UI Sounds"}, {"RememberLayout", "Remember Layout"}, {"CompactSidebar", "Compact Sidebar"}}) do
+        local key = entry[1]
+        state.PreferenceControls[key] = UI:CreateToggle(preferences, {Text = entry[2], Default = Config.Interface[key],
+            Callback = function(value) Config.Interface[key] = value; ExtraFeatures.ApplyInterfaceLayout(false) end})
+    end
+    state.VolumeControl = UI:CreateSlider(preferences, {Text = "UI Volume", Min = 0, Max = 1,
+        Default = Config.Interface.SoundVolume, Increment = 0.01, EditableValue = true,
+        Callback = function(value) Config.Interface.SoundVolume = value end})
+    UI:CreateButton(preferences, "Reset window layout", function()
+        Config.Interface.Window = {Width = 720, Height = 520, X = 0.5, Y = 0.5}
+        ExtraFeatures.ApplyInterfaceLayout(true)
+    end)
+    local diagnostics = UI:CreateSection(SettingsPage, "DIAGNOSTICS")
+    UI:CreateButton(diagnostics, "Show recent errors", function()
+        local lines = {}
+        for _, entry in ipairs(state.Errors) do table.insert(lines, entry.Text) end
+        ExtraFeatures.OpenNotificationView(#lines > 0 and table.concat(lines, "\n\n") or "No errors recorded.", "DIAGNOSTICS")
+    end)
+    local descriptions = {
+        CFrameSpeedEnabled = "Move using the existing CFrame speed controller.", CFrameSpeed = "Speed value; typed values can expand the slider range.",
+        JumpPowerOverrideEnabled = "Override jump power only while enabled.", JumpPower = "Applied by Jump Override / Air Fly as before.",
+        AirFlyEnabled = "Use the existing airborne jump behavior.", FlyEnabled = "Use the existing camera-directed Fly controller.",
+        FlySpeed = "Flight speed in studs per second.", FullBrightEnabled = "Temporarily apply the existing lighting preset.", NoclipEnabled = "Use the existing character collision controller.",
+        AimEnabled = "Master switch for the existing AIM controller.", TeamCheck = "Apply the existing teammate filter.", WallCheck = "Check the path between camera and target.",
+        IgnoreVisibility = "Use the existing visibility override.", AimNPC = "Allow tracked NPCs in the existing target selection.",
+        UseFOV = "Limit targets by the existing screen-space FOV.", FOV = "Radius in screen pixels, not camera angle.", Smoothness = "Higher values rotate faster, matching the original behavior.",
+        TargetAssist = "Requires AIM and FOV; original target selection is retained.", AimSilent = "Requires FOV and the existing developer combat bridge.",
+        HeadHitbox = "Original NPC / dummy Head Hitbox implementation.", HeadHitboxSize = "Increase above 0 to show expanded head bounds.",
+        TelekillEnabled = "Original target, orbit and auto-fire behavior.", TelekillDistance = "Existing orbit distance in studs.",
+        Enabled = "Master switch for the existing ESP renderer.", ShowEnemies = "Display enemy targets.", ShowTeammates = "Display teammate targets.",
+        ShowName = "Display the existing player / NPC name overlay.", ShowBox = "Display the existing projected bounding box.",
+        ShowTracer = "Display screen-space tracer lines.", ShowSkeleton = "Display the existing R6 / R15 skeleton lines.",
+        ShowHealth = "Display current and maximum health.", ShowDistance = "Display target distance in studs.", ESPHighlightEnabled = "Display the existing classification-colored Highlight.",
+        ShowNPC = "Use the shared NPC registry and ESP renderer.", ThirdPersonLock = "Use the existing third-person camera setting.",
+        XRayEnabled = "Restore map transparency when disabled or closed.", XRayTransparency = "Opacity setting for the existing X-Ray feature.",
+        AntiAFK = "Use the existing environment-supported Anti-AFK implementation.", HoldToSpam = "Hold the assigned key and right mouse button as before.",
+        VirtualPet = "Keep the existing reactive virtual pet.", Snowfall = "Keep the existing snowfall effect.", MagicSilent = "Use the existing FUNCTION 1 combat bridge behavior."
+    }
+    for _, registry in ipairs({UIRefs.Toggles, UIRefs.Sliders}) do
+        for key, api in pairs(registry) do
+            local record = api.Frame and state.ByFrame[api.Frame]
+            if record then record.Key, record.Description = key, descriptions[key] or "" end
+        end
+    end
+    for _, record in ipairs(state.Controls) do
+        if record.Hint then record.Hint.Text = record.Description or "" end
+        if record.Description and record.Description ~= "" then
+            ExtraFeatures.BindTooltip(record.Frame, record.Text .. "\n" .. record.Description)
+            record.Search = record.Search .. " " .. string.lower(record.Description)
+        end
+    end
+    for name, page in pairs(GUIState.Pages) do
+        local record = {}
+        state.Pages[name] = record
+        local empty = UI:CreateLabel(page, "No matching features. Try another search or clear Favorites.")
+        empty.Name = "EmptySearch"; empty.LayoutOrder = -2000; empty.Visible = false
+        record.Empty = empty
+        ExtraFeatures.BindTooltip(GUIState.TabButtons[name], name)
+    end
+    state.PlayerSearch = Instance.new("TextBox")
+    state.PlayerSearch.Name = "PlayerSearch"; state.PlayerSearch.Size = UDim2.new(1, 0, 0, 32)
+    state.PlayerSearch.BackgroundColor3 = Config.DarkBg; state.PlayerSearch.Text = ""
+    state.PlayerSearch.PlaceholderText = "Find a player..."; state.PlayerSearch.TextColor3 = Config.TextColor
+    state.PlayerSearch.PlaceholderColor3 = Config.SubTextColor; state.PlayerSearch.ClearTextOnFocus = false
+    state.PlayerSearch.Font = Enum.Font.GothamMedium; state.PlayerSearch.TextSize = 12
+    state.PlayerSearch.LayoutOrder = -1; state.PlayerSearch.Parent = TeleportListSec
+    AddConnection(state.PlayerSearch:GetPropertyChangedSignal("Text"):Connect(ExtraFeatures.FilterPlayers))
+    TeleportList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    TeleportList.Size = UDim2.new(1, 0, 0, 182)
+    MenuProfileList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    RefreshTeleportPlayerList()
+    UI:ApplyFilter()
+    ExtraFeatures.ApplyInterfaceLayout(true)
+    SyncSettingsUI()
+    OtherSystem.SetMenuMouseState(true)
+    AddConnection(UserInputService.WindowFocusReleased:Connect(function()
+        ExtraFeatures.HoldSpamKeyHeld, ExtraFeatures.HoldSpamRightHeld = false, false
+        ExtraFeatures.HoldSpamAccumulator = 0
+        table.clear(OtherSystem.ActiveFireTouches); TouchFireActive = false
+        for _, reset in ipairs(state.DragResetters) do pcall(reset) end
+    end))
+    AddConnection(UserInputService.InputBegan:Connect(function(input)
+        if state.OverlayOpen and input.KeyCode == Enum.KeyCode.Escape then DestroyMenuProfilePopup() end
+    end))
+    local cameraConnection
+    local function bindCamera()
+        if cameraConnection then cameraConnection:Disconnect() end
+        local camera = Workspace.CurrentCamera
+        if camera then cameraConnection = AddConnection(camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            ExtraFeatures.ApplyInterfaceLayout(true)
+        end)) end
+        ExtraFeatures.ApplyInterfaceLayout(true)
+    end
+    AddConnection(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCamera))
+    bindCamera()
+    ExtraFeatures.UpdateInterfaceStatus(1)
+end
+
+_G.MyGUIFramework.Interface = {
+    Notify = ExtraFeatures.Notify,
+    ApplyLayout = ExtraFeatures.ApplyInterfaceLayout,
+    Search = function(query) UIRefs.Experience.SearchBox.Text = tostring(query or "") end,
+    GetDiagnostics = function() return UIRefs.Experience.Errors end
+}
+
+do
+    local ok, reason = pcall(ExtraFeatures.InitializeInterface)
+    if not ok then warn("[Hood Rivals] Interface upgrade: " .. tostring(reason)) end
+end
+
+
+
+ExtraFeatures.V8.Vietnamese = {
+    ["OVERVIEW"] = "TỔNG QUAN", ["HOME"] = "TỔNG QUAN", ["PLAYER"] = "NHÂN VẬT", ["AIM"] = "NGẮM",
+    ["FAVORITES"] = "YÊU THÍCH", ["YOUR FAVORITES"] = "MỤC YÊU THÍCH CỦA BẠN",
+    ["AIM Main"] = "NGẮM CHÍNH", ["AIM Mode"] = "CHẾ ĐỘ NGẮM", ["AIM Target"] = "MỤC TIÊU NGẮM",
+    ["AIM FOV"] = "VÙNG NGẮM", ["AIM Settings"] = "CÀI ĐẶT NGẮM", ["AIM SILENT"] = "NGẮM SILENT",
+    ["ESP Main"] = "ESP CHÍNH", ["ESP Settings"] = "CÀI ĐẶT ESP", ["ESP Visuals"] = "HIỂN THỊ ESP",
+    ["CHARACTER"] = "NHÂN VẬT", ["JUMP"] = "NHẢY", ["FEATURE SETTINGS"] = "CÀI ĐẶT CHỨC NĂNG",
+    ["HEAD HITBOX"] = "VÙNG TRÚNG ĐẦU", ["SELECTED PLAYER"] = "NGƯỜI CHƠI ĐÃ CHỌN",
+    ["TARGET ASSIST"] = "HỖ TRỢ MỤC TIÊU", ["TARGET FILTERS"] = "BỘ LỌC MỤC TIÊU", ["TELEKILL"] = "TELEKILL",
+    ["UI EFFECTS"] = "HIỆU ỨNG GIAO DIỆN", ["Game Pass Spoofer"] = "Mô phỏng Game Pass",
+    ["Quick Targets: [1] Enemy   [2] Aim Team   [3] Aim NPC"] = "Đổi nhanh: [1] Địch   [2] Đồng đội   [3] NPC",
+    ["Tracks the closest valid target and shows local shot feedback without changing the camera."] = "Theo dõi mục tiêu hợp lệ và hiển thị phản hồi phát bắn.",
+    ["W/A/S/D/Q/E move the safe freecam. Target tracking is visual only."] = "W/A/S/D/Q/E di chuyển camera tự do. Theo dõi mục tiêu bằng hiển thị.",
+    ["Game Pass Spoofer is client-side only; server ownership is unchanged."] = "Mô phỏng Game Pass chỉ thay đổi hiển thị trên máy của bạn.",
+    ["Master switch for the existing AIM controller."] = "Công tắc chính của chức năng ngắm.",
+    ["Apply the existing teammate filter."] = "Dùng bộ lọc đồng đội đã chọn.",
+    ["Check the path between camera and target."] = "Kiểm tra vật cản từ camera đến mục tiêu.",
+    ["Use the existing visibility override."] = "Bỏ qua kiểm tra mục tiêu đang hiển thị.",
+    ["Limit targets by the existing screen-space FOV."] = "Chỉ chọn mục tiêu trong vùng ngắm trên màn hình.",
+    ["Allow tracked NPCs in the existing target selection."] = "Cho phép chọn NPC được theo dõi làm mục tiêu.",
+    ["Higher values rotate faster, matching the original behavior."] = "Giá trị lớn hơn làm tốc độ xoay ngắm nhanh hơn.",
+    ["Radius in screen pixels, not camera angle."] = "Bán kính vùng ngắm tính bằng pixel trên màn hình.",
+    ["Requires AIM and FOV; original target selection is retained."] = "Cần bật ngắm và vùng ngắm; dùng bộ lọc mục tiêu hiện tại.",
+    ["Requires FOV and the existing developer combat bridge."] = "Cần vùng ngắm và kết nối combat của game.",
+    ["Increase above 0 to show expanded head bounds."] = "Đặt lớn hơn 0 để hiển thị vùng đầu mở rộng.",
+    ["Original NPC / dummy Head Hitbox implementation."] = "Vùng trúng đầu dành cho NPC hoặc hình nộm.",
+    ["Move using the existing CFrame speed controller."] = "Di chuyển bằng chức năng tốc độ CFrame.",
+    ["Speed value; typed values can expand the slider range."] = "Tốc độ di chuyển; nhập số để mở rộng phạm vi thanh trượt.",
+    ["Use the existing airborne jump behavior."] = "Dùng chức năng nhảy khi đang trên không.",
+    ["Override jump power only while enabled."] = "Chỉ thay đổi lực nhảy khi bật tùy chọn này.",
+    ["Applied by Jump Override / Air Fly as before."] = "Lực nhảy áp dụng cho tùy chỉnh nhảy hoặc bay trên không.",
+    ["Use the existing camera-directed Fly controller."] = "Bay theo hướng camera.",
+    ["Flight speed in studs per second."] = "Tốc độ bay tính bằng stud mỗi giây.",
+    ["Use the existing character collision controller."] = "Điều chỉnh va chạm của nhân vật.",
+    ["Temporarily apply the existing lighting preset."] = "Tạm thời áp dụng thiết lập ánh sáng đã chọn.",
+    ["Original target, orbit and auto-fire behavior."] = "Dùng lựa chọn mục tiêu, quỹ đạo và tự bắn hiện tại.",
+    ["Existing orbit distance in studs."] = "Khoảng cách quỹ đạo tính bằng stud.",
+    ["Use the existing FUNCTION 1 combat bridge behavior."] = "Dùng kết nối combat của Chức năng 1.",
+    ["Distance: Nearest"] = "Khoảng cách: Gần nhất", ["Distance: Farthest"] = "Khoảng cách: Xa nhất",
+    ["Profiles saved"] = "Đã lưu các cấu hình",
+    ["ESP"] = "ESP", ["NPC"] = "NPC", ["TELEPORT"] = "DỊCH CHUYỂN", ["TP"] = "DỊCH CHUYỂN",
+    ["SETTINGS"] = "CÀI ĐẶT", ["SET"] = "CÀI ĐẶT", ["PROFILE"] = "HỒ SƠ", ["FUNCTION 1"] = "CHỨC NĂNG 1",
+    ["Aim Enable"] = "Bật ngắm", ["Team Check"] = "Kiểm tra đội", ["Wall Check"] = "Kiểm tra vật cản",
+    ["Ignore Visibility"] = "Bỏ qua kiểm tra hiển thị", ["Use FOV"] = "Dùng vùng ngắm", ["Always Aim"] = "Luôn ngắm",
+    ["Aim On Fire"] = "Ngắm khi bắn", ["Smoothness"] = "Độ mượt", ["Max Distance"] = "Khoảng cách tối đa",
+    ["Aim NPC"] = "Ngắm NPC", ["AIM NPC"] = "NGẮM NPC", ["Aim Team"] = "Ngắm đồng đội",
+    ["Target Assist"] = "Hỗ trợ mục tiêu", ["AimSilent"] = "AimSilent", ["Head Hitbox"] = "Vùng trúng đầu",
+    ["Head Size"] = "Kích thước đầu", ["CFrame Speed"] = "Tốc độ di chuyển", ["Air Fly"] = "Bay trên không",
+    ["Jump Power"] = "Lực nhảy", ["Jump Power Override"] = "Tùy chỉnh lực nhảy", ["Fly"] = "Bay",
+    ["Fly Speed"] = "Tốc độ bay", ["Full Bright"] = "Làm sáng bản đồ", ["Noclip"] = "Đi xuyên vật cản",
+    ["ESP Enable"] = "Bật ESP", ["ESP Enemy"] = "ESP địch", ["ESP Team"] = "ESP đồng đội", ["ESP NPC"] = "ESP NPC",
+    ["ESP Name"] = "Tên mục tiêu", ["ESP Box"] = "Khung mục tiêu", ["ESP Tracer"] = "Đường chỉ mục tiêu",
+    ["ESP Skeleton"] = "Khung xương", ["ESP Health"] = "Thanh máu", ["ESP Distance"] = "Khoảng cách mục tiêu",
+    ["ESP Highlight"] = "Viền mục tiêu", ["Enemy"] = "Địch", ["Team"] = "Đồng đội", ["Nearest"] = "Gần nhất",
+    ["Farthest"] = "Xa nhất", ["Tele Distance"] = "Khoảng cách dịch chuyển", ["Telekill"] = "Telekill",
+    ["Third Person Lock"] = "Khóa góc nhìn thứ ba", ["X-Ray"] = "X-Ray", ["X-Ray Transparency"] = "Độ trong suốt X-Ray",
+    ["Hold to Spam"] = "Giữ phím để bấm liên tục", ["Virtual Pet"] = "Thú cưng ảo", ["Snowfall"] = "Hiệu ứng tuyết",
+    ["Anti-AFK"] = "Chống AFK", ["Magic Silent"] = "Magic Silent", ["Drone Strike: ACTIVE"] = "Drone Strike: ĐANG BẬT",
+    ["Drone Strike: OFF"] = "Drone Strike: ĐÃ TẮT", ["TP ON"] = "TP BẬT", ["TP OFF"] = "TP TẮT",
+    ["Aim Part: Head"] = "Vị trí ngắm: Đầu", ["Aim Part: Body"] = "Vị trí ngắm: Thân",
+    ["No player selected"] = "Chưa chọn người chơi", ["Target: None"] = "Mục tiêu: Chưa có",
+    ["Search features..."] = "Tìm tính năng...", ["Search..."] = "Tìm kiếm...", ["Find a player..."] = "Tìm người chơi...",
+    ["Profile name..."] = "Tên cấu hình...", ["Press Key..."] = "Nhấn phím...", ["ALL FEATURES"] = "TẤT CẢ TÍNH NĂNG",
+    ["☆  Favorites"] = "☆  Yêu thích", ["★  Favorites"] = "★  Yêu thích",
+    ["No matching features. Try another search or clear Favorites."] = "Không có tính năng phù hợp. Đổi từ khóa hoặc tắt lọc yêu thích.",
+    ["No favorites yet. Click a star next to a feature."] = "Chưa có mục yêu thích. Nhấn ngôi sao cạnh tính năng để lưu.",
+    ["SESSION OVERVIEW"] = "TỔNG QUAN PHIÊN", ["QUICK NAVIGATION"] = "ĐIỀU HƯỚNG NHANH", ["INTERFACE"] = "GIAO DIỆN",
+    ["DIAGNOSTICS"] = "CHẨN ĐOÁN", ["NOTIFICATIONS"] = "THÔNG BÁO", ["RECENT ACTIVITY"] = "HOẠT ĐỘNG GẦN ĐÂY",
+    ["Reduced Motion"] = "Giảm chuyển động", ["Toggle Effects"] = "Hiệu ứng bật/tắt", ["UI Sounds"] = "Âm thanh giao diện",
+    ["Remember Layout"] = "Ghi nhớ bố cục", ["Compact Sidebar"] = "Thanh bên gọn", ["UI Volume"] = "Âm lượng giao diện",
+    ["Reset window layout"] = "Đặt lại bố cục cửa sổ", ["Show recent errors"] = "Xem lỗi gần đây", ["No errors recorded."] = "Chưa ghi nhận lỗi.",
+    ["CONFIG SAVE / LOAD"] = "LƯU / TẢI CÀI ĐẶT", ["SAVE SETTINGS"] = "LƯU CÀI ĐẶT", ["LOAD SETTINGS"] = "TẢI CÀI ĐẶT",
+    ["SAVE / LOAD MENU"] = "LƯU / TẢI CẤU HÌNH", ["SAVE MENU"] = "LƯU CẤU HÌNH", ["Ready"] = "Sẵn sàng",
+    ["Shortcut: hold CTRL + C + V to load settings"] = "Giữ CTRL + C + V để tải cài đặt",
+    ["Shortcut: hold CTRL + S + V to open Favorites"] = "Giữ CTRL + S + V để mở mục yêu thích",
+    ["SAVE MENU PROFILE"] = "LƯU CẤU HÌNH MENU", ["RENAME PROFILE"] = "ĐỔI TÊN CẤU HÌNH", ["DUPLICATE PROFILE"] = "NHÂN BẢN CẤU HÌNH",
+    ["PROFILE OPTIONS"] = "TÙY CHỌN CẤU HÌNH", ["DELETE PROFILE?"] = "XÓA CẤU HÌNH?", ["Rename"] = "Đổi tên",
+    ["Duplicate"] = "Nhân bản", ["Update with current settings"] = "Cập nhật bằng cài đặt hiện tại",
+    ["RUN"] = "TẢI", ["SAVE"] = "LƯU", ["CANCEL"] = "HỦY", ["DELETE"] = "XÓA", ["CLOSE"] = "ĐÓNG",
+    ["Your existing gameplay settings and key bindings are kept."] = "Lưu các thiết lập tính năng và phím tắt của bạn.",
+    ["Enter a profile name first."] = "Nhập tên cấu hình trước.", ["Use a shorter profile name."] = "Tên cấu hình quá dài.",
+    ["That profile name already exists."] = "Tên cấu hình đã tồn tại.", ["Choose a new name for the copy."] = "Chọn tên khác cho bản sao.",
+    ["Settings saved"] = "Đã lưu cài đặt", ["Settings loaded"] = "Đã tải cài đặt", ["No saved settings found"] = "Chưa có cài đặt đã lưu",
+    ["Settings saved for this session"] = "Đã lưu cài đặt trong phiên này", ["Saving settings on server..."] = "Đang lưu cài đặt...",
+    ["Saved data belongs to another player"] = "Dữ liệu đã lưu thuộc tài khoản khác", ["Profile updated."] = "Đã cập nhật cấu hình.",
+    ["Profile updated for this session."] = "Đã cập nhật cấu hình trong phiên này.", ["Connecting player storage..."] = "Đang kết nối dữ liệu người chơi...",
+    ["Profiles kept for this session; JSON unavailable"] = "Cấu hình được giữ trong phiên này; chưa thể mã hóa dữ liệu",
+    ["Profiles kept for this session; filesystem unavailable"] = "Cấu hình được giữ trong phiên này",
+    ["Profiles kept for this session; write failed"] = "Chưa ghi được cấu hình; đã giữ bản trong phiên này",
+    ["Combat bridge: checking..."] = "Kết nối combat: đang kiểm tra...", ["Combat bridge: READY"] = "Kết nối combat: SẴN SÀNG",
+    ["Combat bridge: NOT CONNECTED"] = "Kết nối combat: CHƯA KẾT NỐI", ["Waiting: enable AIM."] = "Cần bật ngắm.",
+    ["Waiting: enable FOV."] = "Cần bật vùng ngắm.", ["Waiting: combat bridge."] = "Đang chờ kết nối combat.",
+    ["Waiting: set Head Size above 0."] = "Đặt kích thước đầu lớn hơn 0.",
+    ["PLAYER IDENTITY"] = "THÔNG TIN NGƯỜI CHƠI", ["GAME / SERVER"] = "GAME / MÁY CHỦ", ["SESSION / STORAGE"] = "PHIÊN / DỮ LIỆU",
+    ["Display Name"] = "Tên hiển thị", ["Username"] = "Tên tài khoản", ["User ID"] = "ID người chơi", ["Account Age"] = "Tuổi tài khoản",
+    ["Current Team"] = "Đội hiện tại", ["Game"] = "Game", ["Place ID"] = "ID Place", ["Universe ID"] = "ID game",
+    ["Server ID"] = "ID máy chủ", ["Server Type"] = "Loại máy chủ", ["Players"] = "Người chơi", ["Network Ping"] = "Ping mạng",
+    ["Time in Session"] = "Thời gian trong phiên", ["Storage"] = "Nơi lưu", ["Public"] = "Công khai", ["Private / reserved"] = "Riêng / dành riêng",
+    ["Saved on device"] = "Đã lưu trên thiết bị", ["Saved on server"] = "Đã lưu trên máy chủ", ["Session only"] = "Chỉ trong phiên này",
+    ["Saving..."] = "Đang lưu...",
+    ["Unknown / FFA"] = "Chưa xác định / FFA", ["Read-only player and server information."] = "Thông tin người chơi và máy chủ; chỉ xem.",
+    ["LANGUAGE"] = "NGÔN NGỮ", ["Language"] = "Ngôn ngữ", ["English"] = "Tiếng Anh", ["Vietnamese"] = "Tiếng Việt",
+    ["AIM PRIORITY"] = "ƯU TIÊN MỤC TIÊU", ["Aim Priority"] = "Ưu tiên ngắm", ["Crosshair (default)"] = "Gần tâm ngắm (mặc định)",
+    ["Nearest to player"] = "Gần nhân vật nhất", ["Lowest health"] = "Ít máu nhất", ["Players first"] = "Ưu tiên người chơi", ["NPCs first"] = "Ưu tiên NPC",
+    ["Priority still follows your team, wall, distance and NPC filters."] = "Ưu tiên vẫn tuân theo bộ lọc đội, vật cản, khoảng cách và NPC.",
+    ["WEAPON TUNING"] = "TÙY CHỈNH SÚNG", ["Infinite Ammo"] = "Đạn vô hạn", ["Skip Reload"] = "Bỏ thời gian reload",
+    ["Recoil Control"] = "Kiểm soát độ giật", ["Recoil Amount (%)"] = "Mức giật còn lại (%)", ["Spread Control"] = "Kiểm soát độ tản đạn",
+    ["Spread Amount (%)"] = "Mức tản còn lại (%)", ["0% removes the effect; 100% keeps the weapon's default."] = "0% loại bỏ hiệu ứng; 100% giữ mức mặc định của súng.",
+    ["Weapon: game adapter connected"] = "Súng: đã kết nối bộ điều khiển game", ["Weapon: controller connected"] = "Súng: đã kết nối bộ điều khiển",
+    ["Weapon: admin permission required"] = "Súng: cần quyền admin", ["Weapon: waiting for a compatible equipped weapon"] = "Súng: đang chờ trang bị súng tương thích",
+    ["Weapon: controller not connected"] = "Súng: chưa kết nối bộ điều khiển", ["Recoil and spread apply to shot direction, not just camera visuals."] = "Độ giật và tản được áp dụng vào hướng đạn thực tế.",
+    ["NEARBY ENEMY ALERT"] = "CẢNH BÁO ĐỊCH Ở GẦN", ["Nearby Enemy Alert"] = "Cảnh báo địch ở gần", ["Scan Radius"] = "Bán kính quét",
+    ["Include Hostile NPCs"] = "Quét cả NPC thù địch", ["Arrows show nearby living enemies. Alerts clear when the area is safe."] = "Mũi tên chỉ địch còn sống trong phạm vi. Cảnh báo tự ẩn khi không còn địch.",
+    ["TEAM DETECTION"] = "NHẬN DIỆN ĐỘI", ["Team Detection"] = "Cách nhận diện đội", ["Auto"] = "Tự động", ["Free for all (FFA)"] = "Mọi người là đối thủ (FFA)",
+    ["Roblox teams"] = "Đội Roblox", ["Custom team attribute"] = "Thuộc tính đội tùy chỉnh", ["Team Attribute"] = "Tên thuộc tính đội",
+    ["Auto checks custom combat teams before Roblox teams. Use FFA for games without teams."] = "Tự động ưu tiên đội tùy chỉnh rồi đến đội Roblox. Chọn FFA cho game không chia đội.",
+    ["Custom player rigs can expose PlayerUserId; NPCs remain a separate category."] = "Nhân vật tùy chỉnh có thể dùng PlayerUserId; NPC vẫn được phân loại riêng.",
+    ["CAMERA / VISUAL"] = "CAMERA / HIỂN THỊ", ["SERVER"] = "MÁY CHỦ", ["REJOIN / MENU"] = "VÀO LẠI / MENU",
+    ["PLAYER LIST"] = "DANH SÁCH NGƯỜI CHƠI", ["MOVEMENT"] = "DI CHUYỂN", ["FLY"] = "BAY", ["VISUAL"] = "HIỂN THỊ",
+    ["ESP FILTERS"] = "BỘ LỌC ESP", ["ESP VISUALS"] = "HIỂN THỊ ESP", ["AIM SETTINGS"] = "CÀI ĐẶT NGẮM",
+    ["DRONE STRIKE"] = "DRONE STRIKE", ["MAGIC SILENT"] = "MAGIC SILENT", ["Hide GUI"] = "Ẩn menu",
+    ["Master switch for the existing ESP renderer."] = "Công tắc chính của ESP.", ["Display enemy targets."] = "Hiển thị mục tiêu địch.",
+    ["Display teammate targets."] = "Hiển thị mục tiêu đồng đội.", ["Display current and maximum health."] = "Hiển thị máu hiện tại và tối đa, cảnh báo khi máu thấp.",
+    ["Display target distance in studs."] = "Hiển thị khoảng cách tới mục tiêu.", ["Display screen-space tracer lines."] = "Hiển thị đường chỉ tới mục tiêu.",
+    ["Display the existing player / NPC name overlay."] = "Hiển thị tên người chơi / NPC.", ["Display the existing projected bounding box."] = "Hiển thị khung quanh mục tiêu.",
+    ["Display the existing R6 / R15 skeleton lines."] = "Hiển thị khung xương R6 / R15.", ["Display the existing classification-colored Highlight."] = "Hiển thị viền theo màu phân loại.",
+    ["Use the shared NPC registry and ESP renderer."] = "Hiển thị NPC bằng hệ thống ESP chung.", ["Use the existing third-person camera setting."] = "Dùng góc nhìn camera thứ ba.",
+    ["Restore map transparency when disabled or closed."] = "Khôi phục độ trong suốt bản đồ khi tắt hoặc đóng.",
+    ["Opacity setting for the existing X-Ray feature."] = "Chỉnh độ trong suốt của X-Ray.", ["Use the existing environment-supported Anti-AFK implementation."] = "Chống AFK khi môi trường hỗ trợ.",
+    ["Hold the assigned key and right mouse button as before."] = "Giữ phím đã chọn và nút chuột phải để thao tác.",
+    ["Keep the existing reactive virtual pet."] = "Thú cưng ảo phản ứng theo thao tác.", ["Keep the existing snowfall effect."] = "Hiển thị hiệu ứng tuyết.",
+    ["MENU READY"] = "MENU SẴN SÀNG", ["Action failed. See diagnostics."] = "Thao tác thất bại. Xem mục chẩn đoán.",
+    ["F4 is reserved for unloading the framework."] = "F4 dành riêng để gỡ menu.", ["That key is reserved for Drone Strike freecam movement"] = "Phím này dùng để di chuyển camera Drone Strike.",
+    ["NHẬP THÔNG BÁO Ở ĐÂY"] = "Chưa có thông báo mới.",
+}
+
+function ExtraFeatures.V8.Translate(text)
+    text = tostring(text or "")
+    if Config.Interface.Language ~= "VI" then
+        if text == "NHẬP THÔNG BÁO Ở ĐÂY" then return "No new notifications." end
+        local aliases = {["KHÁC"] = "OTHER", ["↓  Ít Người"] = "↓  Fewer Players", ["↩  Rejoin"] = "↩  Rejoin",
+            ["↻  Đổi Server"] = "↻  Change Server", ["⌁  Ping Thấp"] = "⌁  Low Ping"}
+        if aliases[text] then return aliases[text] end
+        return text
+    end
+    local dictionary = ExtraFeatures.V8.Vietnamese
+    if dictionary[text] then return dictionary[text] end
+    local choice = text:match("^(.-)  ▾$")
+    if choice then return ExtraFeatures.V8.Translate(choice) .. "  ▾" end
+    local selected = text:match("^✓  (.*)$")
+    if selected then return "✓  " .. ExtraFeatures.V8.Translate(selected) end
+    local prefix, body = text:match("^(−%s+)(.*)$")
+    if not prefix then prefix, body = text:match("^([+]%s+)(.*)$") end
+    if prefix then return prefix .. (dictionary[body] or body) end
+    if text:sub(1, #"YOUR MENU PROFILES") == "YOUR MENU PROFILES" then
+        return text:gsub("YOUR MENU PROFILES", "CẤU HÌNH CỦA BẠN"):gsub("Current Game:", "Game hiện tại:")
+            :gsub("Current PlaceId:", "ID Place hiện tại:"):gsub("Profiles belong to your User ID%.", "Cấu hình được lưu theo ID tài khoản của bạn.")
+    end
+    for _, rule in ipairs({{"Profile saved: ", "Đã lưu cấu hình: "}, {"Profile loaded: ", "Đã tải cấu hình: "},
+        {"Profile deleted: ", "Đã xóa cấu hình: "}, {"Profile kept for this session: ", "Đã giữ cấu hình trong phiên: "},
+        {"Settings load failed: ", "Tải cài đặt thất bại: "}, {"Selected: ", "Đã chọn: "}, {"Target: ", "Mục tiêu: "},
+        {"Drone Strike Key: ", "Phím Drone Strike: "}, {"Switch Target Key: ", "Phím đổi mục tiêu: "},
+        {"Hold to Spam Key: ", "Phím giữ để bấm: "}, {"Open ", "Mở "}, {"Key already assigned to ", "Phím đã được dùng cho "}}) do
+        if text:sub(1, #rule[1]) == rule[1] then return rule[2] .. text:sub(#rule[1] + 1) end
+    end
+    local results = text:match("^(%d+) results$")
+    if results then return results .. " kết quả" end
+    if text:find("toggles ON", 1, true) or text:find("NPCs tracked", 1, true) then
+        text = text:gsub("MENU READY", "MENU SẴN SÀNG"):gsub("toggles ON", "mục đang bật")
+            :gsub("players", "người chơi"):gsub("NPCs tracked", "NPC đang theo dõi")
+        text = text:gsub("Right Control / your assigned key opens the menu%. F4 unloads it%.", "Phím đã chọn mở menu. F4 gỡ menu.")
+        text = text:gsub("Press (.-) to open the menu%. F4 unloads it%.", "Nhấn %1 để mở menu. F4 gỡ menu.")
+    end
+    return text
+end
+
+function ExtraFeatures.V8.ShouldTranslate(object)
+    if not object or object:GetAttribute("MenuNoTranslate") == true then return false end
+    if object.Name == "ProfileTitle" or object.Name == "ProfileMetadata" or object.Name == "ProfileValue" then return false end
+    if object:IsDescendantOf(TeleportList) then return false end
+    return object:IsDescendantOf(MainWindow) or (MenuProfilePopup and object:IsDescendantOf(MenuProfilePopup))
+        or object.Name == "FeatureTooltip"
+end
+
+function ExtraFeatures.V8.TrackText(object)
+    local state = ExtraFeatures.V8
+    if state.Registry[object] or not state.ShouldTranslate(object) then return end
+    local properties = object:IsA("TextBox") and {"PlaceholderText"}
+        or (object:IsA("TextLabel") or object:IsA("TextButton")) and {"Text"} or nil
+    if not properties then return end
+    local record = {Sources = {}, Connections = {}, Busy = false}
+    state.Registry[object] = record
+    for _, property in ipairs(properties) do
+        record.Sources[property] = object[property]
+        local function render()
+            if record.Busy or state.Destroyed then return end
+            record.Busy = true
+            object[property] = state.Translate(record.Sources[property])
+            record.Busy = false
+        end
+        table.insert(record.Connections, object:GetPropertyChangedSignal(property):Connect(function()
+            if record.Busy then return end
+            record.Sources[property] = object[property]; render()
+        end))
+        render()
+    end
+    object.Destroying:Connect(function()
+        for _, connection in ipairs(record.Connections) do connection:Disconnect() end
+        state.Registry[object] = nil
+    end)
+end
+
+function ExtraFeatures.V8.TrackTree(root)
+    if not root then return end
+    ExtraFeatures.V8.TrackText(root)
+    for _, child in ipairs(root:GetDescendants()) do ExtraFeatures.V8.TrackText(child) end
+end
+
+function ExtraFeatures.V8.ApplyLanguage()
+    local state = ExtraFeatures.V8
+    for object, record in pairs(state.Registry) do
+        if object.Parent then
+            record.Busy = true
+            for property, source in pairs(record.Sources) do object[property] = state.Translate(source) end
+            record.Busy = false
+        end
+    end
+    for _, record in ipairs(UIRefs.Experience.Controls) do
+        record.SearchNormalized = state.Normalize(record.Search .. " " .. state.Translate(record.Text)
+            .. " " .. state.Translate(record.Description or "") .. " " .. state.Translate(record.Section.Title))
+    end
+    UI:ApplyFilter()
+    if state.SyncControls then state.SyncControls() end
+    if state.UpdateProfile then state.UpdateProfile() end
+end
+
+
+function ExtraFeatures.V8.StyleHealth(data, humanoid, _classificationColor)
+    local info = data.info
+    local label = info and info:FindFirstChild("Health")
+    if not label then return end
+    local maximum = math.max(tonumber(humanoid.MaxHealth) or 100, 1)
+    local health = math.max(tonumber(humanoid.Health) or 0, 0)
+    local ratio = math.clamp(health / maximum, 0, 1)
+    local critical = ratio <= 0.25
+    local color = critical and Color3.fromRGB(255, 99, 113)
+        or ratio <= 0.6 and Color3.fromRGB(255, 203, 87) or Color3.fromRGB(97, 239, 160)
+    local suffix = critical and (Config.Interface.Language == "VI" and "  ! THẤP" or "  ! LOW") or ""
+    label.Text = string.format("HP: %d / %d%s", math.floor(health), math.floor(maximum), suffix)
+    label.TextColor3 = color
+    label.TextStrokeColor3 = critical and Color3.fromRGB(255, 240, 240) or Color3.fromRGB(0, 0, 0)
+    label.TextStrokeTransparency = critical and 0.6 or 0
+    label.TextTransparency = critical and not Config.Interface.ReducedMotion and (0.06 + 0.12 * (1 + math.sin(os.clock() * 5)) / 2) or 0
+    local track = info:FindFirstChild("HealthTrack")
+    if not track then
+        track = Instance.new("Frame"); track.Name = "HealthTrack"
+        track.Size = UDim2.fromOffset(100, 4); track.Position = UDim2.new(0.5, -50, 0, 40)
+        track.BackgroundColor3 = Color3.fromRGB(30, 37, 48); track.BackgroundTransparency = 0.15
+        track.BorderSizePixel = 0; track.ZIndex = label.ZIndex; track.Parent = info
+        local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(1, 0); corner.Parent = track
+        local fill = Instance.new("Frame"); fill.Name = "Fill"; fill.BorderSizePixel = 0; fill.ZIndex = track.ZIndex + 1
+        fill.Parent = track
+        local fillCorner = corner:Clone(); fillCorner.Parent = fill
+        local distance = info:FindFirstChild("Distance")
+        if distance then distance.Position = UDim2.fromOffset(0, 48) end
+    end
+    track.Visible = Config.ShowHealth
+    track.Fill.Size = UDim2.new(ratio, 0, 1, 0)
+    track.Fill.BackgroundColor3 = color
+end
+
+function ExtraFeatures.V8.HideProximity()
+    local state = ExtraFeatures.V8
+    state.Nearby = {}
+    if state.ProximitySummary then state.ProximitySummary.Visible = false end
+    for _, arrow in ipairs(state.Arrows or {}) do arrow.Frame.Visible = false end
+end
+
+function ExtraFeatures.V8.CreateOverlays()
+    local state = ExtraFeatures.V8
+    state.Arrows = {}
+    for index = 1, 4 do
+        local frame = Instance.new("Frame"); frame.Name = "NearbyEnemy_" .. index
+        frame.Size = UDim2.fromOffset(82, 48); frame.AnchorPoint = Vector2.new(0.5, 0.5)
+        frame.BackgroundTransparency = 1; frame.Visible = false; frame.ZIndex = 42; frame.Parent = ScreenGui
+        local pointer = Instance.new("TextLabel"); pointer.Name = "Direction"
+        pointer.Size = UDim2.fromOffset(28, 28); pointer.Position = UDim2.fromOffset(27, 0)
+        pointer.BackgroundTransparency = 1; pointer.Text = "▲"; pointer.Font = Enum.Font.GothamBold
+        pointer.TextSize = 25; pointer.TextColor3 = Color3.fromRGB(255, 111, 114)
+        pointer.TextStrokeTransparency = 0.3; pointer.ZIndex = 43; pointer.Parent = frame
+        local caption = Instance.new("TextLabel"); caption.Name = "Distance"
+        caption.Size = UDim2.new(1, 0, 0, 16); caption.Position = UDim2.fromOffset(0, 30)
+        caption.BackgroundTransparency = 1; caption.Font = Enum.Font.GothamBold; caption.TextSize = 11
+        caption.TextColor3 = Config.TextColor; caption.TextStrokeTransparency = 0.2; caption.ZIndex = 43; caption.Parent = frame
+        state.Arrows[index] = {Frame = frame, Pointer = pointer, Caption = caption}
+    end
+    local summary = Instance.new("TextLabel"); summary.Name = "NearbyEnemySummary"
+    summary.AnchorPoint = Vector2.new(0.5, 0); summary.Size = UDim2.fromOffset(242, 28)
+    summary.BackgroundColor3 = Color3.fromRGB(49, 23, 34); summary.BackgroundTransparency = 0.12
+    summary.TextColor3 = Color3.fromRGB(255, 176, 176); summary.Font = Enum.Font.GothamBold; summary.TextSize = 12
+    summary.BorderSizePixel = 0; summary.ZIndex = 44; summary.Visible = false; summary.Parent = ScreenGui
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 8); corner.Parent = summary
+    state.ProximitySummary = summary
+    local health = summary:Clone(); health.Name = "LocalLowHealth"
+    health.AnchorPoint = Vector2.new(0.5, 1); health.Parent = ScreenGui; state.LocalHealth = health
+end
+
+function ExtraFeatures.V8.ScanNearby()
+    local state = ExtraFeatures.V8
+    local character = NPCSystem.GetCharacter(LocalPlayer)
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not Config.Proximity.Enabled or not root or not humanoid or humanoid.Health <= 0
+        or GUIState.CurrentState == "Closed" then state.HideProximity(); return end
+    local nearby = {}
+    local function consider(target, character)
+        local part = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not part or not humanoid or humanoid.Health <= 0 then return end
+        local distance = (part.Position - root.Position).Magnitude
+        if distance <= Config.Proximity.Radius and distance > 0.01 then
+            table.insert(nearby, {Target = target, Root = part, Distance = distance})
+        end
+    end
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and NPCSystem.ClassifyPlayer(player) == "Enemy" then
+            consider(player, NPCSystem.GetCharacter(player))
+        end
+    end
+    if Config.Proximity.IncludeNPC then
+        for model in pairs(NPCSystem.ValidNPCs) do
+            if NPCSystem.IsValidNPC(model) and (model:GetAttribute("Hostile") == true
+                or string.lower(tostring(model:GetAttribute("Disposition") or "")) == "hostile") then consider(model, model) end
+        end
+    end
+    table.sort(nearby, function(a, b) return a.Distance < b.Distance end)
+    state.Nearby = nearby
+end
+
+function ExtraFeatures.V8.UpdateProximity(camera)
+    local state = ExtraFeatures.V8
+    if not Config.Proximity.Enabled or not camera or GUIState.CurrentState == "Closed" then state.HideProximity(); return end
+    local viewport = camera.ViewportSize
+    local scale = math.max(UIScaleObj.Scale, 0.01)
+    local center = Vector2.new(viewport.X / 2, viewport.Y / 2)
+    local radius = math.min(110, math.max(58, math.min(viewport.X, viewport.Y) * 0.15))
+    local count = 0
+    for index, arrow in ipairs(state.Arrows or {}) do
+        local entry = (state.Nearby or {})[index]
+        if entry and entry.Root.Parent then
+            local humanoid = entry.Root.Parent:FindFirstChildOfClass("Humanoid")
+            local character = NPCSystem.GetCharacter(LocalPlayer)
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local validEnemy = NPCSystem.IsPlayer(entry.Target) and NPCSystem.ClassifyPlayer(entry.Target) == "Enemy"
+                or NPCSystem.IsNPCModel(entry.Target) and Config.Proximity.IncludeNPC
+            local distance = root and (entry.Root.Position - root.Position).Magnitude or math.huge
+            if humanoid and humanoid.Health > 0 and validEnemy and distance <= Config.Proximity.Radius then
+                local direction = camera.CFrame:VectorToObjectSpace(entry.Root.Position - root.Position)
+                local angle = math.atan2(direction.X, -direction.Z)
+                arrow.Frame.Position = UDim2.fromOffset((center.X + math.sin(angle) * radius) / scale,
+                    (center.Y - math.cos(angle) * radius) / scale)
+                arrow.Pointer.Rotation = math.deg(angle)
+                arrow.Pointer.TextColor3 = distance < Config.Proximity.Radius * 0.35 and Color3.fromRGB(255, 88, 102) or Color3.fromRGB(255, 184, 89)
+                arrow.Caption.Text = string.format("%d stud", math.floor(distance + 0.5))
+                arrow.Frame.Visible = true; count += 1
+            else arrow.Frame.Visible = false end
+        else arrow.Frame.Visible = false end
+    end
+    if state.ProximitySummary then
+        state.ProximitySummary.Visible = count > 0
+        local inset = 36
+        pcall(function() inset = game:GetService("GuiService"):GetGuiInset().Y end)
+        state.ProximitySummary.Position = UDim2.fromOffset(center.X / scale, (inset + 12) / scale)
+        state.ProximitySummary.Size = UDim2.fromOffset(math.min(242, viewport.X / scale - 20), 28)
+        state.ProximitySummary.Text = Config.Interface.Language == "VI" and ("! " .. #(state.Nearby or {}) .. " địch ở gần")
+            or ("! " .. #(state.Nearby or {}) .. " nearby enemies")
+    end
+end
+
+function ExtraFeatures.V8.UpdateSelfHealth(camera)
+    local state = ExtraFeatures.V8
+    if not state.LocalHealth then return end
+    local character = NPCSystem.GetCharacter(LocalPlayer)
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local low = Config.Enabled and Config.ShowHealth and humanoid and humanoid.Health > 0
+        and humanoid.Health / math.max(humanoid.MaxHealth, 1) <= 0.25 and GUIState.CurrentState ~= "Closed"
+    state.LocalHealth.Visible = low == true
+    if low and camera then
+        local scale = math.max(UIScaleObj.Scale, 0.01)
+        state.LocalHealth.Position = UDim2.fromOffset(camera.ViewportSize.X / (2 * scale), (camera.ViewportSize.Y - 18) / scale)
+        state.LocalHealth.Size = UDim2.fromOffset(math.min(242, camera.ViewportSize.X / scale - 20), 28)
+        local prefix = Config.Interface.Language == "VI" and "! MÁU CỦA BẠN THẤP: " or "! YOUR HEALTH IS LOW: "
+        state.LocalHealth.Text = prefix .. math.floor(humanoid.Health) .. " / " .. math.floor(humanoid.MaxHealth)
+    end
+end
+
+function ExtraFeatures.V8.Update(camera)
+    local state = ExtraFeatures.V8
+    if state.Destroyed then return end
+    local now = os.clock()
+    if now - (state.LastScan or -math.huge) >= 0.15 then state.LastScan = now; state.ScanNearby() end
+    state.UpdateProximity(camera); state.UpdateSelfHealth(camera)
+    if state.FPSLabel then
+        local fps = ExtraFeatures.UIEffects.Bubble.LastFPS or 0
+        if fps ~= state.DisplayedFPS then
+            state.DisplayedFPS = fps; state.FPSLabel.Text = "FPS  " .. tostring(fps)
+            if state.FPSAccent then state.FPSAccent.BackgroundColor3 = fps >= 55 and Color3.fromRGB(71, 224, 184)
+                or fps >= 30 and Color3.fromRGB(255, 195, 85) or Color3.fromRGB(255, 96, 121) end
+        end
+    end
+    if state.UpdateProfile and now - (state.LastProfile or -math.huge) >= 1 then
+        state.LastProfile = now; state.UpdateProfile(); state.UpdateWeaponStatus()
+    end
+end
+
+
+function ExtraFeatures.V8.Session()
+    _G.__HoodRivalsV8Sessions = _G.__HoodRivalsV8Sessions or {}
+    local key = tostring(LocalPlayer.UserId)
+    _G.__HoodRivalsV8Sessions[key] = _G.__HoodRivalsV8Sessions[key] or {Settings = {}, Profiles = {}}
+    return _G.__HoodRivalsV8Sessions[key]
+end
+
+function ExtraFeatures.V8.ReadOwned(path)
+    if not FileAPI.Available or not FileExists(path) then return nil end
+    local raw = SafeReadFile(path)
+    local payload = raw and SafeDecodeJSON(raw)
+    if type(payload) == "table" and (payload.OwnerUserId == nil or payload.OwnerUserId == LocalPlayer.UserId) then return payload end
+    return nil
+end
+
+function ExtraFeatures.V8.Request(action, data, callback)
+    local state = ExtraFeatures.V8
+    local folder = game:GetService("ReplicatedStorage"):FindFirstChild("HoodRivalsMenuService")
+    local remote = folder and folder:FindFirstChild("Request")
+    if not remote or not remote:IsA("RemoteFunction") then
+        if callback then callback(false, {Reason = "Not connected"}) end
+        return false
+    end
+    local finished = false
+    local generation = state.SessionId
+    local function complete(ok, response)
+        if finished then return end
+        finished = true
+        if generation ~= state.SessionId then return end
+        if state.Destroyed and action ~= "Close" and action ~= "Save" then return end
+        if type(response) ~= "table" or response.OwnerUserId ~= LocalPlayer.UserId then
+            ok, response = false, {Reason = "Invalid player storage response"}
+        end
+        if callback then callback(ok, response) end
+    end
+    task.delay(8, function() complete(false, {OwnerUserId = LocalPlayer.UserId, Reason = "Storage request timed out"}) end)
+    task.spawn(function()
+        local ok, response = pcall(function() return remote:InvokeServer(action, data, generation) end)
+        if not ok then response = {OwnerUserId = LocalPlayer.UserId, Reason = tostring(response)} end
+        complete(ok, response)
+    end)
+    return true
+end
+
+function ExtraFeatures.V8.QueueSave(section, payload, onSaved)
+    local state = ExtraFeatures.V8
+    state.PendingSaves = state.PendingSaves or {}
+    state.PendingSaves[section] = {Payload = payload, Callback = onSaved, Attempts = 0}
+    if state.ServerReady then state.ServerStatus = "Saving..." end
+    state.SaveToken = (state.SaveToken or 0) + 1
+    local token = state.SaveToken
+    task.delay(0.65, function()
+        if token ~= state.SaveToken or state.Destroyed then return end
+        state.FlushSaves()
+    end)
+end
+
+function ExtraFeatures.V8.FlushSaves()
+    local state = ExtraFeatures.V8
+    if not state.ServerReady or not state.PendingSaves or next(state.PendingSaves) == nil then return end
+    local pending = state.PendingSaves; state.PendingSaves = {}
+    local payload = {OwnerUserId = LocalPlayer.UserId, PlaceId = game.PlaceId}
+    for section, item in pairs(pending) do payload[section] = item.Payload end
+    state.Request("Save", payload, function(ok, response)
+        if (response.RetryAfter or not ok) and not state.Destroyed then
+            local retry = false
+            for section, item in pairs(pending) do
+                item.Attempts = (item.Attempts or 0) + 1
+                if item.Attempts < 5 and not state.PendingSaves[section] then
+                    state.PendingSaves[section] = item; retry = true
+                end
+            end
+            state.ServerStatus = "Session only"
+            if retry then
+                task.delay(math.clamp(tonumber(response.RetryAfter) or 3, 0.8, 5), function() if not state.Destroyed then state.FlushSaves() end end)
+                return
+            end
+        end
+        state.ServerStatus = ok and response.Persisted and "Saved on server" or "Session only"
+        for _, item in pairs(pending) do if item.Callback and not state.Destroyed then item.Callback(ok and response.Persisted == true) end end
+        if state.UpdateProfile and not state.Destroyed then state.UpdateProfile() end
+    end)
+end
+
+function ExtraFeatures.V8.SaveInterface()
+    local state = ExtraFeatures.V8
+    if state.Restoring or state.Destroyed then return end
+    state.InterfaceRevision += 1
+    local payload = ExtraFeatures.BuildInterfacePayload()
+    state.Session().Interface = payload
+    local encoded = SafeEncodeJSON(payload)
+    state.InterfaceFileSaved = encoded and SafeWriteFile(state.InterfacePath, encoded) == true or false
+    state.QueueSave("Interface", payload)
+    if state.RefreshFavorites then state.RefreshFavorites() end
+end
+
+function ExtraFeatures.V8.SaveSettingsToStorage(payload)
+    local state = ExtraFeatures.V8
+    state.SettingsRevision += 1
+    state.Session().Settings[tostring(game.PlaceId)] = payload
+    state.QueueSave("Settings", payload, function(persisted)
+        if persisted then SetSettingsStatus("Settings saved") end
+    end)
+end
+
+function ExtraFeatures.V8.SaveProfilesToStorage()
+    local state = ExtraFeatures.V8
+    state.ProfilesRevision += 1
+    for _, profile in ipairs(MenuProfiles) do profile.OwnerUserId = LocalPlayer.UserId end
+    local snapshot = SafeDecodeJSON(SafeEncodeJSON(MenuProfiles)) or {}
+    state.Session().Profiles = snapshot
+    state.QueueSave("Profiles", snapshot, function(persisted)
+        if persisted then SetSettingsStatus("Profiles saved") end
+    end)
+end
+
+function ExtraFeatures.V8.ImportProfiles(profiles)
+    if type(profiles) ~= "table" then return end
+    local imported, ids, names = {}, {}, {}
+    for _, profile in ipairs(profiles) do
+        if #imported >= 80 then break end
+        local owner = profile.OwnerUserId
+        local name = type(profile.ProfileName or profile.name) == "string" and TrimString(profile.ProfileName or profile.name) or ""
+        local config = profile.ConfigData or profile.config
+        local id = type(profile.ProfileId or profile.profileId) == "string" and (profile.ProfileId or profile.profileId) or GenerateMenuProfileId()
+        if (owner == nil or owner == LocalPlayer.UserId) and #name > 0 and #name <= 96 and type(config) == "table"
+            and (config.OwnerUserId == nil or config.OwnerUserId == LocalPlayer.UserId) and not names[string.lower(name)] then
+            if ids[id] then id = GenerateMenuProfileId() end
+            profile.OwnerUserId, profile.ProfileId, profile.profileId = LocalPlayer.UserId, id, id
+            profile.ProfileName, profile.name, profile.ConfigData, profile.config = name, name, config, config
+            profile.GameName = profile.GameName or profile.gameName or "Unknown"
+            profile.gameName = profile.GameName
+            profile.PlaceId = tonumber(profile.PlaceId or profile.placeId) or 0; profile.placeId = profile.PlaceId
+            table.insert(imported, profile); ids[id], names[string.lower(name)] = true, true
+        end
+    end
+    MenuProfiles = imported
+    RefreshMenuProfileList()
+end
+
+function ExtraFeatures.V8.ConnectStorage()
+    local state = ExtraFeatures.V8
+    if state.Destroyed or state.Connecting or state.ServerReady then return end
+    state.Connecting = true
+    local interfaceRevision, profileRevision = state.InterfaceRevision, state.ProfilesRevision
+    local sent = state.Request("Load", {OwnerUserId = LocalPlayer.UserId, PlaceId = game.PlaceId}, function(ok, response)
+        state.Connecting = false
+        if not ok or response.Ok ~= true or response.Protocol ~= 8 then
+            state.ServerStatus = FileAPI.Available and "Saved on device" or "Session only"
+            state.UpdateWeaponStatus(); return
+        end
+        state.ServerReady, state.CanTune = true, response.CanTune == true
+        state.ServerStatus = response.Persistent and "Saved on server" or "Session only"
+        SetSettingsStatus(state.ServerStatus)
+        local saved = response.Data or {}
+        state.Restoring = true
+        if interfaceRevision == state.InterfaceRevision and not state.HasLocalInterface and type(saved.Interface) == "table" then
+            ExtraFeatures.ApplyInterfacePayload(saved.Interface); state.ApplyLanguage(); ExtraFeatures.ApplyInterfaceLayout(true)
+        end
+        if profileRevision == state.ProfilesRevision and #MenuProfiles == 0 and type(saved.Profiles) == "table" then state.ImportProfiles(saved.Profiles) end
+        if type(saved.Settings) == "table" then state.ServerSettings = saved.Settings end
+        state.Restoring = false
+        if state.HasLocalInterface then state.QueueSave("Interface", ExtraFeatures.BuildInterfacePayload()) end
+        if #MenuProfiles > 0 and profileRevision == state.ProfilesRevision then state.SaveProfilesToStorage() end
+        state.FlushSaves(); state.SyncWeapon(); state.UpdateProfile()
+    end)
+    if not sent then
+        state.Connecting = false
+        state.ServerStatus = FileAPI.Available and "Saved on device" or "Session only"
+        SetSettingsStatus(state.ServerStatus)
+    end
+end
+
+function ExtraFeatures.V8.RestoreInterface()
+    local state = ExtraFeatures.V8
+    local saved = state.ReadOwned(state.InterfacePath) or state.Session().Interface
+    state.HasLocalInterface = type(saved) == "table"
+    if state.HasLocalInterface then
+        state.Restoring = true; ExtraFeatures.ApplyInterfacePayload(saved); state.Restoring = false
+    end
+    if #MenuProfiles == 0 then state.ImportProfiles(state.Session().Profiles) end
+end
+
+function ExtraFeatures.V8.WeaponPayload(active)
+    local source = Config.WeaponTuning
+    return {Active = active == true, InfiniteAmmo = active and source.InfiniteAmmo == true or false,
+        SkipReload = active and source.SkipReload == true or false,
+        RecoilScale = active and source.RecoilEnabled and source.RecoilScale or 1,
+        SpreadScale = active and source.SpreadEnabled and source.SpreadScale or 1}
+end
+
+function ExtraFeatures.V8.RegisterWeaponAdapter(name, adapter)
+    if type(name) ~= "string" or type(adapter) ~= "table" or type(adapter.Apply) ~= "function" then
+        return false, "Adapter requires a name and Apply(settings)"
+    end
+    ExtraFeatures.V8.WeaponAdapters[name] = adapter
+    ExtraFeatures.V8.SyncWeapon()
+    return true
+end
+
+function ExtraFeatures.V8.SyncWeapon()
+    local state = ExtraFeatures.V8
+    if state.Destroyed then return end
+    local payload = state.WeaponPayload(GUIState.CurrentState ~= "Closed")
+    for name, adapter in pairs(state.WeaponAdapters) do
+        local ok, reason = pcall(adapter.Apply, table.clone(payload))
+        if not ok then UI:Invoke(function() error(reason) end, "Weapon adapter: " .. name) end
+    end
+    state.WeaponSyncToken = (state.WeaponSyncToken or 0) + 1
+    local token = state.WeaponSyncToken
+    task.delay(0.12, function()
+        if token ~= state.WeaponSyncToken or state.Destroyed or not state.ServerReady then return end
+        state.Request("Weapon", payload, function(ok, response)
+            if token ~= state.WeaponSyncToken or state.Destroyed then return end
+            state.WeaponConfirmed = ok and response.Ok == true
+            state.WeaponStatus = state.WeaponConfirmed and "Settings applied" or response.Reason or "Controller not connected"
+            state.UpdateWeaponStatus()
+        end)
+    end)
+    state.UpdateWeaponStatus()
+end
+
+function ExtraFeatures.V8.UpdateWeaponStatus()
+    local state = ExtraFeatures.V8
+    if not state.WeaponStatusLabel then return end
+    local character = NPCSystem.GetCharacter(LocalPlayer)
+    local tool = character and character:FindFirstChildOfClass("Tool")
+    local supported = tool and tool:GetAttribute("HoodRivalsTuningVersion") == 1
+    local adapter = next(state.WeaponAdapters) ~= nil
+    local text
+    if adapter then text = "Weapon: game adapter connected"
+    elseif state.ServerReady and state.CanTune and supported then text = "Weapon: controller connected"
+    elseif state.ServerReady and not state.CanTune then text = "Weapon: admin permission required"
+    elseif state.ServerReady then text = "Weapon: waiting for a compatible equipped weapon"
+    else text = "Weapon: controller not connected" end
+    state.WeaponStatusLabel.Text = text
+end
+
+function ExtraFeatures.V8.Pause()
+    local state = ExtraFeatures.V8
+    state.HideProximity()
+    if state.LocalHealth then state.LocalHealth.Visible = false end
+    for _, adapter in pairs(state.WeaponAdapters) do pcall(adapter.Apply, state.WeaponPayload(false)) end
+    if state.ServerReady then state.Request("Weapon", state.WeaponPayload(false)) end
+    state.WeaponSyncToken = (state.WeaponSyncToken or 0) + 1
+end
+
+function ExtraFeatures.V8.Cleanup()
+    local state = ExtraFeatures.V8
+    state.SaveInterface(); state.FlushSaves(); state.Pause()
+    if state.ServerReady then state.Request("Close", {}) end
+    state.Destroyed = true
+    for _, arrow in ipairs(state.Arrows or {}) do arrow.Frame:Destroy() end
+    if state.ProximitySummary then state.ProximitySummary:Destroy() end
+    if state.LocalHealth then state.LocalHealth:Destroy() end
+    for object, record in pairs(state.Registry) do
+        for _, connection in ipairs(record.Connections or {}) do connection:Disconnect() end
+        state.Registry[object] = nil
+    end
+end
+
+
+function UI:CreateChoice(parent, options)
+    local frame = Instance.new("Frame"); frame.Name = "Choice_" .. options.Key
+    frame.Size = UDim2.new(1, 0, 0, 62); frame.BackgroundTransparency = 1; frame.Parent = parent
+    local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 0, 22)
+    label.Text = options.Text; label.BackgroundTransparency = 1; label.Font = Enum.Font.GothamMedium
+    label.TextSize = 13; label.TextXAlignment = Enum.TextXAlignment.Left; label.TextColor3 = Config.TextColor; label.Parent = frame
+    local button = UI:CreateButton(frame, "", function() end)
+    button.Name = "ChoiceValue"; button.Position = UDim2.fromOffset(0, 26); button.Size = UDim2.new(1, 0, 0, 32)
+    button.TextXAlignment = Enum.TextXAlignment.Left; button.TextTruncate = Enum.TextTruncate.AtEnd
+    local padding = Instance.new("UIPadding"); padding.PaddingLeft = UDim.new(0, 10); padding.Parent = button
+    local api = {Frame = frame, Choices = options.Choices, Value = options.Default}
+    function api.Get() return api.Value end
+    function api.Refresh()
+        for _, choice in ipairs(options.Choices) do if choice.Value == api.Value then button.Text = choice.Text .. "  ▾"; return end end
+    end
+    function api.Set(value, silent)
+        for _, choice in ipairs(options.Choices) do
+            if choice.Value == value then
+                api.Value = value; api.Refresh()
+                if silent ~= true then UI:Invoke(options.Callback, options.Text, value) end
+                return true
+            end
+        end
+        return false
+    end
+    UI:ConnectOwned(button, button.MouseButton1Click, function()
+        local card = ExtraFeatures.NewDialog(options.Text, "", 300)
+        local scroll = Instance.new("ScrollingFrame"); scroll.Size = UDim2.new(1, -32, 1, -108)
+        scroll.Position = UDim2.fromOffset(16, 52); scroll.BackgroundTransparency = 1; scroll.BorderSizePixel = 0
+        scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; scroll.CanvasSize = UDim2.new(); scroll.ScrollBarThickness = 3; scroll.Parent = card
+        local layout = Instance.new("UIListLayout"); layout.Padding = UDim.new(0, 7); layout.Parent = scroll
+        for _, choice in ipairs(options.Choices) do
+            local item = UI:CreateButton(scroll, (choice.Value == api.Value and "✓  " or "") .. choice.Text, function()
+                DestroyMenuProfilePopup(); api.Set(choice.Value)
+            end)
+            item.TextTruncate = Enum.TextTruncate.AtEnd
+            if choice.Value == api.Value then item.TextColor3 = Config.AccentColor end
+        end
+        local cancel = UI:CreateButton(card, "CANCEL", DestroyMenuProfilePopup)
+        cancel.Size = UDim2.new(1, -32, 0, 34); cancel.Position = UDim2.new(0, 16, 1, -48)
+    end)
+    api.Refresh()
+    local record = UI:RegisterControl(frame, options.Text, "Choice", api, options)
+    UI:AddFavorite(record, UDim2.new(1, -28, 0, -2))
+    label.Size = UDim2.new(1, -35, 0, 22)
+    return api
+end
+
+function ExtraFeatures.V8.ApplyFeatures(payload)
+    local state = ExtraFeatures.V8
+    if type(payload) ~= "table" then return end
+    local priorities = {Crosshair = true, Nearest = true, LowestHealth = true, PlayersFirst = true, NPCFirst = true}
+    if priorities[payload.AimPriority] then Config.AimPriority = payload.AimPriority end
+    if type(payload.Classification) == "table" then
+        local value = payload.Classification
+        if value.Mode == "Auto" or value.Mode == "FFA" or value.Mode == "RobloxTeams" or value.Mode == "Custom" then Config.Classification.Mode = value.Mode end
+        if type(value.Attribute) == "string" and #value.Attribute <= 64 then Config.Classification.Attribute = TrimString(value.Attribute) end
+    end
+    if type(payload.WeaponTuning) == "table" then
+        for _, key in ipairs({"InfiniteAmmo", "SkipReload", "RecoilEnabled", "SpreadEnabled"}) do
+            if type(payload.WeaponTuning[key]) == "boolean" then Config.WeaponTuning[key] = payload.WeaponTuning[key] end
+        end
+        for _, key in ipairs({"RecoilScale", "SpreadScale"}) do
+            if IsFiniteNumber(payload.WeaponTuning[key]) then Config.WeaponTuning[key] = math.clamp(payload.WeaponTuning[key], 0, 1) end
+        end
+    end
+    if type(payload.Proximity) == "table" then
+        for _, key in ipairs({"Enabled", "IncludeNPC"}) do
+            if type(payload.Proximity[key]) == "boolean" then Config.Proximity[key] = payload.Proximity[key] end
+        end
+        if IsFiniteNumber(payload.Proximity.Radius) then Config.Proximity.Radius = math.clamp(payload.Proximity.Radius, 10, 120) end
+    end
+    state.SyncControls(); state.SyncWeapon()
+    if not Config.Proximity.Enabled then state.HideProximity() end
+end
+
+function ExtraFeatures.V8.SyncControls()
+    local state = ExtraFeatures.V8
+    for key, control in pairs(state.Controls or {}) do
+        local value = key == "AimPriority" and Config.AimPriority or key == "Language" and Config.Interface.Language
+            or key == "TeamMode" and Config.Classification.Mode or Config.WeaponTuning[key]
+        if key == "RecoilScale" or key == "SpreadScale" then value = value * 100 end
+        if value ~= nil then control.Set(value, true) end
+    end
+    if state.ProximityControl then state.ProximityControl.Set(Config.Proximity.Enabled, true) end
+    if state.RadiusControl then state.RadiusControl.Set(Config.Proximity.Radius, true) end
+    if state.IncludeNPCControl then state.IncludeNPCControl.Set(Config.Proximity.IncludeNPC, true) end
+    if state.TeamAttributeBox then state.TeamAttributeBox.Text = Config.Classification.Attribute end
+end
+
+function ExtraFeatures.V8.FavoriteChordDown()
+    return (UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl))
+        and UserInputService:IsKeyDown(Enum.KeyCode.S) and UserInputService:IsKeyDown(Enum.KeyCode.V)
+end
+
+function ExtraFeatures.V8.RefreshFavorites()
+    local state = ExtraFeatures.V8
+    if not state.FavoritesList then return end
+    for _, child in ipairs(state.FavoritesList:GetChildren()) do if child:IsA("GuiObject") then child:Destroy() end end
+    state.FavoriteLinks = {}
+    for _, record in ipairs(UIRefs.Experience.Controls) do
+        if Config.Interface.Favorites[record.Id] and record.Frame.Parent then
+            local function navigate()
+                UIRefs.Experience.SearchBox.Text = ""; UIRefs.Experience.FavoritesOnly = false
+                local section = record.Section.Frame
+                while section and section ~= ContentArea do
+                    local item = UIRefs.Experience.SectionByFrame[section]
+                    if item then Config.Interface.CollapsedSections[item.Id] = nil end
+                    section = section.Parent
+                end
+                UI:ApplyFilter(); PageManager:ShowPage(record.Page, true)
+                local page = GUIState.Pages[record.Page]
+                task.defer(function()
+                    if state.Destroyed or not record.Frame.Parent then return end
+                    page.CanvasPosition = Vector2.new(0, math.max(0, record.Frame.AbsolutePosition.Y - page.AbsolutePosition.Y + page.CanvasPosition.Y - 12))
+                end)
+                state.SaveInterface()
+            end
+            local text = state.Translate(record.Page) .. "  /  " .. state.Translate(record.Text)
+            local button = UI:CreateButton(state.FavoritesList, text, navigate)
+            button:SetAttribute("MenuNoTranslate", true)
+            button.Size = UDim2.new(1, 0, 0, 42); button.TextXAlignment = Enum.TextXAlignment.Left
+            button.TextSize = 12; button.TextTruncate = Enum.TextTruncate.AtEnd
+            local pad = Instance.new("UIPadding"); pad.PaddingLeft = UDim.new(0, 10); pad.Parent = button
+            table.insert(state.FavoriteLinks, {Button = button, Record = record})
+        end
+    end
+    state.FavoriteEmpty.Visible = #state.FavoriteLinks == 0
+end
+
+function ExtraFeatures.V8.OpenFavorites()
+    local state = ExtraFeatures.V8
+    if state.Destroyed or UIRefs.Experience.OverlayOpen then return end
+    UIRefs.Experience.SearchBox.Text = ""; UIRefs.Experience.FavoritesOnly = false
+    local button = MainWindow:FindFirstChild("FavoritesOnly", true)
+    if button then button.Text = "☆  Favorites"; button.TextColor3 = Config.SubTextColor end
+    if GUIState.CurrentState ~= "Open" then
+        ExtraFeatures.UIEffects.AnimationBusy = false; SetMenuState("Open")
+    end
+    state.RefreshFavorites(); UI:ApplyFilter(); PageManager:ShowPage("FAVORITES", true)
+end
+
+function ExtraFeatures.V8.ProfileRow(parent, key)
+    local row = Instance.new("Frame"); row.Name = "Info_" .. key; row.Size = UDim2.new(1, 0, 0, key == "Server ID" and 42 or 28)
+    row.AutomaticSize = Enum.AutomaticSize.Y
+    row.BackgroundTransparency = 1; row.Parent = parent
+    local label = Instance.new("TextLabel"); label.Size = UDim2.new(0.38, -4, 0, key == "Server ID" and 42 or 28)
+    label.AutomaticSize = Enum.AutomaticSize.Y
+    label.BackgroundTransparency = 1; label.Text = key; label.Font = Enum.Font.GothamMedium; label.TextSize = 11
+    label.TextColor3 = Config.SubTextColor; label.TextXAlignment = Enum.TextXAlignment.Left; label.TextWrapped = true; label.Parent = row
+    local value = label:Clone(); value.Name = "ProfileValue"; value:SetAttribute("MenuNoTranslate", true)
+    value.Size = UDim2.new(0.62, 0, 0, key == "Server ID" and 42 or 28); value.Position = UDim2.new(0.38, 0, 0, 0)
+    value.TextColor3 = Config.TextColor; value.Text = "--"; value.Font = Enum.Font.GothamBold
+    value.TextSize = 12; value.Parent = row
+    ExtraFeatures.V8.ProfileValues[key] = value
+    UI:RegisterControl(row, key, "Info", {}, {})
+end
+
+function ExtraFeatures.V8.UpdateProfile()
+    local state = ExtraFeatures.V8
+    if not state.ProfileValues then return end
+    local function set(key, value)
+        local label = state.ProfileValues[key]
+        if label then label.Text = tostring(value == nil and "--" or value) end
+    end
+    set("Display Name", LocalPlayer.DisplayName); set("Username", "@" .. LocalPlayer.Name); set("User ID", LocalPlayer.UserId)
+    set("Account Age", tostring(LocalPlayer.AccountAge or 0) .. (Config.Interface.Language == "VI" and " ngày" or " days"))
+    local _, team = NPCSystem.GetTeamToken(LocalPlayer)
+    set("Current Team", team or state.Translate("Unknown / FFA"))
+    set("Game", CurrentGameName); set("Place ID", game.PlaceId); set("Universe ID", game.GameId)
+    set("Server ID", game.JobId ~= "" and game.JobId or "Studio")
+    local privateId = game.PrivateServerId
+    set("Server Type", state.Translate(type(privateId) == "string" and privateId ~= "" and "Private / reserved" or "Public"))
+    set("Players", tostring(#Players:GetPlayers()) .. " / " .. tostring(Players.MaxPlayers or "--"))
+    local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    set("Network Ping", ok and type(ping) == "number" and (tostring(math.floor(ping * 1000 + 0.5)) .. " ms") or "--")
+    local elapsed = math.max(0, math.floor(os.clock() - state.JoinedAt))
+    set("Time in Session", string.format("%02d:%02d:%02d", math.floor(elapsed / 3600), math.floor(elapsed / 60) % 60, elapsed % 60))
+    set("Storage", state.Translate(state.ServerReady and state.ServerStatus or FileAPI.Available and "Saved on device" or "Session only"))
+end
+
+function ExtraFeatures.V8.BuildFPSBadge()
+    local state = ExtraFeatures.V8
+    FloatingBtn.Size = UDim2.fromOffset(146, 48)
+    FloatingBtn.Text = ""; FloatingBtn.BackgroundColor3 = Color3.fromRGB(14, 24, 43)
+    FloatingBtn.BackgroundTransparency = 0.06; FloatingBtn.BorderSizePixel = 0
+    FloatCorner.CornerRadius = UDim.new(0, 11)
+    FloatStroke.Color = Color3.fromRGB(108, 220, 255); FloatStroke.Thickness = 1.4; FloatStroke.Transparency = 0.22
+    UIRefs.FloatingRainbowGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(51, 230, 205)),
+        ColorSequenceKeypoint.new(0.52, Color3.fromRGB(87, 176, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(168, 114, 255))})
+    local gradient = Instance.new("UIGradient")
+    gradient.Color = ColorSequence.new(Color3.fromRGB(18, 36, 57), Color3.fromRGB(20, 20, 39)); gradient.Rotation = 25; gradient.Parent = FloatingBtn
+    local accent = Instance.new("Frame"); accent.Name = "PerformanceAccent"
+    accent.Size = UDim2.fromOffset(3, 25); accent.Position = UDim2.fromOffset(10, 11)
+    accent.BackgroundColor3 = Color3.fromRGB(71, 224, 184); accent.BorderSizePixel = 0; accent.Parent = FloatingBtn; state.FPSAccent = accent
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(1, 0); corner.Parent = accent
+    local text = Instance.new("TextLabel"); text.Name = "FPSValue"
+    text.Size = UDim2.new(1, -39, 1, 0); text.Position = UDim2.fromOffset(21, 0); text.BackgroundTransparency = 1
+    text.Text = "FPS  --"; text.TextColor3 = Color3.fromRGB(235, 252, 255); text.Font = Enum.Font.GothamBold
+    text.TextSize = 18; text.TextXAlignment = Enum.TextXAlignment.Left; text.Parent = FloatingBtn; state.FPSLabel = text
+    local slash = text:Clone(); slash.Name = "GamingAccent"; slash.Size = UDim2.fromOffset(20, 24)
+    slash.Position = UDim2.new(1, -24, 0.5, -12); slash.Text = "//"; slash.TextSize = 16
+    slash.TextColor3 = Color3.fromRGB(99, 189, 226); slash.TextTransparency = 0.25; slash.Parent = FloatingBtn
+    ExtraFeatures.ClampInterfaceFrame(FloatingBtn)
+end
+
+function ExtraFeatures.V8.Initialize()
+    local state = ExtraFeatures.V8
+    state.SessionId = GenerateMenuProfileId()
+    state.InterfacePath = "HoodRivals_Interface_u" .. tostring(LocalPlayer.UserId) .. ".json"
+    state.Controls = {}
+    state.RestoreInterface()
+    local aim = UI:CreateSection(GUIState.Pages.AIM, "AIM PRIORITY")
+    state.Controls.AimPriority = UI:CreateChoice(aim, {Key = "AimPriority", Text = "Aim Priority", Default = Config.AimPriority,
+        Choices = {{Value = "Crosshair", Text = "Crosshair (default)"}, {Value = "Nearest", Text = "Nearest to player"},
+            {Value = "LowestHealth", Text = "Lowest health"}, {Value = "PlayersFirst", Text = "Players first"}, {Value = "NPCFirst", Text = "NPCs first"}},
+        Callback = function(value) Config.AimPriority = value end})
+    UI:CreateLabel(aim, "Priority still follows your team, wall, distance and NPC filters.")
+    local weapon = UI:CreateSection(GUIState.Pages["FUNCTION 1"], "WEAPON TUNING")
+    state.WeaponStatusLabel = UI:CreateLabel(weapon, "Weapon: controller not connected")
+    for _, entry in ipairs({{"InfiniteAmmo", "Infinite Ammo"}, {"SkipReload", "Skip Reload"},
+        {"RecoilEnabled", "Recoil Control"}, {"SpreadEnabled", "Spread Control"}}) do
+        local key = entry[1]
+        state.Controls[key] = UI:CreateToggle(weapon, {Text = entry[2], Default = Config.WeaponTuning[key],
+            Callback = function(value) Config.WeaponTuning[key] = value; state.SyncWeapon() end})
+    end
+    for _, entry in ipairs({{"RecoilScale", "Recoil Amount (%)"}, {"SpreadScale", "Spread Amount (%)"}}) do
+        local key = entry[1]
+        state.Controls[key] = UI:CreateSlider(weapon, {Text = entry[2], Min = 0, Max = 100, Increment = 1,
+            Default = Config.WeaponTuning[key] * 100, EditableValue = true,
+            Callback = function(value) Config.WeaponTuning[key] = value / 100; state.SyncWeapon() end})
+    end
+    UI:CreateLabel(weapon, "0% removes the effect; 100% keeps the weapon's default.")
+    UI:CreateLabel(weapon, "Recoil and spread apply to shot direction, not just camera visuals.")
+    local proximity = UI:CreateSection(GUIState.Pages.ESP, "NEARBY ENEMY ALERT")
+    state.ProximityControl = UI:CreateToggle(proximity, {Text = "Nearby Enemy Alert", Default = Config.Proximity.Enabled,
+        Callback = function(value) Config.Proximity.Enabled = value; state.LastScan = nil; if not value then state.HideProximity() end end})
+    state.RadiusControl = UI:CreateSlider(proximity, {Text = "Scan Radius", Min = 10, Max = 120, Default = Config.Proximity.Radius,
+        Increment = 1, EditableValue = true, Callback = function(value) Config.Proximity.Radius = value; state.LastScan = nil end})
+    state.IncludeNPCControl = UI:CreateToggle(proximity, {Text = "Include Hostile NPCs", Default = Config.Proximity.IncludeNPC,
+        Callback = function(value) Config.Proximity.IncludeNPC = value; state.LastScan = nil end})
+    UI:CreateLabel(proximity, "Arrows show nearby living enemies. Alerts clear when the area is safe.")
+    local teams = UI:CreateSection(GUIState.Pages.ESP, "TEAM DETECTION")
+    state.Controls.TeamMode = UI:CreateChoice(teams, {Key = "TeamMode", Text = "Team Detection", Default = Config.Classification.Mode,
+        Choices = {{Value = "Auto", Text = "Auto"}, {Value = "FFA", Text = "Free for all (FFA)"},
+            {Value = "RobloxTeams", Text = "Roblox teams"}, {Value = "Custom", Text = "Custom team attribute"}},
+        Callback = function(value) Config.Classification.Mode = value; state.LastScan = nil; state.UpdateProfile() end})
+    state.TeamAttributeBox = UI:CreateTextbox(teams, {Text = "Team Attribute", Default = Config.Classification.Attribute,
+        Placeholder = "TeamId", Callback = function(value)
+            value = TrimString(tostring(value)); if #value <= 64 then Config.Classification.Attribute = value end
+            state.TeamAttributeBox.Text = Config.Classification.Attribute; state.LastScan = nil
+        end})
+    UI:CreateLabel(teams, "Auto checks custom combat teams before Roblox teams. Use FFA for games without teams.")
+    UI:CreateLabel(teams, "Custom player rigs can expose PlayerUserId; NPCs remain a separate category.")
+    local language = UI:CreateSection(SettingsPage, "LANGUAGE")
+    state.Controls.Language = UI:CreateChoice(language, {Key = "Language", Text = "Language", Default = Config.Interface.Language,
+        Choices = {{Value = "EN", Text = "English"}, {Value = "VI", Text = "Vietnamese"}},
+        Callback = function(value) Config.Interface.Language = value; state.ApplyLanguage(); state.RefreshFavorites(); state.SaveInterface() end})
+    UI:CreateLabel(language, "Shortcut: hold CTRL + S + V to open Favorites")
+    local profile = PageManager:AddPage("PROFILE")
+    GUIState.TabButtons.PROFILE.LayoutOrder = 90
+    state.ProfileValues = {}
+    local identity = UI:CreateSection(profile, "PLAYER IDENTITY")
+    local avatar = Instance.new("ImageLabel"); avatar.Name = "ProfileAvatar"; avatar.Size = UDim2.fromOffset(84, 84)
+    avatar.BackgroundColor3 = Config.DarkBg; avatar.BorderSizePixel = 0; avatar.Parent = identity
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 16); corner.Parent = avatar
+    task.defer(function()
+        local ok, image = pcall(function() return Players:GetUserThumbnailAsync(LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size180x180) end)
+        if ok and not state.Destroyed and avatar.Parent then avatar.Image = image end
+    end)
+    UI:CreateLabel(identity, "Read-only player and server information.")
+    for _, key in ipairs({"Display Name", "Username", "User ID", "Account Age", "Current Team"}) do state.ProfileRow(identity, key) end
+    local server = UI:CreateSection(profile, "GAME / SERVER")
+    for _, key in ipairs({"Game", "Place ID", "Universe ID", "Server ID", "Server Type", "Players", "Network Ping"}) do state.ProfileRow(server, key) end
+    local session = UI:CreateSection(profile, "SESSION / STORAGE")
+    for _, key in ipairs({"Time in Session", "Storage"}) do state.ProfileRow(session, key) end
+    local favorites = PageManager:AddPage("FAVORITES")
+    GUIState.TabButtons.FAVORITES.LayoutOrder = -9
+    state.FavoriteSection = UI:CreateSection(favorites, "YOUR FAVORITES")
+    state.FavoriteEmpty = UI:CreateLabel(state.FavoriteSection, "No favorites yet. Click a star next to a feature.")
+    state.FavoritesList = Instance.new("Frame"); state.FavoritesList.Size = UDim2.new(1, 0, 0, 0)
+    state.FavoritesList.AutomaticSize = Enum.AutomaticSize.Y; state.FavoritesList.BackgroundTransparency = 1; state.FavoritesList.Parent = state.FavoriteSection
+    local layout = Instance.new("UIListLayout"); layout.Padding = UDim.new(0, 8); layout.Parent = state.FavoritesList
+    state.CreateOverlays(); state.BuildFPSBadge(); state.TrackTree(MainWindow)
+    state.BaseDialog = ExtraFeatures.NewDialog
+    ExtraFeatures.NewDialog = function(...)
+        local card = state.BaseDialog(...); state.TrackTree(MenuProfilePopup); return card
+    end
+    state.BaseApplyFilter = UI.ApplyFilter
+    UI.ApplyFilter = function(self)
+        state.BaseApplyFilter(self)
+        state.FavoriteSection.Visible = true
+    end
+    AddConnection(ScreenGui.DescendantAdded:Connect(state.TrackText))
+    AddConnection(UserInputService.InputEnded:Connect(function()
+        if not state.FavoriteChordDown() then state.FavoriteChordLatched = false end
+    end))
+    AddConnection(UserInputService.WindowFocusReleased:Connect(function() state.FavoriteChordLatched = false end))
+    local replicated = game:GetService("ReplicatedStorage")
+    AddConnection(replicated.DescendantAdded:Connect(function(item)
+        if item.Name == "Request" or item.Name == "HoodRivalsMenuService" then task.defer(state.ConnectStorage) end
+    end))
+    state.ApplyLanguage(); state.RefreshFavorites(); state.UpdateProfile(); state.UpdateWeaponStatus()
+    local lastPage = state.PendingLastPage or Config.Interface.LastPage
+    if Config.Interface.RememberLayout and GUIState.Pages[lastPage] then
+        PageManager:ShowPage(lastPage, true)
+    end
+    ExtraFeatures.ApplyInterfaceLayout(true)
+    _G.MyGUIFramework.WeaponTuning = {RegisterAdapter = state.RegisterWeaponAdapter,
+        GetSettings = function() return state.WeaponPayload(GUIState.CurrentState ~= "Closed") end, Sync = state.SyncWeapon}
+    _G.MyGUIFramework.Classification = {RegisterTeamResolver = function(resolver)
+        if resolver ~= nil and type(resolver) ~= "function" then return false end
+        state.TeamResolver = resolver; state.LastScan = nil; return true
+    end}
+    _G.MyGUIFramework.Interface.OpenFavorites = state.OpenFavorites
+    _G.MyGUIFramework.Interface.SetLanguage = function(value)
+        if value ~= "EN" and value ~= "VI" then return false end
+        Config.Interface.Language = value; state.ApplyLanguage(); state.RefreshFavorites(); state.SaveInterface(); return true
+    end
+    _G.MyGUIFramework.Settings.GetOwnerUserId = function() return LocalPlayer.UserId end
+    state.ConnectStorage()
+end
+
+do
+    local ok, reason = pcall(ExtraFeatures.V8.Initialize)
+    if not ok then
+        table.insert(UIRefs.Experience.Errors, {Time = os.time(), Text = "V8 initialization: " .. tostring(reason)})
+        warn("[Hood Rivals V8] " .. tostring(reason))
+    end
+end
+
