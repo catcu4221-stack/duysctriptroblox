@@ -92,6 +92,7 @@ local Config = {
     Interface = {
         Language = "EN",
         ReducedMotion = false,
+        LowPowerMode = false,
         ClickEffects = true,
         SoundEffects = true,
         SoundVolume = 0.45,
@@ -106,8 +107,6 @@ local Config = {
     StartPage = "ESP",
     AimPriority = "Crosshair",
     Classification = {Mode = "Auto", Attribute = "TeamId"},
-    WeaponTuning = {InfiniteAmmo = false, SkipReload = false, RecoilEnabled = false,
-        RecoilScale = 0, SpreadEnabled = false, SpreadScale = 0},
     Proximity = {Enabled = false, Radius = 35, IncludeNPC = false},
 
     -- OTHER / SETTINGS
@@ -852,14 +851,17 @@ local ExtraFeatures = {
 
 -- Shared configuration and classification helpers; no new render loops.
 ExtraFeatures.V8 = {
-    Version = 8, OwnerUserId = LocalPlayer.UserId, CustomCharacters = {},
+    Version = 9, OwnerUserId = LocalPlayer.UserId, CustomCharacters = {},
     Registry = setmetatable({}, {__mode = "k"}), TranslationGuard = false,
     InterfaceRevision = 0, ProfilesRevision = 0, SettingsRevision = 0,
     RequestSerial = 0, ServerReady = false, ServerStatus = "Not connected",
-    WeaponStatus = "Controller not connected", WeaponAdapters = {},
     ScanAccumulator = 0, ProfileAccumulator = 0, JoinedAt = os.clock(),
     FavoriteChordLatched = false, Destroyed = false, Restoring = false
 }
+
+function ExtraFeatures.IsReducedMotion()
+    return Config.Interface.ReducedMotion or Config.Interface.LowPowerMode
+end
 
 function ExtraFeatures.V8.Normalize(text)
     text = string.lower(tostring(text or ""))
@@ -1366,7 +1368,7 @@ end
 
 function ExtraFeatures.OnUserToggleClicked(guiObject)
     if not Config.Interface.ClickEffects then return end
-    if Config.Interface.ReducedMotion then
+    if ExtraFeatures.IsReducedMotion() then
         ExtraFeatures.PlayToggleFXSound()
         return
     end
@@ -1423,6 +1425,7 @@ function ExtraFeatures.OnTabChangedLegacy(previousPage, pageName)
 end
 
 function ExtraFeatures.UpdateHeavySliders(renderDt)
+    if not MainWindow.Visible then return end
     local sliders = ExtraFeatures.UIEffects.Sliders.Active
 
     if type(sliders) ~= "table" then
@@ -2127,18 +2130,36 @@ function OtherSystem.ApplyXRayPart(part)
         math.max(originalTransparency, Config.XRayTransparency)
 end
 
+
 function OtherSystem.EnableXRay()
     Config.XRayEnabled = true
     OtherSystem.XRayActive = true
-
+    OtherSystem.XRayGeneration = (OtherSystem.XRayGeneration or 0) + 1
+    if Config.Interface.LowPowerMode then
+        local generation = OtherSystem.XRayGeneration
+        task.spawn(function()
+            local pending = {Workspace}
+            while #pending > 0 and Config.XRayEnabled and generation == OtherSystem.XRayGeneration do
+                local remaining, deadline = 120, os.clock() + 0.002
+                repeat
+                    local instance = table.remove(pending)
+                    if instance:IsA("BasePart") then OtherSystem.ApplyXRayPart(instance) end
+                    for _, child in ipairs(instance:GetChildren()) do table.insert(pending, child) end
+                    remaining -= 1
+                until #pending == 0 or remaining <= 0 or os.clock() >= deadline
+                    or not Config.XRayEnabled or generation ~= OtherSystem.XRayGeneration
+                if #pending > 0 then task.wait() end
+            end
+        end)
+        return
+    end
     for _, instance in ipairs(Workspace:GetDescendants()) do
-        if instance:IsA("BasePart") then
-            OtherSystem.ApplyXRayPart(instance)
-        end
+        if instance:IsA("BasePart") then OtherSystem.ApplyXRayPart(instance) end
     end
 end
 
 function OtherSystem.DisableXRay()
+    OtherSystem.XRayGeneration = (OtherSystem.XRayGeneration or 0) + 1
     Config.XRayEnabled = false
     OtherSystem.XRayActive = false
 
@@ -2961,6 +2982,11 @@ function PageManager:ShowPage(pageName, suppressEffects)
         end
     end
 
+    if pageName == "PROFILE" and ExtraFeatures.V8.UpdateProfile then
+        ExtraFeatures.V8.LastProfile = os.clock()
+        ExtraFeatures.V8.UpdateProfile()
+    end
+
     if suppressEffects ~= true
         and previousPage ~= GUIState.ActivePage
         and ExtraFeatures.OnTabChanged
@@ -3099,7 +3125,7 @@ function UI:Tween(object, slot, duration, goals)
     local slots = UIRefs.Experience.TweenSlots[object]
     if not slots then slots = {}; UIRefs.Experience.TweenSlots[object] = slots end
     if slots[slot] then slots[slot]:Cancel(); slots[slot] = nil end
-    if Config.Interface.ReducedMotion then
+    if ExtraFeatures.IsReducedMotion() then
         for key, value in pairs(goals) do object[key] = value end
         return
     end
@@ -3434,7 +3460,7 @@ function UI:CreateToggle(parent, options)
             or UDim2.new(0, 3, 0.5, -9)
 
         local backgroundTweenInfo = TweenInfo.new(
-            Config.Interface.ReducedMotion and 0 or 0.24,
+            ExtraFeatures.IsReducedMotion() and 0 or 0.24,
             Enum.EasingStyle.Quint,
             Enum.EasingDirection.Out
         )
@@ -3443,7 +3469,7 @@ function UI:CreateToggle(parent, options)
 
         if userInitiated then
             indicatorTweenInfo = TweenInfo.new(
-                Config.Interface.ReducedMotion and 0 or 0.34,
+                ExtraFeatures.IsReducedMotion() and 0 or 0.34,
                 Enum.EasingStyle.Bounce,
                 Enum.EasingDirection.Out
             )
@@ -3463,7 +3489,7 @@ function UI:CreateToggle(parent, options)
             {Position = targetPos}
         ):Play()
 
-        if usePop and not Config.Interface.ReducedMotion then
+        if usePop and not ExtraFeatures.IsReducedMotion() then
             pop(userInitiated == true)
         end
 
@@ -3719,7 +3745,7 @@ function UI:CreateSlider(parent, options)
         valueBox.Text = FormatValue(currentValue)
         visualState.TargetPercentage = percentage
 
-        if immediate == true or Config.Interface.ReducedMotion then
+        if immediate == true or ExtraFeatures.IsReducedMotion() then
             visualState.ActiveVisual = false
             ApplyVisualPercentage(percentage)
         else
@@ -4122,6 +4148,9 @@ local PlayerRuntime = {
     UseJumpPowerOriginal = nil,
 
     NoclipOriginalCanCollide = {},
+    NoclipParts = {},
+    NoclipConnections = {},
+    NoclipCacheCharacter = nil,
 
     FullBrightSaved = nil
 }
@@ -4182,6 +4211,7 @@ local function RefreshPlayerCharacterReferences(character)
     PlayerRuntime.Character = character
     PlayerRuntime.Humanoid = character and character:FindFirstChildOfClass("Humanoid") or nil
     PlayerRuntime.RootPart = character and character:FindFirstChild("HumanoidRootPart") or nil
+    ExtraFeatures.ResetNoclipCache()
     PlayerRuntime.NoclipOriginalCanCollide = {}
 
     CaptureOriginalJumpPower(PlayerRuntime.Humanoid)
@@ -4209,7 +4239,9 @@ end
 -- =========================
 
 local function RestoreNoclip(character)
+    if PlayerRuntime.NoclipCacheCharacter then ExtraFeatures.ResetNoclipCache() end
     local originalStates = PlayerRuntime.NoclipOriginalCanCollide
+    if next(originalStates) == nil then return end
 
     for part, originalCanCollide in pairs(originalStates) do
         if part and part.Parent and part:IsA("BasePart") then
@@ -4295,6 +4327,7 @@ local function CleanupPlayerRuntime()
         RestoreOriginalJumpPower(PlayerRuntime.Humanoid)
     end
 
+    ExtraFeatures.ResetNoclipCache()
     PlayerRuntime.Character = nil
     PlayerRuntime.Humanoid = nil
     PlayerRuntime.RootPart = nil
@@ -4458,6 +4491,35 @@ local function UpdateFly(humanoid, rootPart)
     bodyGyro.CFrame = camera.CFrame
 end
 
+function ExtraFeatures.ResetNoclipCache()
+    for _, connection in ipairs(PlayerRuntime.NoclipConnections) do connection:Disconnect() end
+    table.clear(PlayerRuntime.NoclipConnections)
+    table.clear(PlayerRuntime.NoclipParts)
+    PlayerRuntime.NoclipCacheCharacter = nil
+end
+
+function ExtraFeatures.GetNoclipParts(character)
+    if PlayerRuntime.NoclipCacheCharacter == character then return PlayerRuntime.NoclipParts end
+    ExtraFeatures.ResetNoclipCache()
+    PlayerRuntime.NoclipCacheCharacter = character
+    local parts = PlayerRuntime.NoclipParts
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then parts[part] = true end
+    end
+    table.insert(PlayerRuntime.NoclipConnections, character.DescendantAdded:Connect(function(part)
+        if part:IsA("BasePart") then parts[part] = true end
+    end))
+    table.insert(PlayerRuntime.NoclipConnections, character.DescendantRemoving:Connect(function(part)
+        if parts[part] then
+            local original = PlayerRuntime.NoclipOriginalCanCollide[part]
+            if original ~= nil then part.CanCollide = original end
+            PlayerRuntime.NoclipOriginalCanCollide[part] = nil
+            parts[part] = nil
+        end
+    end))
+    return parts
+end
+
 local function UpdateNoclip(character)
     if not Config.Player.NoclipEnabled then
         RestoreNoclip(character)
@@ -4468,8 +4530,8 @@ local function UpdateNoclip(character)
         return
     end
 
-    for _, part in ipairs(character:GetDescendants()) do
-        if part:IsA("BasePart") then
+    for part in pairs(ExtraFeatures.GetNoclipParts(character)) do
+        if part.Parent and part:IsDescendantOf(character) then
             if PlayerRuntime.NoclipOriginalCanCollide[part] == nil then
                 PlayerRuntime.NoclipOriginalCanCollide[part] =
                     part.CanCollide
@@ -4486,6 +4548,7 @@ local function UpdatePlayer(dt)
     local character, humanoid, rootPart = GetLocalCharacterParts()
 
     if character ~= PlayerRuntime.Character then
+        ExtraFeatures.ResetNoclipCache()
         PlayerRuntime.NoclipOriginalCanCollide = {}
     end
 
@@ -8892,7 +8955,7 @@ function ExtraFeatures.StartVirtualPet()
 
     ExtraFeatures.StopVirtualPet()
 
-    if not Config.VirtualPetEnabled then
+    if not Config.VirtualPetEnabled or Config.Interface.LowPowerMode then
         return
     end
 
@@ -9201,7 +9264,7 @@ function ExtraFeatures.StartSnowfall()
 
     ExtraFeatures.DestroySnowfall()
 
-    if not Config.SnowfallEnabled then
+    if not Config.SnowfallEnabled or Config.Interface.LowPowerMode then
         return
     end
 
@@ -9249,6 +9312,25 @@ function ExtraFeatures.SetSnowfallEnabled(enabled)
     return true
 end
 
+function ExtraFeatures.ApplyPerformanceMode()
+    local effects = ExtraFeatures.UIEffects
+    if Config.Interface.LowPowerMode then
+        ExtraFeatures.StopVirtualPet()
+        ExtraFeatures.DestroySnowfall()
+        ExtraFeatures.DestroyMinimizeChat()
+        local dynamic = effects.DynamicColor
+        if dynamic.Tween then dynamic.Tween:Cancel(); dynamic.Tween = nil end
+        MainStroke.Thickness = 1.5
+        MainStroke.Transparency = 0.10
+        FloatStroke.Thickness = 1.4
+        FloatStroke.Transparency = 0.22
+        return
+    end
+    if GUIState.CurrentState == "Closed" or not effects.Initialized then return end
+    if Config.VirtualPetEnabled and not effects.VirtualPet.Enabled then ExtraFeatures.StartVirtualPet() end
+    if Config.SnowfallEnabled and not effects.Snowfall.Enabled then ExtraFeatures.StartSnowfall() end
+end
+
 function ExtraFeatures.UpdateFloatingStatus(dt)
     local bubble = ExtraFeatures.UIEffects.Bubble
     local delta = math.max(0, tonumber(dt) or 0)
@@ -9281,14 +9363,16 @@ function ExtraFeatures.UpdateFloatingStatus(dt)
         end
     end
 
-    if UIRefs.FloatingRainbowGradient
+    if Config.Interface.LowPowerMode then return end
+
+    if FloatingBtn.Visible and UIRefs.FloatingRainbowGradient
         and UIRefs.FloatingRainbowGradient.Parent
     then
         UIRefs.FloatingRainbowGradient.Rotation =
             (os.clock() * 95) % 360
     end
 
-    if UIRefs.MainRainbowGradient
+    if MainWindow.Visible and UIRefs.MainRainbowGradient
         and UIRefs.MainRainbowGradient.Parent
     then
         local now = os.clock()
@@ -9347,6 +9431,7 @@ function ExtraFeatures.DestroyMinimizeChat()
 end
 
 function ExtraFeatures.ShowMinimizeChat()
+    if Config.Interface.LowPowerMode then return end
     local bubble = ExtraFeatures.UIEffects.Bubble
     local messages = bubble.Messages
 
@@ -9698,7 +9783,7 @@ function ExtraFeatures.InitializeUIEffects()
 
     AddConnection(
         FloatingBtn.MouseEnter:Connect(function()
-            if not FloatingBtn.Visible then
+            if not FloatingBtn.Visible or Config.Interface.LowPowerMode then
                 return
             end
 
@@ -9744,6 +9829,7 @@ function ExtraFeatures.InitializeUIEffects()
 
     AddConnection(
         FloatingBtn.MouseLeave:Connect(function()
+            if Config.Interface.LowPowerMode then return end
             pcall(function()
                 if effects.Bubble.HoverTween then
                     effects.Bubble.HoverTween:Cancel()
@@ -9920,11 +10006,10 @@ CurrentGameName, CurrentPlaceId = GetCurrentGameMetadata()
 
 local function BuildConfigPayload()
     return {
-        version = 8,
+        version = 9,
         OwnerUserId = LocalPlayer.UserId,
         AimPriority = Config.AimPriority,
         Classification = {Mode = Config.Classification.Mode, Attribute = Config.Classification.Attribute},
-        WeaponTuning = table.clone(Config.WeaponTuning),
         Proximity = table.clone(Config.Proximity),
         Interface = ExtraFeatures.BuildInterfacePayload(),
 
@@ -11563,7 +11648,6 @@ function ExtraFeatures.ResumeRuntime()
         UIRefs.Experience.ClosedSnapshot = nil
     end
     ExtraFeatures.StartRenderPipeline()
-    if ExtraFeatures.V8.SyncWeapon then ExtraFeatures.V8.SyncWeapon() end
 end
 
 ExtraFeatures.StartRenderPipeline()
@@ -12315,7 +12399,7 @@ function ExtraFeatures.BuildInterfacePayload()
     local favorites, collapsed = {}, {}
     for key, value in pairs(source.Favorites) do if value == true then favorites[key] = true end end
     for key, value in pairs(source.CollapsedSections) do if value == true then collapsed[key] = true end end
-    return {ReducedMotion = source.ReducedMotion, ClickEffects = source.ClickEffects,
+    return {ReducedMotion = source.ReducedMotion, LowPowerMode = source.LowPowerMode, ClickEffects = source.ClickEffects,
         SoundEffects = source.SoundEffects, SoundVolume = source.SoundVolume,
         Language = source.Language, OwnerUserId = LocalPlayer.UserId,
         RememberLayout = source.RememberLayout, CompactSidebar = source.CompactSidebar,
@@ -12329,7 +12413,7 @@ function ExtraFeatures.ApplyInterfacePayload(payload)
     if payload.OwnerUserId ~= nil and payload.OwnerUserId ~= LocalPlayer.UserId then return end
     local target = Config.Interface
     if payload.Language == "EN" or payload.Language == "VI" then target.Language = payload.Language end
-    for _, key in ipairs({"ReducedMotion", "ClickEffects", "SoundEffects", "RememberLayout", "CompactSidebar"}) do
+    for _, key in ipairs({"ReducedMotion", "LowPowerMode", "ClickEffects", "SoundEffects", "RememberLayout", "CompactSidebar"}) do
         if type(payload[key]) == "boolean" then target[key] = payload[key] end
     end
     if IsFiniteNumber(payload.SoundVolume) then target.SoundVolume = math.clamp(payload.SoundVolume, 0, 1) end
@@ -12338,7 +12422,8 @@ function ExtraFeatures.ApplyInterfacePayload(payload)
             target[key] = {}
             local count = 0
             for id, enabled in pairs(payload[key]) do
-                if type(id) == "string" and #id <= 300 and enabled == true and count < 500 then
+                if type(id) == "string" and #id <= 300 and enabled == true and count < 500
+                    and string.sub(id, 1, 25) ~= "FUNCTION 1/WEAPON TUNING/" then
                     target[key][id] = true; count = count + 1
                 end
             end
@@ -12355,6 +12440,7 @@ function ExtraFeatures.ApplyInterfacePayload(payload)
         ExtraFeatures.V8.PendingLastPage = payload.LastPage
         if GUIState.Pages[payload.LastPage] then target.LastPage = payload.LastPage end
     end
+    if ExtraFeatures.ApplyPerformanceMode then ExtraFeatures.ApplyPerformanceMode() end
     if UIRefs.Experience.Ready then
         UI:ApplyFilter()
         for key, api in pairs(UIRefs.Experience.PreferenceControls or {}) do api.Set(target[key], true) end
@@ -12392,7 +12478,7 @@ function ExtraFeatures.OnTabChanged(previousPage, pageName)
     MainWindow.BackgroundColor3 = Config.DarkBg
     local page = GUIState.Pages[pageName]
     local padding = page and page:FindFirstChildOfClass("UIPadding")
-    if padding and not Config.Interface.ReducedMotion then
+    if padding and not ExtraFeatures.IsReducedMotion() then
         padding.PaddingTop = UDim.new(0, 18)
         UI:Tween(padding, "PageEntry", 0.18, {PaddingTop = UDim.new(0, 10)})
     end
@@ -12609,7 +12695,7 @@ end
 
 function ExtraFeatures.UpdateInterfaceStatus(dt)
     local state = UIRefs.Experience
-    if not state.Ready or state.Destroyed then return end
+    if not state.Ready or state.Destroyed or GUIState.CurrentState ~= "Open" then return end
     state.StatusAccumulator = state.StatusAccumulator + (tonumber(dt) or 0)
     if state.StatusAccumulator < 0.35 then return end
     state.StatusAccumulator = 0
@@ -12662,7 +12748,7 @@ function ExtraFeatures.InitializeInterface()
     state.Ready = true
     state.BaseAnimations = {Open = ExtraFeatures.AnimateMenuOpen, Minimize = ExtraFeatures.AnimateMenuMinimize}
     ExtraFeatures.AnimateMenuOpen = function()
-        if not Config.Interface.ReducedMotion then return state.BaseAnimations.Open() end
+        if not ExtraFeatures.IsReducedMotion() then return state.BaseAnimations.Open() end
         local effects = ExtraFeatures.UIEffects
         effects.Bubble.Token = effects.Bubble.Token + 1
         effects.AnimationBusy = false
@@ -12672,7 +12758,7 @@ function ExtraFeatures.InitializeInterface()
         MainWindow.Visible, FloatingBtn.Visible = true, false
     end
     ExtraFeatures.AnimateMenuMinimize = function()
-        if not Config.Interface.ReducedMotion then return state.BaseAnimations.Minimize() end
+        if not ExtraFeatures.IsReducedMotion() then return state.BaseAnimations.Minimize() end
         local effects = ExtraFeatures.UIEffects
         effects.Bubble.Token = effects.Bubble.Token + 1
         effects.AnimationBusy = false
@@ -12779,12 +12865,20 @@ function ExtraFeatures.InitializeInterface()
     end
     local preferences = UI:CreateSection(SettingsPage, "INTERFACE")
     state.PreferenceControls = {}
-    for _, entry in ipairs({{"ReducedMotion", "Reduced Motion"}, {"ClickEffects", "Toggle Effects"},
+    for _, entry in ipairs({{"LowPowerMode", "Low Power Mode"}, {"ReducedMotion", "Reduced Motion"}, {"ClickEffects", "Toggle Effects"},
         {"SoundEffects", "UI Sounds"}, {"RememberLayout", "Remember Layout"}, {"CompactSidebar", "Compact Sidebar"}}) do
         local key = entry[1]
         state.PreferenceControls[key] = UI:CreateToggle(preferences, {Text = entry[2], Default = Config.Interface[key],
-            Callback = function(value) Config.Interface[key] = value; ExtraFeatures.ApplyInterfaceLayout(false) end})
+            Callback = function(value)
+                Config.Interface[key] = value
+                if key == "LowPowerMode" then
+                    ExtraFeatures.ApplyPerformanceMode()
+                    if ExtraFeatures.V8.SaveInterface then ExtraFeatures.V8.SaveInterface() end
+                end
+                ExtraFeatures.ApplyInterfaceLayout(false)
+            end})
     end
+    UI:CreateLabel(preferences, "Low Power Mode pauses decorative effects and keeps gameplay settings unchanged.")
     state.VolumeControl = UI:CreateSlider(preferences, {Text = "UI Volume", Min = 0, Max = 1,
         Default = Config.Interface.SoundVolume, Increment = 0.01, EditableValue = true,
         Callback = function(value) Config.Interface.SoundVolume = value end})
@@ -12933,6 +13027,8 @@ ExtraFeatures.V8.Vietnamese = {
     ["Distance: Nearest"] = "Khoảng cách: Gần nhất", ["Distance: Farthest"] = "Khoảng cách: Xa nhất",
     ["Profiles saved"] = "Đã lưu các cấu hình",
     ["ESP"] = "ESP", ["NPC"] = "NPC", ["TELEPORT"] = "DỊCH CHUYỂN", ["TP"] = "DỊCH CHUYỂN",
+    ["Low Power Mode"] = "Chế độ máy yếu",
+    ["Low Power Mode pauses decorative effects and keeps gameplay settings unchanged."] = "Tạm dừng hiệu ứng trang trí, giữ nguyên thiết lập gameplay.",
     ["SETTINGS"] = "CÀI ĐẶT", ["SET"] = "CÀI ĐẶT", ["PROFILE"] = "HỒ SƠ", ["FUNCTION 1"] = "CHỨC NĂNG 1",
     ["Aim Enable"] = "Bật ngắm", ["Team Check"] = "Kiểm tra đội", ["Wall Check"] = "Kiểm tra vật cản",
     ["Ignore Visibility"] = "Bỏ qua kiểm tra hiển thị", ["Use FOV"] = "Dùng vùng ngắm", ["Always Aim"] = "Luôn ngắm",
@@ -12997,12 +13093,6 @@ ExtraFeatures.V8.Vietnamese = {
     ["AIM PRIORITY"] = "ƯU TIÊN MỤC TIÊU", ["Aim Priority"] = "Ưu tiên ngắm", ["Crosshair (default)"] = "Gần tâm ngắm (mặc định)",
     ["Nearest to player"] = "Gần nhân vật nhất", ["Lowest health"] = "Ít máu nhất", ["Players first"] = "Ưu tiên người chơi", ["NPCs first"] = "Ưu tiên NPC",
     ["Priority still follows your team, wall, distance and NPC filters."] = "Ưu tiên vẫn tuân theo bộ lọc đội, vật cản, khoảng cách và NPC.",
-    ["WEAPON TUNING"] = "TÙY CHỈNH SÚNG", ["Infinite Ammo"] = "Đạn vô hạn", ["Skip Reload"] = "Bỏ thời gian reload",
-    ["Recoil Control"] = "Kiểm soát độ giật", ["Recoil Amount (%)"] = "Mức giật còn lại (%)", ["Spread Control"] = "Kiểm soát độ tản đạn",
-    ["Spread Amount (%)"] = "Mức tản còn lại (%)", ["0% removes the effect; 100% keeps the weapon's default."] = "0% loại bỏ hiệu ứng; 100% giữ mức mặc định của súng.",
-    ["Weapon: game adapter connected"] = "Súng: đã kết nối bộ điều khiển game", ["Weapon: controller connected"] = "Súng: đã kết nối bộ điều khiển",
-    ["Weapon: admin permission required"] = "Súng: cần quyền admin", ["Weapon: waiting for a compatible equipped weapon"] = "Súng: đang chờ trang bị súng tương thích",
-    ["Weapon: controller not connected"] = "Súng: chưa kết nối bộ điều khiển", ["Recoil and spread apply to shot direction, not just camera visuals."] = "Độ giật và tản được áp dụng vào hướng đạn thực tế.",
     ["NEARBY ENEMY ALERT"] = "CẢNH BÁO ĐỊCH Ở GẦN", ["Nearby Enemy Alert"] = "Cảnh báo địch ở gần", ["Scan Radius"] = "Bán kính quét",
     ["Include Hostile NPCs"] = "Quét cả NPC thù địch", ["Arrows show nearby living enemies. Alerts clear when the area is safe."] = "Mũi tên chỉ địch còn sống trong phạm vi. Cảnh báo tự ẩn khi không còn địch.",
     ["TEAM DETECTION"] = "NHẬN DIỆN ĐỘI", ["Team Detection"] = "Cách nhận diện đội", ["Auto"] = "Tự động", ["Free for all (FFA)"] = "Mọi người là đối thủ (FFA)",
@@ -13144,7 +13234,7 @@ function ExtraFeatures.V8.StyleHealth(data, humanoid, _classificationColor)
     label.TextColor3 = color
     label.TextStrokeColor3 = critical and Color3.fromRGB(255, 240, 240) or Color3.fromRGB(0, 0, 0)
     label.TextStrokeTransparency = critical and 0.6 or 0
-    label.TextTransparency = critical and not Config.Interface.ReducedMotion and (0.06 + 0.12 * (1 + math.sin(os.clock() * 5)) / 2) or 0
+    label.TextTransparency = critical and not ExtraFeatures.IsReducedMotion() and (0.06 + 0.12 * (1 + math.sin(os.clock() * 5)) / 2) or 0
     local track = info:FindFirstChild("HealthTrack")
     if not track then
         track = Instance.new("Frame"); track.Name = "HealthTrack"
@@ -13288,12 +13378,20 @@ function ExtraFeatures.V8.UpdateSelfHealth(camera)
     end
 end
 
+
 function ExtraFeatures.V8.Update(camera)
     local state = ExtraFeatures.V8
     if state.Destroyed then return end
     local now = os.clock()
-    if now - (state.LastScan or -math.huge) >= 0.15 then state.LastScan = now; state.ScanNearby() end
-    state.UpdateProximity(camera); state.UpdateSelfHealth(camera)
+    if Config.Proximity.Enabled then
+        state.ProximityRunning = true
+        if now - (state.LastScan or -math.huge) >= 0.15 then state.LastScan = now; state.ScanNearby() end
+        state.UpdateProximity(camera)
+    elseif state.ProximityRunning then
+        state.ProximityRunning = false
+        state.HideProximity()
+    end
+    state.UpdateSelfHealth(camera)
     if state.FPSLabel then
         local fps = ExtraFeatures.UIEffects.Bubble.LastFPS or 0
         if fps ~= state.DisplayedFPS then
@@ -13302,11 +13400,11 @@ function ExtraFeatures.V8.Update(camera)
                 or fps >= 30 and Color3.fromRGB(255, 195, 85) or Color3.fromRGB(255, 96, 121) end
         end
     end
-    if state.UpdateProfile and now - (state.LastProfile or -math.huge) >= 1 then
-        state.LastProfile = now; state.UpdateProfile(); state.UpdateWeaponStatus()
+    if state.UpdateProfile and GUIState.CurrentState == "Open" and GUIState.ActivePage == "PROFILE"
+        and now - (state.LastProfile or -math.huge) >= 1 then
+        state.LastProfile = now; state.UpdateProfile()
     end
 end
-
 
 function ExtraFeatures.V8.Session()
     _G.__HoodRivalsV8Sessions = _G.__HoodRivalsV8Sessions or {}
@@ -13457,9 +13555,9 @@ function ExtraFeatures.V8.ConnectStorage()
         state.Connecting = false
         if not ok or response.Ok ~= true or response.Protocol ~= 8 then
             state.ServerStatus = FileAPI.Available and "Saved on device" or "Session only"
-            state.UpdateWeaponStatus(); return
+            return
         end
-        state.ServerReady, state.CanTune = true, response.CanTune == true
+        state.ServerReady = true
         state.ServerStatus = response.Persistent and "Saved on server" or "Session only"
         SetSettingsStatus(state.ServerStatus)
         local saved = response.Data or {}
@@ -13472,7 +13570,7 @@ function ExtraFeatures.V8.ConnectStorage()
         state.Restoring = false
         if state.HasLocalInterface then state.QueueSave("Interface", ExtraFeatures.BuildInterfacePayload()) end
         if #MenuProfiles > 0 and profileRevision == state.ProfilesRevision then state.SaveProfilesToStorage() end
-        state.FlushSaves(); state.SyncWeapon(); state.UpdateProfile()
+        state.FlushSaves(); state.UpdateProfile()
     end)
     if not sent then
         state.Connecting = false
@@ -13491,68 +13589,10 @@ function ExtraFeatures.V8.RestoreInterface()
     if #MenuProfiles == 0 then state.ImportProfiles(state.Session().Profiles) end
 end
 
-function ExtraFeatures.V8.WeaponPayload(active)
-    local source = Config.WeaponTuning
-    return {Active = active == true, InfiniteAmmo = active and source.InfiniteAmmo == true or false,
-        SkipReload = active and source.SkipReload == true or false,
-        RecoilScale = active and source.RecoilEnabled and source.RecoilScale or 1,
-        SpreadScale = active and source.SpreadEnabled and source.SpreadScale or 1}
-end
-
-function ExtraFeatures.V8.RegisterWeaponAdapter(name, adapter)
-    if type(name) ~= "string" or type(adapter) ~= "table" or type(adapter.Apply) ~= "function" then
-        return false, "Adapter requires a name and Apply(settings)"
-    end
-    ExtraFeatures.V8.WeaponAdapters[name] = adapter
-    ExtraFeatures.V8.SyncWeapon()
-    return true
-end
-
-function ExtraFeatures.V8.SyncWeapon()
-    local state = ExtraFeatures.V8
-    if state.Destroyed then return end
-    local payload = state.WeaponPayload(GUIState.CurrentState ~= "Closed")
-    for name, adapter in pairs(state.WeaponAdapters) do
-        local ok, reason = pcall(adapter.Apply, table.clone(payload))
-        if not ok then UI:Invoke(function() error(reason) end, "Weapon adapter: " .. name) end
-    end
-    state.WeaponSyncToken = (state.WeaponSyncToken or 0) + 1
-    local token = state.WeaponSyncToken
-    task.delay(0.12, function()
-        if token ~= state.WeaponSyncToken or state.Destroyed or not state.ServerReady then return end
-        state.Request("Weapon", payload, function(ok, response)
-            if token ~= state.WeaponSyncToken or state.Destroyed then return end
-            state.WeaponConfirmed = ok and response.Ok == true
-            state.WeaponStatus = state.WeaponConfirmed and "Settings applied" or response.Reason or "Controller not connected"
-            state.UpdateWeaponStatus()
-        end)
-    end)
-    state.UpdateWeaponStatus()
-end
-
-function ExtraFeatures.V8.UpdateWeaponStatus()
-    local state = ExtraFeatures.V8
-    if not state.WeaponStatusLabel then return end
-    local character = NPCSystem.GetCharacter(LocalPlayer)
-    local tool = character and character:FindFirstChildOfClass("Tool")
-    local supported = tool and tool:GetAttribute("HoodRivalsTuningVersion") == 1
-    local adapter = next(state.WeaponAdapters) ~= nil
-    local text
-    if adapter then text = "Weapon: game adapter connected"
-    elseif state.ServerReady and state.CanTune and supported then text = "Weapon: controller connected"
-    elseif state.ServerReady and not state.CanTune then text = "Weapon: admin permission required"
-    elseif state.ServerReady then text = "Weapon: waiting for a compatible equipped weapon"
-    else text = "Weapon: controller not connected" end
-    state.WeaponStatusLabel.Text = text
-end
-
 function ExtraFeatures.V8.Pause()
     local state = ExtraFeatures.V8
     state.HideProximity()
     if state.LocalHealth then state.LocalHealth.Visible = false end
-    for _, adapter in pairs(state.WeaponAdapters) do pcall(adapter.Apply, state.WeaponPayload(false)) end
-    if state.ServerReady then state.Request("Weapon", state.WeaponPayload(false)) end
-    state.WeaponSyncToken = (state.WeaponSyncToken or 0) + 1
 end
 
 function ExtraFeatures.V8.Cleanup()
@@ -13628,21 +13668,13 @@ function ExtraFeatures.V8.ApplyFeatures(payload)
         if value.Mode == "Auto" or value.Mode == "FFA" or value.Mode == "RobloxTeams" or value.Mode == "Custom" then Config.Classification.Mode = value.Mode end
         if type(value.Attribute) == "string" and #value.Attribute <= 64 then Config.Classification.Attribute = TrimString(value.Attribute) end
     end
-    if type(payload.WeaponTuning) == "table" then
-        for _, key in ipairs({"InfiniteAmmo", "SkipReload", "RecoilEnabled", "SpreadEnabled"}) do
-            if type(payload.WeaponTuning[key]) == "boolean" then Config.WeaponTuning[key] = payload.WeaponTuning[key] end
-        end
-        for _, key in ipairs({"RecoilScale", "SpreadScale"}) do
-            if IsFiniteNumber(payload.WeaponTuning[key]) then Config.WeaponTuning[key] = math.clamp(payload.WeaponTuning[key], 0, 1) end
-        end
-    end
     if type(payload.Proximity) == "table" then
         for _, key in ipairs({"Enabled", "IncludeNPC"}) do
             if type(payload.Proximity[key]) == "boolean" then Config.Proximity[key] = payload.Proximity[key] end
         end
         if IsFiniteNumber(payload.Proximity.Radius) then Config.Proximity.Radius = math.clamp(payload.Proximity.Radius, 10, 120) end
     end
-    state.SyncControls(); state.SyncWeapon()
+    state.SyncControls()
     if not Config.Proximity.Enabled then state.HideProximity() end
 end
 
@@ -13650,8 +13682,7 @@ function ExtraFeatures.V8.SyncControls()
     local state = ExtraFeatures.V8
     for key, control in pairs(state.Controls or {}) do
         local value = key == "AimPriority" and Config.AimPriority or key == "Language" and Config.Interface.Language
-            or key == "TeamMode" and Config.Classification.Mode or Config.WeaponTuning[key]
-        if key == "RecoilScale" or key == "SpreadScale" then value = value * 100 end
+            or key == "TeamMode" and Config.Classification.Mode
         if value ~= nil then control.Set(value, true) end
     end
     if state.ProximityControl then state.ProximityControl.Set(Config.Proximity.Enabled, true) end
@@ -13733,7 +13764,10 @@ function ExtraFeatures.V8.UpdateProfile()
     if not state.ProfileValues then return end
     local function set(key, value)
         local label = state.ProfileValues[key]
-        if label then label.Text = tostring(value == nil and "--" or value) end
+        if label then
+            local formatted = tostring(value == nil and "--" or value)
+            if label.Text ~= formatted then label.Text = formatted end
+        end
     end
     set("Display Name", LocalPlayer.DisplayName); set("Username", "@" .. LocalPlayer.Name); set("User ID", LocalPlayer.UserId)
     set("Account Age", tostring(LocalPlayer.AccountAge or 0) .. (Config.Interface.Language == "VI" and " ngày" or " days"))
@@ -13790,22 +13824,6 @@ function ExtraFeatures.V8.Initialize()
             {Value = "LowestHealth", Text = "Lowest health"}, {Value = "PlayersFirst", Text = "Players first"}, {Value = "NPCFirst", Text = "NPCs first"}},
         Callback = function(value) Config.AimPriority = value end})
     UI:CreateLabel(aim, "Priority still follows your team, wall, distance and NPC filters.")
-    local weapon = UI:CreateSection(GUIState.Pages["FUNCTION 1"], "WEAPON TUNING")
-    state.WeaponStatusLabel = UI:CreateLabel(weapon, "Weapon: controller not connected")
-    for _, entry in ipairs({{"InfiniteAmmo", "Infinite Ammo"}, {"SkipReload", "Skip Reload"},
-        {"RecoilEnabled", "Recoil Control"}, {"SpreadEnabled", "Spread Control"}}) do
-        local key = entry[1]
-        state.Controls[key] = UI:CreateToggle(weapon, {Text = entry[2], Default = Config.WeaponTuning[key],
-            Callback = function(value) Config.WeaponTuning[key] = value; state.SyncWeapon() end})
-    end
-    for _, entry in ipairs({{"RecoilScale", "Recoil Amount (%)"}, {"SpreadScale", "Spread Amount (%)"}}) do
-        local key = entry[1]
-        state.Controls[key] = UI:CreateSlider(weapon, {Text = entry[2], Min = 0, Max = 100, Increment = 1,
-            Default = Config.WeaponTuning[key] * 100, EditableValue = true,
-            Callback = function(value) Config.WeaponTuning[key] = value / 100; state.SyncWeapon() end})
-    end
-    UI:CreateLabel(weapon, "0% removes the effect; 100% keeps the weapon's default.")
-    UI:CreateLabel(weapon, "Recoil and spread apply to shot direction, not just camera visuals.")
     local proximity = UI:CreateSection(GUIState.Pages.ESP, "NEARBY ENEMY ALERT")
     state.ProximityControl = UI:CreateToggle(proximity, {Text = "Nearby Enemy Alert", Default = Config.Proximity.Enabled,
         Callback = function(value) Config.Proximity.Enabled = value; state.LastScan = nil; if not value then state.HideProximity() end end})
@@ -13874,14 +13892,12 @@ function ExtraFeatures.V8.Initialize()
     AddConnection(replicated.DescendantAdded:Connect(function(item)
         if item.Name == "Request" or item.Name == "HoodRivalsMenuService" then task.defer(state.ConnectStorage) end
     end))
-    state.ApplyLanguage(); state.RefreshFavorites(); state.UpdateProfile(); state.UpdateWeaponStatus()
+    state.ApplyLanguage(); state.RefreshFavorites(); state.UpdateProfile()
     local lastPage = state.PendingLastPage or Config.Interface.LastPage
     if Config.Interface.RememberLayout and GUIState.Pages[lastPage] then
         PageManager:ShowPage(lastPage, true)
     end
     ExtraFeatures.ApplyInterfaceLayout(true)
-    _G.MyGUIFramework.WeaponTuning = {RegisterAdapter = state.RegisterWeaponAdapter,
-        GetSettings = function() return state.WeaponPayload(GUIState.CurrentState ~= "Closed") end, Sync = state.SyncWeapon}
     _G.MyGUIFramework.Classification = {RegisterTeamResolver = function(resolver)
         if resolver ~= nil and type(resolver) ~= "function" then return false end
         state.TeamResolver = resolver; state.LastScan = nil; return true
@@ -13898,8 +13914,8 @@ end
 do
     local ok, reason = pcall(ExtraFeatures.V8.Initialize)
     if not ok then
-        table.insert(UIRefs.Experience.Errors, {Time = os.time(), Text = "V8 initialization: " .. tostring(reason)})
-        warn("[Hood Rivals V8] " .. tostring(reason))
+        table.insert(UIRefs.Experience.Errors, {Time = os.time(), Text = "V9 initialization: " .. tostring(reason)})
+        warn("[Hood Rivals V9] " .. tostring(reason))
     end
 end
 
