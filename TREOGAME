@@ -2114,11 +2114,37 @@ do
         local window = newInstance("Frame", {
             Name = "MainWindow",
             Size = UDim2.new(0, 690, 0, 600),
-            Position = UDim2.new(0.5, -345, 0.5, -300),
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
             BackgroundColor3 = C.BG,
             BorderSizePixel = 0,
         }, screen)
         addCorner(window, 11)
+
+        -- Responsive scale: giu nguyen layout 690x600, tu dong thu nho tren man hinh Delta/mobile.
+        local responsiveScale = newInstance("UIScale", { Scale = 1 }, window)
+        local cameraViewportConnection
+        local function updateResponsiveScale()
+            local camera = workspace.CurrentCamera
+            local viewport = camera and camera.ViewportSize or Vector2.new(690, 600)
+            local widthScale = math.max(0.45, (viewport.X - 20) / 690)
+            local heightScale = math.max(0.45, (viewport.Y - 20) / 600)
+            responsiveScale.Scale = math.min(1, widthScale, heightScale)
+        end
+        local function bindViewportCamera()
+            if cameraViewportConnection then
+                cameraViewportConnection:Disconnect()
+                cameraViewportConnection = nil
+            end
+            local camera = workspace.CurrentCamera
+            if camera then
+                cameraViewportConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveScale)
+                table.insert(self._connections, cameraViewportConnection)
+            end
+            updateResponsiveScale()
+        end
+        bindViewportCamera()
+        table.insert(self._connections, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindViewportCamera))
 
 
         local header = newInstance("Frame", {
@@ -2134,7 +2160,7 @@ do
             BorderSizePixel = 0,
         }, header)
 
-        makeLabel(header, "DUY TARGET FIRST  |  V2.7", UDim2.new(0, 15, 0, 0), UDim2.new(1, -120, 1, 0), {
+        makeLabel(header, "DUY TARGET FIRST  |  V2.8", UDim2.new(0, 15, 0, 0), UDim2.new(1, -120, 1, 0), {
             Font = Enum.Font.GothamBold,
             TextSize = 14,
             Color = C.ACCENT,
@@ -2161,16 +2187,17 @@ do
         makeDraggable(header, window)
         makeDraggable(logo, logo)
 
-        minimizeButton.Activated:Connect(function()
+        local function collapseMenu()
             window.Visible = false
             logo.Visible = true
-        end)
+        end
+        minimizeButton.Activated:Connect(collapseMenu)
+        -- Tren Delta, nut X cung thu gon thay vi huy toan bo script; bam logo D de mo lai.
+        closeButton.Activated:Connect(collapseMenu)
         logo.Activated:Connect(function()
             window.Visible = true
             logo.Visible = false
-        end)
-        closeButton.Activated:Connect(function()
-            callbacks.onClose()
+            updateResponsiveScale()
         end)
 
         local sidebar = newInstance("Frame", {
@@ -2467,6 +2494,7 @@ do
 
         local performanceSetters = {}
         local performanceModeButtons = {}
+        local antiAfkSetter
         makeLabel(performanceScroll, "CHỌN CHẾ ĐỘ THỦ CÔNG", UDim2.new(0, 10, 0, 6),
             UDim2.new(1, -20, 0, 18), { Font = Enum.Font.GothamBold, TextSize = 10, Color = C.TEXT })
         local performanceModes = {
@@ -2518,7 +2546,19 @@ do
             makeLabel(performanceScroll, row[3], UDim2.new(0, 10, 0, y + 27),
                 UDim2.new(1, -30, 0, 17), { TextSize = 8, Color = C.DIM })
         end
-        performanceScroll.CanvasSize = UDim2.new(0, 0, 0, 133 + #performanceRows * 47 + 8)
+        -- Anti-AFK tach rieng khoi cac tuy chon do hoa.
+        local antiAfkY = 133 + #performanceRows * 47
+        antiAfkSetter = makeToggle(performanceScroll, "ANTI-AFK (CHỐNG TỰ NGẮT KHI IDLE)",
+            UDim2.new(0, 10, 0, antiAfkY), function(enabled)
+                local ok, message = callbacks.onAntiAFKChanged(enabled)
+                if not ok then
+                    antiAfkSetter(not enabled, true)
+                end
+            end)
+        makeLabel(performanceScroll, "Chỉ phản hồi sự kiện Idled; không tự di chuyển nhân vật.",
+            UDim2.new(0, 10, 0, antiAfkY + 27), UDim2.new(1, -30, 0, 17),
+            { TextSize = 8, Color = C.DIM })
+        performanceScroll.CanvasSize = UDim2.new(0, 0, 0, antiAfkY + 55)
 
 
         -- CREATE FILE state: text + Spawn + Destination.
@@ -2806,6 +2846,9 @@ do
             setPerformanceModeUI = function(mode)
                 refreshPerformanceModeButtons(mode)
             end,
+            setAntiAFKUI = function(enabled, silent)
+                if antiAfkSetter then antiAfkSetter(enabled == true, silent == true) end
+            end,
             setSpeedUI = setSpeedUI,
             setNoclipUI = setNoclipUI,
             setFollowUI = setFollowUI,
@@ -2874,6 +2917,8 @@ local destroyed = false
 local manualMovementActive
 local syncManualMovementPause
 local runtimeConnections = {}
+local antiAfkEnabled = false
+local antiAfkConnection = nil
 
 local function sendMatchReport(report)
     local isWin = report.Result == "WIN (VICTORY)"
@@ -3076,6 +3121,11 @@ local callbacks = {}
 
 callbacks.onClose = function()
     destroyed = true
+    antiAfkEnabled = false
+    if antiAfkConnection then
+        pcall(function() antiAfkConnection:Disconnect() end)
+        antiAfkConnection = nil
+    end
     if RouteRecorder and RouteRecorder._connection then
         RouteRecorder.Recording = false
         RouteRecorder._connection:Disconnect()
@@ -3362,6 +3412,52 @@ callbacks.onPerformancePreset = function(mode)
     return true
 end
 
+callbacks.onAntiAFKChanged = function(enabled)
+    enabled = enabled == true
+    if antiAfkConnection then
+        pcall(function() antiAfkConnection:Disconnect() end)
+        antiAfkConnection = nil
+    end
+    antiAfkEnabled = enabled
+
+    if enabled then
+        local ok, signal = pcall(function() return LP.Idled end)
+        if not ok or not signal then
+            antiAfkEnabled = false
+            if api then api.setAntiAFKUI(false, true) end
+            return false, "Executor/game khong ho tro su kien Idled."
+        end
+        local connected, connection = pcall(function()
+            return signal:Connect(function()
+                if not antiAfkEnabled or destroyed then return end
+                -- VirtualUser duoc goi co bao ve pcall de tuong thich nhieu executor.
+                local serviceOK, virtualUser = pcall(function()
+                    return game:GetService("VirtualUser")
+                end)
+                if serviceOK and virtualUser then
+                    pcall(function()
+                        virtualUser:CaptureController()
+                        virtualUser:ClickButton2(Vector2.new(0, 0))
+                    end)
+                end
+            end)
+        end)
+        if not connected or not connection then
+            antiAfkEnabled = false
+            if api then api.setAntiAFKUI(false, true) end
+            return false, "Khong the ket noi su kien Anti-AFK tren executor nay."
+        end
+        antiAfkConnection = connection
+    end
+
+    local message = enabled and "Anti-AFK da bat (Idled event)." or "Anti-AFK da tat."
+    if api then
+        api.setAntiAFKUI(enabled, true)
+        api.setStatus(message, enabled and Color3.fromRGB(47, 163, 100) or Color3.fromRGB(133, 143, 164))
+    end
+    return true, message
+end
+
 callbacks.onPerformanceChanged = function(name, enabled)
     local ok, message = PerformanceManager:SetOption(name, enabled)
     if ok then
@@ -3623,7 +3719,6 @@ local heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
 end)
 table.insert(runtimeConnections, heartbeatConnection)
 
-print("[DUY SYSTEM] V2.8 da khoi dong - Destination Idle Zone + Faster Return.")
+print("[DUY SYSTEM] V2.8 da khoi dong - Xeno/Delta Responsive + Anti-AFK.")
 print("[DUY SYSTEM] Record route: bat dau tai Spawn, di theo tuyen, Stop gan Destination.")
 print("[DUY SYSTEM] External movement pause API: PlayerGui.DuySystemMovementOverride:Fire(true/false)")
-
