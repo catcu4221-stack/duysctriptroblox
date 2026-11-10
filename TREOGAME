@@ -1,1 +1,3629 @@
+--[[
+    DUY TARGET FIRST SYSTEM - V2.7 MAP IMPORT EXPORT + BOSS REPORT
+    Phien ban danh cho du an Roblox do ban so huu / co quyen chinh sua.
+
+    Chuc nang:
+      - GUI co the keo tha, thu nho thanh logo D, cac tab.
+      - Map & Save Manager: Set Spawn, Set Destination, Create File, Dropdown,
+        Rename/Delete hai lan xac nhan, luu JSON bang writefile/readfile neu co.
+      - Enemy Detector: BillboardGui + TextLabel HP, loai MaxHP = 250.
+      - Target First: xep hang theo tien do tren tuyen duong da Record.
+      - Movement: PathfindingService + Humanoid:MoveTo; khong teleport.
+      - Player Control: 2 che do speed, Noclip, Auto Follow.
+      - Auto Follow tam dung khi phim di chuyen / teleport / script khac phat tin hieu;
+        tiep tuc sau 0.01 giay khi thao tac ket thuc.
+      - Record tuyen duong bang vi tri nguoi choi; KHONG phat lai chuyen dong.
+      - Boss scanner theo MaxHP; chi gui thong bao khi HP ve 0 duoc xac nhan.
+      - Tab WEBHOOK: URL chi giu trong RAM cua script.
+
+    LUU Y QUAN TRONG:
+      1. writefile/readfile la API cua mot so moi truong; Roblox Studio LocalScript
+         khong co san cac API nay.
+      2. Scanner lang nghe su kien UI; khong quet lai PlayerGui theo Heartbeat.
+      3. Boss chi duoc bao cao khi HP = 0 duoc quan sat truc tiep.
+]]
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
+local CONFIG = {
+    SAVE_FILE = "duy_system_saves.json",
+    DESTINATION_MAX_HP = 250,
+    ENEMY_SCAN_INTERVAL = 0.75,
+    -- Scanner duoc chuyen sang event-driven, khong poll PlayerGui lien tuc.
+    MOVEMENT_CHECK_INTERVAL = 0.45,
+    TARGET_SWITCH_COOLDOWN = 1.5,
+    TARGET_SWITCH_ADVANTAGE = 5,
+    TARGET_RECOMPUTE_DISTANCE = 10,
+    BASE_WALK_SPEED = 16,
+    MIN_SPEED = 1,
+    MAX_SPEED = 100,
+    ROUTE_RECORD_INTERVAL = 0.35,
+    ROUTE_POINT_SPACING = 3,
+    ROUTE_MAX_POINTS = 1500,
+    SPAWN_EXCLUSION_RADIUS = 5,
+    DEST_EXCLUSION_RADIUS = 5,
+    DEST_IDLE_RADIUS = 12, -- dung lai trong vung nay khi khong con Enemy
+
+
+    -- Neu game co nhieu Wave label, co the dien Name chinh xac vao day.
+    WAVE_LABEL_NAME = nil,
+}
+
+-- ============================================================
+-- SERVICES / PLAYER
+-- ============================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local PathfindingService = game:GetService("PathfindingService")
+local HttpService = game:GetService("HttpService")
+
+local LP = Players.LocalPlayer
+if not LP then
+    error("DUY SYSTEM: khong tim thay LocalPlayer.")
+end
+
+local PlayerGui = LP:WaitForChild("PlayerGui")
+
+-- Discord webhook client-only: URL chi ton tai trong bo nho cua script hien tai.
+-- Khong gan token vao source code va khong luu URL vao file save cua game.
+local executorRequest = (syn and syn.request)
+    or (http and http.request)
+    or http_request
+    or (fluxus and fluxus.request)
+    or request
+local savedWebhookUrl = nil
+
+local function isValidDiscordWebhook(url)
+    url = tostring(url or ""):match("^%s*(.-)%s*$")
+    return type(url) == "string"
+        and #url <= 300
+        and url:match("^https://discord%.com/api/webhooks/%d+/[%w_-]+$") ~= nil
+end
+
+local function postDiscordPayload(payload)
+    if not savedWebhookUrl then
+        return false, "Hay SAVE WEBHOOK truoc."
+    end
+    if type(executorRequest) ~= "function" then
+        return false, "Executor khong ho tro HTTP request."
+    end
+
+    local ok, response = pcall(function()
+        return executorRequest({
+            Url = savedWebhookUrl,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+    if not ok then
+        return false, "Request loi: " .. tostring(response)
+    end
+
+    local statusCode = type(response) == "table"
+        and tonumber(response.StatusCode or response.status_code or response.Status)
+        or nil
+    if statusCode and (statusCode < 200 or statusCode >= 300) then
+        return false, "Discord tra ve HTTP " .. tostring(statusCode)
+    end
+    return true, "Da gui request toi Discord."
+end
+
+-- Cac script LocalScript khac co the phat Begin/End de tam dung Auto Follow.
+local movementOverrideEvent = PlayerGui:FindFirstChild("DuySystemMovementOverride")
+if not movementOverrideEvent or not movementOverrideEvent:IsA("BindableEvent") then
+    if movementOverrideEvent then movementOverrideEvent:Destroy() end
+    movementOverrideEvent = Instance.new("BindableEvent")
+    movementOverrideEvent.Name = "DuySystemMovementOverride"
+    movementOverrideEvent.Parent = PlayerGui
+end
+
+
+local function getCharacter()
+    return LP.Character
+end
+
+local function getHRP()
+    local character = getCharacter()
+    return character and character:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function getHumanoid()
+    local character = getCharacter()
+    return character and character:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function trim(value)
+    return (tostring(value or ""):match("^%s*(.-)%s*$"))
+end
+
+local function safeNumber(value, fallback)
+    local n = tonumber(value)
+    if n == nil then return fallback end
+    return n
+end
+
+-- ============================================================
+-- SAVE MANAGER
+-- ============================================================
+local SaveManager = {}
+do
+    local db = {
+        fileList = {},
+        files = {},
+        lastKey = nil,
+    }
+
+    local HAS_FILE_IO = type(writefile) == "function" and type(readfile) == "function"
+    SaveManager._activeKey = nil
+
+    local function saveDB()
+        if not HAS_FILE_IO then
+            return false, "writefile/readfile khong kha dung; du lieu chi ton tai trong session."
+        end
+
+        local ok, err = pcall(function()
+            writefile(CONFIG.SAVE_FILE, HttpService:JSONEncode(db))
+        end)
+
+        if not ok then
+            warn("[DUY SaveManager] Khong the ghi JSON:", err)
+            return false, tostring(err)
+        end
+        return true
+    end
+
+    local function validateDB(decoded)
+        if type(decoded) ~= "table" then return false end
+        if type(decoded.fileList) ~= "table" then return false end
+        if type(decoded.files) ~= "table" then return false end
+        return true
+    end
+
+    local function loadDB()
+        if not HAS_FILE_IO then return end
+
+        local ok, raw = pcall(readfile, CONFIG.SAVE_FILE)
+        if not ok or type(raw) ~= "string" or raw == "" then
+            return
+        end
+
+        local decodedOK, decoded = pcall(function()
+            return HttpService:JSONDecode(raw)
+        end)
+
+        if decodedOK and validateDB(decoded) then
+            db.fileList = decoded.fileList
+            db.files = decoded.files
+            db.lastKey = decoded.lastKey
+
+            -- Loai bo key hong / trung trong fileList.
+            local cleaned, seen = {}, {}
+            for _, key in ipairs(db.fileList) do
+                if type(key) == "string" and db.files[key] and not seen[key] then
+                    seen[key] = true
+                    table.insert(cleaned, key)
+                end
+            end
+            db.fileList = cleaned
+
+            if db.lastKey and not db.files[db.lastKey] then
+                db.lastKey = nil
+            end
+        else
+            warn("[DUY SaveManager] JSON khong dung cau truc mong doi; bo qua du lieu cu.")
+        end
+    end
+
+    local function normalizedName(name)
+        return string.lower(trim(name))
+    end
+
+    local function makeKey(name)
+        -- UrlEncode giu duoc ten co dau va tranh ky tu khong hop le trong key.
+        local encoded = HttpService:UrlEncode(normalizedName(name))
+        return "map_" .. encoded
+    end
+
+    function SaveManager:Init()
+        loadDB()
+        if db.lastKey and db.files[db.lastKey] then
+            self._activeKey = db.lastKey
+        end
+        self._hasFileIO = HAS_FILE_IO
+    end
+
+    function SaveManager:HasPersistence()
+        return HAS_FILE_IO
+    end
+
+    function SaveManager:NameExists(name, exceptKey)
+        local normalized = normalizedName(name)
+        for key, data in pairs(db.files) do
+            if key ~= exceptKey and type(data) == "table"
+                and normalizedName(data.MapName) == normalized then
+                return true
+            end
+        end
+        return false
+    end
+
+    function SaveManager:CreateFile(name)
+        name = trim(name)
+        if name == "" then return false, "Ten file khong duoc de trong." end
+        if self:NameExists(name) then return false, "Ten file da ton tai." end
+
+        local key = makeKey(name)
+        local suffix = 1
+        while db.files[key] do
+            suffix += 1
+            key = makeKey(name) .. "_" .. tostring(suffix)
+        end
+
+        db.files[key] = {
+            MapName = name,
+            SpawnPoint = nil,
+            DestinationPoint = nil,
+            RoutePoints = {},
+            Settings = {
+                SpeedMode = "NORMAL",
+                Noclip = false,
+                AutoFollow = false,
+                PerformanceMode = "NORMAL",
+                Performance_HideEnemyModels = false,
+                Performance_SimplifyMap = false,
+                Performance_HideTextures = false,
+                Performance_DisableShadows = false,
+                Performance_DisableEffects = false,
+                Performance_DisableFog = false,
+            },
+        }
+
+        table.insert(db.fileList, key)
+        self._activeKey = key
+        db.lastKey = key
+        saveDB()
+        return true, key
+    end
+
+    function SaveManager:GetFile(key)
+        return db.files[key]
+    end
+
+    function SaveManager:GetFileList()
+        local copy = {}
+        for i, key in ipairs(db.fileList) do
+            copy[i] = key
+        end
+        return copy
+    end
+
+    function SaveManager:SelectFile(key)
+        if not db.files[key] then
+            return false, "Khong tim thay file."
+        end
+        self._activeKey = key
+        db.lastKey = key
+        saveDB()
+        return true
+    end
+
+    function SaveManager:GetActiveFile()
+        local key = self._activeKey
+        if not key then return nil, nil end
+        return key, db.files[key]
+    end
+
+    function SaveManager:RenameFile(oldKey, newName)
+        newName = trim(newName)
+        if not db.files[oldKey] then return false, "Khong tim thay file." end
+        if newName == "" then return false, "Ten moi khong duoc de trong." end
+        if self:NameExists(newName, oldKey) then return false, "Ten moi da ton tai." end
+
+        local newKey = makeKey(newName)
+        local suffix = 1
+        while db.files[newKey] and newKey ~= oldKey do
+            suffix += 1
+            newKey = makeKey(newName) .. "_" .. tostring(suffix)
+        end
+
+        local data = db.files[oldKey]
+        data.MapName = newName
+        db.files[newKey] = data
+        db.files[oldKey] = nil
+
+        for i, key in ipairs(db.fileList) do
+            if key == oldKey then
+                db.fileList[i] = newKey
+                break
+            end
+        end
+
+        if self._activeKey == oldKey then
+            self._activeKey = newKey
+            db.lastKey = newKey
+        end
+
+        saveDB()
+        return true, newKey
+    end
+
+    function SaveManager:DeleteFile(key)
+        if not db.files[key] then return false, "Khong tim thay file." end
+
+        local wasActive = self._activeKey == key
+        db.files[key] = nil
+        for i, fileKey in ipairs(db.fileList) do
+            if fileKey == key then
+                table.remove(db.fileList, i)
+                break
+            end
+        end
+
+        if wasActive then
+            self._activeKey = db.fileList[1]
+            db.lastKey = self._activeKey
+        elseif db.lastKey == key then
+            db.lastKey = self._activeKey
+        end
+
+        saveDB()
+        return true
+    end
+
+    function SaveManager:UpdateActiveSettings(settings)
+        local _, data = self:GetActiveFile()
+        if not data then return false end
+        data.Settings = data.Settings or {}
+        for key, value in pairs(settings) do
+            data.Settings[key] = value
+        end
+        saveDB()
+        return true
+    end
+
+    function SaveManager:UpdateActivePoints(spawnPoint, destinationPoint)
+        local _, data = self:GetActiveFile()
+        if not data then return false end
+        if spawnPoint then
+            data.SpawnPoint = { X = spawnPoint.X, Y = spawnPoint.Y, Z = spawnPoint.Z }
+        end
+        if destinationPoint then
+            data.DestinationPoint = {
+                X = destinationPoint.X,
+                Y = destinationPoint.Y,
+                Z = destinationPoint.Z,
+            }
+        end
+        saveDB()
+        return true
+    end
+
+    function SaveManager:UpdateActiveRoute(points)
+        local _, data = self:GetActiveFile()
+        if not data then return false, "Chua chon file." end
+        data.RoutePoints = {}
+        for _, point in ipairs(points or {}) do
+            table.insert(data.RoutePoints, { X = point.X, Y = point.Y, Z = point.Z })
+        end
+        saveDB()
+        return true
+    end
+end
+
+-- ============================================================
+-- MAP MANAGER
+-- ============================================================
+local MapManager = {
+    _spawn = nil,
+    _destination = nil,
+    _route = {},
+}
+
+function MapManager:SetSpawn()
+    local hrp = getHRP()
+    if not hrp then return false, "Khong tim thay HumanoidRootPart." end
+    self._spawn = hrp.Position
+    self._route = {}
+    return true, self._spawn
+end
+
+function MapManager:SetDestination()
+    local hrp = getHRP()
+    if not hrp then return false, "Khong tim thay HumanoidRootPart." end
+    self._destination = hrp.Position
+    self._route = {}
+    return true, self._destination
+end
+
+function MapManager:LoadFromFile(data)
+    if type(data) ~= "table" then return false end
+
+    if type(data.SpawnPoint) == "table"
+        and tonumber(data.SpawnPoint.X)
+        and tonumber(data.SpawnPoint.Y)
+        and tonumber(data.SpawnPoint.Z) then
+        self._spawn = Vector3.new(data.SpawnPoint.X, data.SpawnPoint.Y, data.SpawnPoint.Z)
+    else
+        self._spawn = nil
+    end
+
+    if type(data.DestinationPoint) == "table"
+        and tonumber(data.DestinationPoint.X)
+        and tonumber(data.DestinationPoint.Y)
+        and tonumber(data.DestinationPoint.Z) then
+        self._destination = Vector3.new(data.DestinationPoint.X, data.DestinationPoint.Y, data.DestinationPoint.Z)
+    else
+        self._destination = nil
+    end
+    self._route = {}
+    if type(data.RoutePoints) == "table" then
+        for _, point in ipairs(data.RoutePoints) do
+            if type(point) == "table" and tonumber(point.X) and tonumber(point.Y) and tonumber(point.Z) then
+                table.insert(self._route, Vector3.new(point.X, point.Y, point.Z))
+            end
+        end
+    end
+    return true
+end
+
+function MapManager:GetSpawn()
+    return self._spawn
+end
+
+function MapManager:GetDestination()
+    return self._destination
+end
+
+function MapManager:GetRoute()
+    return self._route
+end
+
+function MapManager:SetRoute(points)
+    self._route = points or {}
+end
+
+function MapManager:IsReady()
+    return self._spawn ~= nil and self._destination ~= nil and #self._route >= 2
+end
+
+-- ============================================================
+-- ENEMY DETECTOR (EVENT-DRIVEN CACHE, KHONG QUET LAI TOAN BO BILLBOARD MOI LAN)
+-- ============================================================
+local EnemyDetector = {}
+do
+    local tracked = {}
+    local records = {}
+    local workspaceAdded
+    local workspaceRemoving
+
+    local function stripRichText(text)
+        return tostring(text or ""):gsub("<[^>]+>", "")
+    end
+
+    local function compactHPNumber(numberText, suffix)
+        local value = tonumber(numberText)
+        if not value then return nil end
+        suffix = (suffix or ""):lower()
+        local multiplier = ({ k = 1e3, m = 1e6, b = 1e9 })[suffix] or 1
+        return value * multiplier
+    end
+
+    local function parseHP(text)
+        local clean = stripRichText(text):lower():gsub(",", "")
+        local c, cs, m, ms = clean:match("(%d+%.?%d*)([kmb]?)%s*/%s*(%d+%.?%d*)([kmb]?)")
+        local current = compactHPNumber(c, cs)
+        local maximum = compactHPNumber(m, ms)
+        if not current or not maximum then return false end
+        if current < 0 or maximum <= 0 then return false end
+        if maximum == CONFIG.DESTINATION_MAX_HP then return false end
+        return true, current, maximum
+    end
+
+    local function firstPartInModel(model)
+        local root = model:FindFirstChild("HumanoidRootPart")
+        if root and root:IsA("BasePart") then return root end
+        if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+            return model.PrimaryPart
+        end
+        return model:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local function getPositionPart(billboard)
+        local adornee = billboard.Adornee
+        if adornee then
+            if adornee:IsA("BasePart") then return adornee end
+            if adornee:IsA("Attachment") and adornee.Parent and adornee.Parent:IsA("BasePart") then
+                return adornee.Parent
+            end
+        end
+        local node = billboard.Parent
+        while node and node ~= workspace do
+            if node:IsA("BasePart") then return node end
+            if node:IsA("Model") then
+                local part = firstPartInModel(node)
+                if part then return part end
+            end
+            node = node.Parent
+        end
+        return nil
+    end
+
+    local function refreshBillboard(billboard)
+        local info = tracked[billboard]
+        if not info or not billboard.Parent or not billboard.Enabled then
+            records[billboard] = nil
+            return
+        end
+
+        local currentHP, maxHP
+        for label in pairs(info.labels) do
+            if label and label.Parent then
+                local valid, current, maximum = parseHP(label.Text)
+                if valid then
+                    currentHP, maxHP = current, maximum
+                    break
+                end
+            end
+        end
+
+        if not currentHP then
+            records[billboard] = nil
+            return
+        end
+
+        local part = getPositionPart(billboard)
+        if not part or not part.Parent then
+            records[billboard] = nil
+            return
+        end
+
+        records[billboard] = {
+            Billboard = billboard,
+            Part = part,
+            Position = part.Position,
+            CurrentHP = currentHP,
+            MaxHP = maxHP,
+        }
+    end
+
+    local function addLabel(billboard, label)
+        if not label:IsA("TextLabel") and not label:IsA("TextButton") then return end
+        local info = tracked[billboard]
+        if not info or info.labels[label] then return end
+        info.labels[label] = true
+        table.insert(info.connections, label:GetPropertyChangedSignal("Text"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+        refreshBillboard(billboard)
+    end
+
+    local function unregister(billboard)
+        local info = tracked[billboard]
+        if info then
+            for _, connection in ipairs(info.connections) do
+                pcall(function() connection:Disconnect() end)
+            end
+        end
+        tracked[billboard] = nil
+        records[billboard] = nil
+    end
+
+    local function register(billboard)
+        if not billboard:IsA("BillboardGui") or tracked[billboard] then return end
+        local info = { labels = {}, connections = {} }
+        tracked[billboard] = info
+
+        for _, child in ipairs(billboard:GetDescendants()) do
+            addLabel(billboard, child)
+        end
+
+        table.insert(info.connections, billboard.DescendantAdded:Connect(function(child)
+            addLabel(billboard, child)
+        end))
+        table.insert(info.connections, billboard.DescendantRemoving:Connect(function(child)
+            if info.labels[child] then
+                info.labels[child] = nil
+                refreshBillboard(billboard)
+            end
+        end))
+        table.insert(info.connections, billboard:GetPropertyChangedSignal("Adornee"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+        table.insert(info.connections, billboard:GetPropertyChangedSignal("Enabled"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+        refreshBillboard(billboard)
+    end
+
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        if instance:IsA("BillboardGui") then register(instance) end
+    end
+
+    workspaceAdded = workspace.DescendantAdded:Connect(function(instance)
+        if instance:IsA("BillboardGui") then register(instance) end
+    end)
+    workspaceRemoving = workspace.DescendantRemoving:Connect(function(instance)
+        if instance:IsA("BillboardGui") then unregister(instance) end
+    end)
+
+    function EnemyDetector:ScanAll()
+        local results = {}
+        for billboard, record in pairs(records) do
+            if billboard and billboard.Parent and record.Part and record.Part.Parent then
+                record.Position = record.Part.Position
+                table.insert(results, record)
+            else
+                records[billboard] = nil
+            end
+        end
+        return results
+    end
+
+    function EnemyDetector:IsAlive(enemy)
+        if not enemy or not enemy.Billboard then return false end
+        local record = records[enemy.Billboard]
+        return record ~= nil and enemy.Billboard.Parent ~= nil
+            and record.CurrentHP > 0 and record.MaxHP ~= CONFIG.DESTINATION_MAX_HP
+    end
+
+    function EnemyDetector:GetTrackedModels()
+        local models, seen = {}, {}
+        for _, record in pairs(records) do
+            local node = record.Part
+            while node and node ~= workspace do
+                if node:IsA("Model") then
+                    if not seen[node] then
+                        seen[node] = true
+                        table.insert(models, node)
+                    end
+                    break
+                end
+                node = node.Parent
+            end
+        end
+        return models
+    end
+
+    function EnemyDetector:Destroy()
+        if workspaceAdded then workspaceAdded:Disconnect() end
+        if workspaceRemoving then workspaceRemoving:Disconnect() end
+        local billboards = {}
+        for billboard in pairs(tracked) do table.insert(billboards, billboard) end
+        for _, billboard in ipairs(billboards) do unregister(billboard) end
+        table.clear(records)
+    end
+end
+
+-- ============================================================
+-- PERFORMANCE MANAGER (LOCAL VISUALS ONLY, CO THE KHOI PHUC)
+-- ============================================================
+local PerformanceManager = {}
+do
+    local Lighting = game:GetService("Lighting")
+    local options = {
+        HideEnemyModels = false,
+        SimplifyMap = false,
+        HideTextures = false,
+        DisableShadows = false,
+        DisableEffects = false,
+        DisableFog = false,
+    }
+    local snapshots = setmetatable({}, { __mode = "k" })
+    local enemyModels = setmetatable({}, { __mode = "k" })
+    local enemyConnections = setmetatable({}, { __mode = "k" })
+    local worldAddedConnection
+    local lightingAddedConnection
+    local destroyed = false
+
+    local function saveAndSet(instance, slot, property, value)
+        if not instance then return end
+        local bucket = snapshots[instance]
+        if not bucket then
+            bucket = {}
+            snapshots[instance] = bucket
+        end
+        if not bucket[slot] then
+            local ok, original = pcall(function()
+                return instance[property]
+            end)
+            if not ok then return end
+            bucket[slot] = { property = property, value = original }
+        end
+        pcall(function()
+            instance[property] = value
+        end)
+    end
+
+    local function restoreSlot(slot)
+        for instance, bucket in pairs(snapshots) do
+            local saved = bucket[slot]
+            if saved then
+                pcall(function()
+                    instance[saved.property] = saved.value
+                end)
+                bucket[slot] = nil
+            end
+        end
+    end
+
+    local function isVisualEffect(instance)
+        return instance:IsA("ParticleEmitter")
+            or instance:IsA("Trail")
+            or instance:IsA("Beam")
+            or instance:IsA("Fire")
+            or instance:IsA("Smoke")
+            or instance:IsA("Sparkles")
+            or instance:IsA("PointLight")
+            or instance:IsA("SpotLight")
+            or instance:IsA("SurfaceLight")
+            or instance:IsA("PostEffect")
+    end
+
+    local function applyWorldInstance(instance)
+        if not instance or destroyed then return end
+
+        if instance:IsA("BasePart") then
+            if options.SimplifyMap then
+                saveAndSet(instance, "SmoothMap.Material", "Material", Enum.Material.SmoothPlastic)
+                saveAndSet(instance, "SmoothMap.MaterialVariant", "MaterialVariant", "")
+            end
+            if options.DisableShadows then
+                saveAndSet(instance, "DisableShadows.CastShadow", "CastShadow", false)
+            end
+        elseif options.HideTextures and (instance:IsA("Decal") or instance:IsA("Texture")) then
+            saveAndSet(instance, "HideTextures.Transparency", "Transparency", 1)
+        elseif options.HideTextures and instance:IsA("SurfaceAppearance") then
+            saveAndSet(instance, "HideTextures.ColorMap", "ColorMap", "")
+            saveAndSet(instance, "HideTextures.NormalMap", "NormalMap", "")
+            saveAndSet(instance, "HideTextures.RoughnessMap", "RoughnessMap", "")
+            saveAndSet(instance, "HideTextures.MetalnessMap", "MetalnessMap", "")
+        end
+
+        if options.DisableEffects and isVisualEffect(instance) then
+            saveAndSet(instance, "DisableEffects.Enabled", "Enabled", false)
+        end
+    end
+
+    local function applyFog()
+        if options.DisableFog then
+            saveAndSet(Lighting, "DisableFog.FogStart", "FogStart", 0)
+            saveAndSet(Lighting, "DisableFog.FogEnd", "FogEnd", 1000000)
+            for _, child in ipairs(Lighting:GetChildren()) do
+                if child:IsA("Atmosphere") then
+                    saveAndSet(child, "DisableFog.Density", "Density", 0)
+                    saveAndSet(child, "DisableFog.Haze", "Haze", 0)
+                end
+            end
+        end
+    end
+
+    local function applyLightingInstance(instance)
+        if options.DisableEffects and isVisualEffect(instance) then
+            saveAndSet(instance, "DisableEffects.Enabled", "Enabled", false)
+        end
+        if options.DisableFog and instance:IsA("Atmosphere") then
+            saveAndSet(instance, "DisableFog.Density", "Density", 0)
+            saveAndSet(instance, "DisableFog.Haze", "Haze", 0)
+        end
+    end
+
+    local function scanWorldForEnabledOptions()
+        local descendants = workspace:GetDescendants()
+        task.spawn(function()
+            for index, instance in ipairs(descendants) do
+                if destroyed then break end
+                applyWorldInstance(instance)
+                if index % 250 == 0 then task.wait() end
+            end
+        end)
+    end
+
+    local function scanLightingForEnabledOptions()
+        local descendants = Lighting:GetDescendants()
+        task.spawn(function()
+            for index, instance in ipairs(descendants) do
+                if destroyed then break end
+                applyLightingInstance(instance)
+                if index % 150 == 0 then task.wait() end
+            end
+            applyFog()
+        end)
+    end
+
+    local function hideEnemyInstance(instance)
+        if instance:IsA("BasePart") then
+            saveAndSet(instance, "EnemyModel.LocalTransparencyModifier", "LocalTransparencyModifier", 1)
+        end
+    end
+
+    local function hideEnemyModel(model)
+        if not options.HideEnemyModels or not model or not model.Parent or enemyModels[model] then
+            return
+        end
+        enemyModels[model] = true
+        for _, descendant in ipairs(model:GetDescendants()) do
+            hideEnemyInstance(descendant)
+        end
+        enemyConnections[model] = model.DescendantAdded:Connect(function(descendant)
+            if options.HideEnemyModels then
+                hideEnemyInstance(descendant)
+            end
+        end)
+    end
+
+    function PerformanceManager:RefreshEnemyModels(models)
+        if not options.HideEnemyModels then return end
+        models = models or EnemyDetector:GetTrackedModels()
+        for _, model in ipairs(models) do
+            hideEnemyModel(model)
+        end
+    end
+
+    function PerformanceManager:SetOption(name, enabled)
+        if options[name] == nil then
+            return false, "Tuy chon hieu nang khong hop le: " .. tostring(name)
+        end
+        options[name] = enabled == true
+
+        if name == "HideEnemyModels" then
+            if options[name] then
+                self:RefreshEnemyModels()
+            else
+                for _, connection in pairs(enemyConnections) do
+                    pcall(function() connection:Disconnect() end)
+                end
+                table.clear(enemyConnections)
+                table.clear(enemyModels)
+                restoreSlot("EnemyModel.LocalTransparencyModifier")
+            end
+        elseif name == "SimplifyMap" then
+            if options[name] then
+                scanWorldForEnabledOptions()
+            else
+                restoreSlot("SmoothMap.Material")
+                restoreSlot("SmoothMap.MaterialVariant")
+            end
+        elseif name == "HideTextures" then
+            if options[name] then
+                scanWorldForEnabledOptions()
+            else
+                restoreSlot("HideTextures.Transparency")
+                restoreSlot("HideTextures.ColorMap")
+                restoreSlot("HideTextures.NormalMap")
+                restoreSlot("HideTextures.RoughnessMap")
+                restoreSlot("HideTextures.MetalnessMap")
+            end
+        elseif name == "DisableShadows" then
+            if options[name] then
+                saveAndSet(Lighting, "DisableShadows.GlobalShadows", "GlobalShadows", false)
+                scanWorldForEnabledOptions()
+            else
+                restoreSlot("DisableShadows.CastShadow")
+                restoreSlot("DisableShadows.GlobalShadows")
+            end
+        elseif name == "DisableEffects" then
+            if options[name] then
+                scanWorldForEnabledOptions()
+                scanLightingForEnabledOptions()
+            else
+                restoreSlot("DisableEffects.Enabled")
+            end
+        elseif name == "DisableFog" then
+            if options[name] then
+                applyFog()
+                scanLightingForEnabledOptions()
+            else
+                restoreSlot("DisableFog.FogStart")
+                restoreSlot("DisableFog.FogEnd")
+                restoreSlot("DisableFog.Density")
+                restoreSlot("DisableFog.Haze")
+            end
+        end
+
+        return true, options[name] and "Da bat toi uu." or "Da khoi phuc tuy chon."
+    end
+
+    function PerformanceManager:ApplyOptions(values)
+        values = type(values) == "table" and values or {}
+        for name in pairs(options) do
+            options[name] = values[name] == true
+        end
+
+        -- Khoi phuc rieng cac tuy chon dang tat, tranh de sot hieu ung cua file cu.
+        if not options.HideEnemyModels then
+            for _, connection in pairs(enemyConnections) do
+                pcall(function() connection:Disconnect() end)
+            end
+            table.clear(enemyConnections)
+            table.clear(enemyModels)
+            restoreSlot("EnemyModel.LocalTransparencyModifier")
+        else
+            self:RefreshEnemyModels()
+        end
+
+        if not options.SimplifyMap then
+            restoreSlot("SmoothMap.Material")
+            restoreSlot("SmoothMap.MaterialVariant")
+        end
+        if not options.HideTextures then
+            restoreSlot("HideTextures.Transparency")
+            restoreSlot("HideTextures.ColorMap")
+            restoreSlot("HideTextures.NormalMap")
+            restoreSlot("HideTextures.RoughnessMap")
+            restoreSlot("HideTextures.MetalnessMap")
+        end
+        if not options.DisableShadows then
+            restoreSlot("DisableShadows.CastShadow")
+            restoreSlot("DisableShadows.GlobalShadows")
+        else
+            saveAndSet(Lighting, "DisableShadows.GlobalShadows", "GlobalShadows", false)
+        end
+        if not options.DisableEffects then
+            restoreSlot("DisableEffects.Enabled")
+        end
+        if not options.DisableFog then
+            restoreSlot("DisableFog.FogStart")
+            restoreSlot("DisableFog.FogEnd")
+            restoreSlot("DisableFog.Density")
+            restoreSlot("DisableFog.Haze")
+        end
+
+        local worldEnabled = options.SimplifyMap or options.HideTextures
+            or options.DisableShadows or options.DisableEffects
+        if worldEnabled then
+            scanWorldForEnabledOptions()
+        end
+        if options.DisableEffects or options.DisableFog then
+            scanLightingForEnabledOptions()
+        end
+        if options.DisableFog then
+            applyFog()
+        end
+        return true
+    end
+
+    function PerformanceManager:GetOptions()
+        local copy = {}
+        for key, value in pairs(options) do copy[key] = value end
+        return copy
+    end
+
+    function PerformanceManager:IsEnabled(name)
+        return options[name] == true
+    end
+
+    worldAddedConnection = workspace.DescendantAdded:Connect(function(instance)
+        applyWorldInstance(instance)
+    end)
+    lightingAddedConnection = Lighting.DescendantAdded:Connect(function(instance)
+        applyLightingInstance(instance)
+    end)
+
+    function PerformanceManager:Destroy()
+        if destroyed then return end
+        destroyed = true
+        if worldAddedConnection then worldAddedConnection:Disconnect() end
+        if lightingAddedConnection then lightingAddedConnection:Disconnect() end
+        for _, connection in pairs(enemyConnections) do
+            pcall(function() connection:Disconnect() end)
+        end
+        table.clear(enemyConnections)
+        table.clear(enemyModels)
+        local slots = {
+            "EnemyModel.LocalTransparencyModifier",
+            "SmoothMap.Material", "SmoothMap.MaterialVariant",
+            "HideTextures.Transparency", "HideTextures.ColorMap", "HideTextures.NormalMap",
+            "HideTextures.RoughnessMap", "HideTextures.MetalnessMap",
+            "DisableShadows.CastShadow", "DisableShadows.GlobalShadows",
+            "DisableEffects.Enabled", "DisableFog.FogStart", "DisableFog.FogEnd",
+            "DisableFog.Density", "DisableFog.Haze",
+        }
+        for _, slot in ipairs(slots) do restoreSlot(slot) end
+    end
+end
+
+-- ============================================================
+-- TARGET SELECTOR (ROUTE PROGRESS, NOT STRAIGHT-LINE DISTANCE)
+-- ============================================================
+local TargetSelector = { _current = nil, _lastSwitch = 0, _motion = setmetatable({}, { __mode = "k" }) }
+
+local function projectProgress(position, route)
+    if type(route) ~= "table" or #route < 2 then return nil, math.huge end
+    local bestProgress, bestDistance = nil, math.huge
+    local totalLength, cumulative = 0, {0}
+    for i = 1, #route - 1 do
+        totalLength += (route[i + 1] - route[i]).Magnitude
+        cumulative[i + 1] = totalLength
+    end
+    if totalLength <= 0 then return nil, math.huge end
+    for i = 1, #route - 1 do
+        local a, b = route[i], route[i + 1]
+        local segment = b - a
+        local lengthSq = segment:Dot(segment)
+        if lengthSq > 0 then
+            local t = math.clamp((position - a):Dot(segment) / lengthSq, 0, 1)
+            local projected = a + segment * t
+            local distance = (position - projected).Magnitude
+            if distance < bestDistance then
+                bestDistance = distance
+                bestProgress = (cumulative[i] + segment.Magnitude * t) / totalLength
+            end
+        end
+    end
+    return bestProgress, bestDistance
+end
+
+function TargetSelector:Select(enemies, spawn, destination, route)
+    if not spawn or not destination or type(route) ~= "table" or #route < 2 then
+        self._current = nil
+        return nil
+    end
+    local ranked, currentFresh = {}, nil
+    for _, enemy in ipairs(enemies or {}) do
+        local nowSample = os.clock()
+        local previous = self._motion[enemy.Billboard]
+        if previous then
+            local elapsed = nowSample - previous.Time
+            if elapsed >= 0.15 then
+                local measured = (enemy.Position - previous.Position).Magnitude / elapsed
+                if measured < 120 then
+                    previous.Speed = previous.Speed and (previous.Speed * 0.55 + measured * 0.45) or measured
+                end
+                previous.Position = enemy.Position
+                previous.Time = nowSample
+            end
+        else
+            self._motion[enemy.Billboard] = { Position = enemy.Position, Time = nowSample, Speed = nil }
+        end
+        local fromSpawn = (enemy.Position - spawn).Magnitude
+        local fromDestination = (enemy.Position - destination).Magnitude
+        if fromSpawn > CONFIG.SPAWN_EXCLUSION_RADIUS and fromDestination > CONFIG.DEST_EXCLUSION_RADIUS
+            and enemy.MaxHP ~= CONFIG.DESTINATION_MAX_HP and enemy.CurrentHP > 0 then
+            local progress, routeDistance = projectProgress(enemy.Position, route)
+            -- Khong chon muc tieu lech khoi tuyen duong qua xa.
+            if progress ~= nil and routeDistance <= 18 then
+                table.insert(ranked, { Enemy = enemy, Progress = progress, RouteDistance = routeDistance })
+            end
+        end
+        if self._current and enemy.Billboard == self._current.Billboard then currentFresh = enemy end
+    end
+    table.sort(ranked, function(a,b)
+        if math.abs(a.Progress - b.Progress) > 0.002 then return a.Progress > b.Progress end
+        return a.RouteDistance < b.RouteDistance
+    end)
+    local best = ranked[1] and ranked[1].Enemy or nil
+    local now = os.clock()
+    if not currentFresh then
+        self._current = best
+        self._lastSwitch = now
+        return best
+    end
+    local currentRank
+    for _, item in ipairs(ranked) do
+        if item.Enemy.Billboard == currentFresh.Billboard then currentRank = item; break end
+    end
+    if not currentRank then
+        self._current = best
+        self._lastSwitch = now
+        return best
+    end
+    self._current = currentFresh
+    if best and best.Billboard ~= currentFresh.Billboard then
+        local advantage = (ranked[1].Progress - currentRank.Progress)
+        if advantage >= 0.025 and now - self._lastSwitch >= CONFIG.TARGET_SWITCH_COOLDOWN then
+            self._current = best
+            self._lastSwitch = now
+        end
+    end
+    return self._current
+end
+
+function TargetSelector:GetEstimatedSpeed(enemy)
+    enemy = enemy or self._current
+    local sample = enemy and self._motion[enemy.Billboard]
+    return sample and sample.Speed or nil
+end
+
+function TargetSelector:Get() return self._current end
+function TargetSelector:Clear() self._current = nil end
+
+-- ============================================================
+-- PLAYER CONTROLLER
+-- ============================================================
+local PlayerController = {
+    _speed = 1,
+    _noclip = false,
+    _noclipConnection = nil,
+    _originalCollision = {},
+}
+
+do
+    local function rememberAndDisable(part)
+        if not part:IsA("BasePart") then return end
+        if PlayerController._originalCollision[part] == nil then
+            PlayerController._originalCollision[part] = part.CanCollide
+        end
+        part.CanCollide = false
+    end
+
+    local function restoreCollision()
+        for part, original in pairs(PlayerController._originalCollision) do
+            if part and part.Parent then
+                part.CanCollide = original
+            end
+        end
+        table.clear(PlayerController._originalCollision)
+    end
+
+    function PlayerController:SetSpeed(multiplier)
+        multiplier = tonumber(multiplier) or 1
+        multiplier = math.clamp(multiplier, 0.1, CONFIG.MAX_SPEED / CONFIG.BASE_WALK_SPEED)
+        self._speed = multiplier
+        local humanoid = getHumanoid()
+        if humanoid then
+            humanoid.WalkSpeed = CONFIG.BASE_WALK_SPEED * multiplier
+        end
+    end
+
+    function PlayerController:GetSpeed()
+        return self._speed
+    end
+
+    function PlayerController:SetNoclip(enabled)
+        self._noclip = enabled == true
+
+        if self._noclipConnection then
+            self._noclipConnection:Disconnect()
+            self._noclipConnection = nil
+        end
+
+        if self._noclip then
+            self._noclipConnection = RunService.Stepped:Connect(function()
+                local character = getCharacter()
+                if not character then return end
+                for _, part in ipairs(character:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        rememberAndDisable(part)
+                    end
+                end
+            end)
+        else
+            restoreCollision()
+        end
+    end
+
+    function PlayerController:GetNoclip()
+        return self._noclip
+    end
+
+    LP.CharacterAdded:Connect(function(character)
+        task.spawn(function()
+            local humanoid = character:WaitForChild("Humanoid", 10)
+            character:WaitForChild("HumanoidRootPart", 10)
+            if humanoid then
+                humanoid.WalkSpeed = CONFIG.BASE_WALK_SPEED * PlayerController._speed
+            end
+            if PlayerController._noclip then
+                PlayerController:SetNoclip(true)
+            end
+        end)
+    end)
+end
+
+-- ============================================================
+-- MOVEMENT CONTROLLER (CO THE TAM DUNG KHI NGUOI DUNG / SCRIPT KHAC DI CHUYEN)
+-- ============================================================
+local MovementController = {
+    _active = false,
+    _paused = false,
+    _generation = 0,
+    _lastGoalKey = nil,
+    _lastGoalPosition = nil,
+    _runId = 0,
+    _getTarget = nil,
+    _getDestination = nil,
+    _getSpeedMode = nil,
+    _lastSpeedUpdate = 0,
+}
+
+do
+    local function moveAlongPath(goalPosition, humanoid, root, generation)
+        if not MovementController._active or MovementController._paused
+            or generation ~= MovementController._generation then
+            return
+        end
+
+        local path
+        local ok = pcall(function()
+            path = PathfindingService:CreatePath({
+                AgentRadius = 2,
+                AgentHeight = 5,
+                AgentCanJump = true,
+            })
+            path:ComputeAsync(root.Position, goalPosition)
+        end)
+
+        if not ok or not path or path.Status ~= Enum.PathStatus.Success then
+            if MovementController._active and not MovementController._paused
+                and generation == MovementController._generation then
+                humanoid:MoveTo(goalPosition)
+            end
+            return
+        end
+
+        local waypoints = path:GetWaypoints()
+        for waypointIndex = 2, #waypoints do
+            local waypoint = waypoints[waypointIndex]
+            if not MovementController._active or MovementController._paused
+                or generation ~= MovementController._generation then
+                return
+            end
+
+            humanoid:MoveTo(waypoint.Position)
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                humanoid.Jump = true
+            end
+
+            local reached = false
+            local finishedConnection = humanoid.MoveToFinished:Connect(function(success)
+                reached = success
+            end)
+            local startedAt = os.clock()
+            while MovementController._active and not MovementController._paused
+                and generation == MovementController._generation
+                and not reached and (os.clock() - startedAt) < 2.5 do
+                task.wait(0.05)
+            end
+            finishedConnection:Disconnect()
+
+            if not MovementController._active or MovementController._paused
+                or generation ~= MovementController._generation then
+                return
+            end
+            if not reached then return end
+        end
+    end
+
+    local function replanImmediately()
+        if not MovementController._active or MovementController._paused then return end
+        local humanoid = getHumanoid()
+        local root = getHRP()
+        if not humanoid or not root or humanoid.Health <= 0 then return end
+
+        local target = MovementController._getTarget and MovementController._getTarget() or nil
+        local goalPosition = target and target.Position or
+            (MovementController._getDestination and MovementController._getDestination() or nil)
+        local goalKey = target and target.Billboard or "DESTINATION"
+        if not goalPosition then return end
+
+        MovementController._lastGoalPosition = goalPosition
+        MovementController._lastGoalKey = goalKey
+        MovementController._generation += 1
+        local generation = MovementController._generation
+        task.spawn(moveAlongPath, goalPosition, humanoid, root, generation)
+    end
+
+    function MovementController:Start(getTarget, getDestination, getSpeedMode)
+        if self._active then return end
+        self._getTarget = getTarget
+        self._getDestination = getDestination
+        self._getSpeedMode = getSpeedMode
+        self._active = true
+        self._paused = false
+        self._runId += 1
+        local runId = self._runId
+        self._generation += 1
+        self._lastGoalKey = nil
+        self._lastGoalPosition = nil
+
+        task.spawn(function()
+            while MovementController._active and runId == MovementController._runId do
+                if not MovementController._paused then
+                    local humanoid = getHumanoid()
+                    local root = getHRP()
+                    if humanoid and root and humanoid.Health > 0 then
+                        local target = getTarget()
+                        local goalPosition
+                        local goalKey
+
+                        if target and target.Position then
+                            goalPosition = target.Position
+                            goalKey = target.Billboard
+                        else
+                            local destination = getDestination()
+                            if destination and (root.Position - destination).Magnitude <= CONFIG.DEST_IDLE_RADIUS then
+                                -- Khong tiep tuc di vao Destination khi khong con Enemy.
+                                -- Dung tai vi tri hien tai; khi Enemy moi xuat hien se replan ngay.
+                                goalPosition = nil
+                                goalKey = "DESTINATION_IDLE"
+                            else
+                                goalPosition = destination
+                                goalKey = "DESTINATION"
+                            end
+                        end
+
+                        if goalPosition then
+                            local mode = MovementController._getSpeedMode and MovementController._getSpeedMode() or "NORMAL"
+                            local desiredMultiplier = 1
+                            if target and mode == "NORMAL" then
+                                local distance = (root.Position - target.Position).Magnitude
+                                -- Tang toc ro hon khi quay lai muc tieu o xa, toi da 100 WalkSpeed.
+                                desiredMultiplier = math.clamp(distance / 8, 1, CONFIG.MAX_SPEED / CONFIG.BASE_WALK_SPEED)
+                            elseif target and mode == "MATCH_ENEMY" then
+                                local enemySpeed = TargetSelector:GetEstimatedSpeed(target)
+                                if enemySpeed and enemySpeed > 0.5 then
+                                    desiredMultiplier = (enemySpeed * 1.05) / CONFIG.BASE_WALK_SPEED
+                                else
+                                    desiredMultiplier = 1
+                                end
+                            end
+                            if os.clock() - MovementController._lastSpeedUpdate > 0.25 then
+                                PlayerController:SetSpeed(desiredMultiplier)
+                                MovementController._lastSpeedUpdate = os.clock()
+                            end
+                            local movedEnough = not MovementController._lastGoalPosition
+                                or (goalPosition - MovementController._lastGoalPosition).Magnitude
+                                    >= CONFIG.TARGET_RECOMPUTE_DISTANCE
+                            local targetChanged = goalKey ~= MovementController._lastGoalKey
+                            if movedEnough or targetChanged then
+                                MovementController._lastGoalPosition = goalPosition
+                                MovementController._lastGoalKey = goalKey
+                                MovementController._generation += 1
+                                local thisGeneration = MovementController._generation
+                                task.spawn(moveAlongPath, goalPosition, humanoid, root, thisGeneration)
+                            end
+                        else
+                            if MovementController._lastGoalKey ~= "DESTINATION_IDLE" then
+                                MovementController._generation += 1 -- huy path dang chay ve Destination
+                                MovementController._lastGoalKey = "DESTINATION_IDLE"
+                                MovementController._lastGoalPosition = root.Position
+                                humanoid:MoveTo(root.Position)
+                            end
+                            if os.clock() - MovementController._lastSpeedUpdate > 0.25 then
+                                PlayerController:SetSpeed(1)
+                                MovementController._lastSpeedUpdate = os.clock()
+                            end
+                        end
+                    end
+                end
+                task.wait(CONFIG.MOVEMENT_CHECK_INTERVAL)
+            end
+        end)
+    end
+
+    function MovementController:SetPaused(paused)
+        paused = paused == true
+        if self._paused == paused then return end
+        self._paused = paused
+        self._generation += 1 -- huy path cu ngay khi co thao tac khac
+        self._lastGoalKey = nil
+        self._lastGoalPosition = nil
+        if paused then
+            local humanoid = getHumanoid()
+            local root = getHRP()
+            if humanoid and root then humanoid:MoveTo(root.Position) end
+        else
+            replanImmediately()
+        end
+    end
+
+    function MovementController:Stop()
+        self._active = false
+        self._paused = false
+        self._runId += 1
+        self._generation += 1
+        self._lastGoalKey = nil
+        self._lastGoalPosition = nil
+        self._getTarget = nil
+        self._getDestination = nil
+        self._getSpeedMode = nil
+        PlayerController:SetSpeed(1)
+        local humanoid = getHumanoid()
+        local root = getHRP()
+        if humanoid and root then humanoid:MoveTo(root.Position) end
+    end
+
+    function MovementController:IsActive()
+        return self._active
+    end
+
+    function MovementController:IsPaused()
+        return self._paused
+    end
+end
+
+-- ============================================================
+-- MATCH SCANNER (EVENT-DRIVEN, VICTORY/DEFEAT + WAVE)
+-- ============================================================
+local MatchScanner = {
+    CurrentMatch = 1,
+    CurrentWave = nil,
+    MaxWave = 40,
+    Result = "IN PROGRESS",
+    WaveSource = "NOT ACTIVE",
+    DefeatVisible = false,
+    VictoryVisible = false,
+    _active = false,
+    _connections = {},
+    _watchedText = {},
+    _watchedGui = {},
+    _waveLabel = nil,
+    _terminalLocked = false,
+    _reportedTerminal = false,
+    _terminalToken = 0,
+    _handledTerminalText = setmetatable({}, { __mode = "k" }),
+    _onUpdate = nil,
+    _onReport = nil,
+    _reportingMatch = false,
+}
+
+do
+    local function stripRichText(text)
+        return tostring(text or ""):gsub("<[^>]+>", "")
+    end
+
+    local function isTextObject(instance)
+        return instance and (instance:IsA("TextLabel") or instance:IsA("TextButton"))
+    end
+
+    local function isVisible(instance)
+        local node = instance
+        while node and node ~= PlayerGui do
+            if node:IsA("GuiObject") and not node.Visible then return false end
+            if node:IsA("ScreenGui") and not node.Enabled then return false end
+            node = node.Parent
+        end
+        return true
+    end
+
+    local function parseWave(text)
+        if typeof(text) ~= "string" then return nil, nil end
+        local clean = stripRichText(text)
+        local current, maximum = clean:match("[Ww]ave%s*:?%s*(%d+)%s*/%s*(%d+)")
+        current, maximum = tonumber(current), tonumber(maximum)
+        if not current or maximum ~= 40 or current < 1 or current > 40 then
+            return nil, nil
+        end
+        return current, maximum
+    end
+
+    local function isDefeatText(text)
+        local clean = string.lower(stripRichText(text))
+        return clean:match("%f[%a]defeat%f[%A]") ~= nil
+            or clean:match("%f[%a]game over%f[%A]") ~= nil
+    end
+
+    local function isVictoryText(text)
+        local clean = string.lower(stripRichText(text))
+        return clean:match("%f[%a]victory%f[%A]") ~= nil
+    end
+
+    local function publish(self)
+        if self._onUpdate then
+            self._onUpdate(self:GetSnapshot())
+        end
+    end
+
+    local function finalizeTerminal(self, token)
+        if not self._active or not self._terminalLocked or self._reportedTerminal
+            or token ~= self._terminalToken or self._reportingMatch then
+            return
+        end
+        self._reportingMatch = true
+        local report = {
+            MatchNumber = self.CurrentMatch,
+            ReportId = HttpService:GenerateGUID(false),
+            Result = self.Result,
+            WaveInfo = self.CurrentWave and (tostring(self.CurrentWave) .. "/40") or "N/A",
+        }
+        self._reportedTerminal = true
+        self.CurrentMatch += 1
+        if self._onReport then
+            local ok, err = pcall(self._onReport, report)
+            if not ok then warn("[DUY SCANNER] Report callback error:", err) end
+        end
+        self._reportingMatch = false
+        publish(self)
+    end
+
+    local function captureCurrentWaveFromCache(self)
+        local fallbackCurrent, fallbackMaximum
+        for instance in pairs(self._watchedText) do
+            if instance and instance.Parent and isTextObject(instance) and isVisible(instance) then
+                local current, maximum = parseWave(instance.Text)
+                if current and maximum == 40 then
+                    fallbackCurrent, fallbackMaximum = current, maximum
+                    if string.find(string.lower(instance.Name), "wave", 1, true) then
+                        self.CurrentWave = current
+                        self.MaxWave = maximum
+                        self.WaveSource = instance:GetFullName()
+                        return
+                    end
+                end
+            end
+        end
+        if fallbackCurrent then
+            self.CurrentWave = fallbackCurrent
+            self.MaxWave = fallbackMaximum
+        end
+    end
+
+    local function handleTerminal(self, result)
+        if not self._active or self._terminalLocked then return end
+        captureCurrentWaveFromCache(self)
+        self._terminalLocked = true
+        self._reportedTerminal = false
+        self._terminalToken += 1
+        local token = self._terminalToken
+        self.Result = result
+        self.DefeatVisible = result == "LOSS (DEFEAT)"
+        self.VictoryVisible = result == "WIN (VICTORY)"
+        publish(self)
+
+        task.delay(0.25, function()
+            finalizeTerminal(self, token)
+        end)
+    end
+
+    local function checkResultTexts(self)
+        if not self._active then return end
+        for instance in pairs(self._watchedText) do
+            if instance and instance.Parent and isTextObject(instance) then
+                if isVisible(instance) then
+                    local text = stripRichText(instance.Text)
+                    if isDefeatText(text) or isVictoryText(text) then
+                        local result = isDefeatText(text) and "LOSS (DEFEAT)" or "WIN (VICTORY)"
+                        local signature = result .. "|" .. string.lower(text)
+                        if self._handledTerminalText[instance] ~= signature then
+                            self._handledTerminalText[instance] = signature
+                            handleTerminal(self, result)
+                            return
+                        end
+                    else
+                        self._handledTerminalText[instance] = nil
+                    end
+                else
+                    self._handledTerminalText[instance] = nil
+                end
+            end
+        end
+    end
+
+    local function handleWave(self, instance)
+        if not isVisible(instance) then return end
+        local current, maximum = parseWave(instance.Text)
+        if not current or maximum ~= 40 then return end
+
+        if current >= 35 then
+            self.CurrentWave = current
+            self.MaxWave = maximum
+            self.WaveSource = instance:GetFullName()
+        elseif current <= 2 and self._terminalLocked then
+            -- Wave 1/40 cua tran moi xac nhan UI da chuyen sang tran moi.
+            finalizeTerminal(self, self._terminalToken)
+            self._terminalLocked = false
+            self._reportedTerminal = false
+            self.Result = "IN PROGRESS"
+            self.CurrentWave = current
+            self.MaxWave = maximum
+            self.DefeatVisible = false
+            self.VictoryVisible = false
+            self.WaveSource = instance:GetFullName()
+            publish(self)
+            return
+        elseif current <= 2 and self.CurrentWave == nil then
+            self.CurrentWave = current
+            self.MaxWave = maximum
+            self.WaveSource = instance:GetFullName()
+        end
+        publish(self)
+    end
+
+    local function handleTextChanged(self, instance)
+        if not self._active or not isTextObject(instance) then return end
+        local text = stripRichText(instance.Text)
+        if isVisible(instance) and (isDefeatText(text) or isVictoryText(text)) then
+            local result = isDefeatText(text) and "LOSS (DEFEAT)" or "WIN (VICTORY)"
+            local signature = result .. "|" .. string.lower(text)
+            if self._handledTerminalText[instance] ~= signature then
+                self._handledTerminalText[instance] = signature
+                handleTerminal(self, result)
+            end
+            return
+        else
+            self._handledTerminalText[instance] = nil
+        end
+
+        -- Chi xu ly chuoi co tu Wave; bo qua Night 6 va cac so UI khac.
+        if string.find(string.lower(text), "wave", 1, true)
+            or (CONFIG.WAVE_LABEL_NAME and instance.Name == CONFIG.WAVE_LABEL_NAME) then
+            local current = parseWave(text)
+            if current then
+                self._waveLabel = instance
+                handleWave(self, instance)
+            end
+        end
+    end
+
+    local function connect(connection)
+        table.insert(MatchScanner._connections, connection)
+    end
+
+    local function watchGuiObject(self, instance)
+        if self._watchedGui[instance] then return end
+        if not instance:IsA("GuiObject") and not instance:IsA("ScreenGui") then return end
+        self._watchedGui[instance] = true
+        if instance:IsA("GuiObject") then
+            connect(instance:GetPropertyChangedSignal("Visible"):Connect(function()
+                checkResultTexts(self)
+            end))
+        elseif instance:IsA("ScreenGui") then
+            connect(instance:GetPropertyChangedSignal("Enabled"):Connect(function()
+                checkResultTexts(self)
+            end))
+        end
+    end
+
+    local function watchTextObject(self, instance)
+        if not isTextObject(instance) or self._watchedText[instance] then return end
+        self._watchedText[instance] = true
+        connect(instance:GetPropertyChangedSignal("Text"):Connect(function()
+            handleTextChanged(self, instance)
+        end))
+        handleTextChanged(self, instance)
+    end
+
+    function MatchScanner:Reset()
+        self.CurrentMatch = 1
+        self.CurrentWave = nil
+        self.MaxWave = 40
+        self.Result = "IN PROGRESS"
+        self.WaveSource = "WAITING FOR WAVE UI"
+        self.DefeatVisible = false
+        self.VictoryVisible = false
+        self._terminalLocked = false
+        self._reportedTerminal = false
+        self._terminalToken += 1
+        self._reportingMatch = false
+        table.clear(self._handledTerminalText)
+        publish(self)
+    end
+
+    function MatchScanner:Start(onUpdate, onReport)
+        if self._active then return end
+        self._active = true
+        self._onUpdate = onUpdate
+        self._onReport = onReport
+        self.WaveSource = "LISTENING FOR WAVE / RESULT"
+
+        -- Mot lan duyet UI khi bat scanner; sau do chi lang nghe su kien Text/Visible.
+        for _, instance in ipairs(PlayerGui:GetDescendants()) do
+            watchGuiObject(self, instance)
+            watchTextObject(self, instance)
+        end
+
+        connect(PlayerGui.DescendantAdded:Connect(function(instance)
+            watchGuiObject(self, instance)
+            watchTextObject(self, instance)
+        end))
+        connect(PlayerGui.DescendantRemoving:Connect(function(instance)
+            self._watchedText[instance] = nil
+            self._watchedGui[instance] = nil
+            self._handledTerminalText[instance] = nil
+            if self._waveLabel == instance then self._waveLabel = nil end
+        end))
+        publish(self)
+    end
+
+    function MatchScanner:Stop()
+        self._active = false
+        for _, connection in ipairs(self._connections) do
+            pcall(function() connection:Disconnect() end)
+        end
+        table.clear(self._connections)
+        table.clear(self._watchedText)
+        table.clear(self._watchedGui)
+        table.clear(self._handledTerminalText)
+        self._waveLabel = nil
+        self._onUpdate = nil
+        self._onReport = nil
+    end
+
+    function MatchScanner:ScanOnce()
+        -- Scan Now chi xu ly cache; khong poll UI trong Heartbeat.
+        if self._active then
+            for instance in pairs(self._watchedText) do
+                if instance and instance.Parent then
+                    handleTextChanged(self, instance)
+                end
+            end
+            checkResultTexts(self)
+        end
+        publish(self)
+        return self:GetSnapshot()
+    end
+
+    function MatchScanner:DebugUI()
+        -- Chi quet full UI khi nguoi dung bam SCAN NOW.
+        print("========== DUY UI SCAN DEBUG ==========")
+        for _, instance in ipairs(PlayerGui:GetDescendants()) do
+            if isTextObject(instance) and isVisible(instance) then
+                local raw = stripRichText(instance.Text)
+                local wave, maximum = parseWave(raw)
+                if wave and maximum == 40 then
+                    print("[WAVE CANDIDATE]", instance:GetFullName(), "Text=", raw)
+                end
+                if isDefeatText(raw) then
+                    print("[DEFEAT CANDIDATE]", instance:GetFullName(), "Text=", raw)
+                elseif isVictoryText(raw) then
+                    print("[VICTORY CANDIDATE]", instance:GetFullName(), "Text=", raw)
+                end
+            end
+        end
+        print("========== END DUY UI SCAN DEBUG ==========")
+    end
+
+    function MatchScanner:GetSnapshot()
+        return {
+            MatchNumber = self.CurrentMatch,
+            Result = self.Result,
+            Wave = self.CurrentWave,
+            MaxWave = self.MaxWave,
+            WaveSource = self.WaveSource,
+            DefeatVisible = self.DefeatVisible,
+            VictoryVisible = self.VictoryVisible,
+            ScannerActive = self._active,
+        }
+    end
+end
+
+-- ============================================================
+-- GUI HELPERS
+-- ============================================================
+local GUI = {
+    _screen = nil,
+    _api = nil,
+    _connections = {},
+}
+
+do
+    local C = {
+        BG = Color3.fromRGB(14, 15, 23),
+        PANEL = Color3.fromRGB(21, 23, 34),
+        SIDEBAR = Color3.fromRGB(10, 12, 19),
+        HEADER = Color3.fromRGB(19, 23, 35),
+        INPUT = Color3.fromRGB(28, 31, 45),
+        BUTTON = Color3.fromRGB(35, 39, 56),
+        BUTTON_HOVER = Color3.fromRGB(47, 54, 76),
+        ACCENT = Color3.fromRGB(91, 169, 255),
+        TEXT = Color3.fromRGB(225, 229, 240),
+        DIM = Color3.fromRGB(133, 143, 164),
+        GREEN = Color3.fromRGB(47, 163, 100),
+        GREEN_DARK = Color3.fromRGB(53, 83, 70),
+        RED = Color3.fromRGB(205, 75, 82),
+        RED_DARK = Color3.fromRGB(87, 42, 49),
+        YELLOW = Color3.fromRGB(225, 172, 66),
+        TRACK = Color3.fromRGB(48, 53, 71),
+        ACTIVE_FILE = Color3.fromRGB(31, 59, 94),
+    }
+
+    local function newInstance(className, properties, parent)
+        local object = Instance.new(className)
+        for key, value in pairs(properties or {}) do
+            object[key] = value
+        end
+        if parent then object.Parent = parent end
+        return object
+    end
+
+    local function addCorner(parent, radius)
+        return newInstance("UICorner", {
+            CornerRadius = UDim.new(0, radius or 7),
+        }, parent)
+    end
+
+    local function addStroke(parent, color, thickness)
+        return newInstance("UIStroke", {
+            Color = color or Color3.fromRGB(48, 66, 96),
+            Thickness = thickness or 1,
+        }, parent)
+    end
+
+    local function makeLabel(parent, text, position, size, options)
+        options = options or {}
+        return newInstance("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = position,
+            Size = size,
+            Text = text or "",
+            Font = options.Font or Enum.Font.GothamMedium,
+            TextSize = options.TextSize or 12,
+            TextColor3 = options.Color or C.TEXT,
+            TextXAlignment = options.Align or Enum.TextXAlignment.Left,
+            TextYAlignment = options.YAlign or Enum.TextYAlignment.Center,
+            TextWrapped = options.Wrapped or false,
+            RichText = false,
+        }, parent)
+    end
+
+    local function makeButton(parent, text, position, size, options)
+        options = options or {}
+        local button = newInstance("TextButton", {
+            Position = position,
+            Size = size,
+            BackgroundColor3 = options.Background or C.BUTTON,
+            BorderSizePixel = 0,
+            Text = text,
+            Font = options.Font or Enum.Font.GothamSemibold,
+            TextSize = options.TextSize or 11,
+            TextColor3 = options.TextColor or C.TEXT,
+            AutoButtonColor = false,
+            Active = options.Active ~= false,
+            Selectable = options.Selectable ~= false,
+            ZIndex = options.ZIndex or 5,
+        }, parent)
+        addCorner(button, options.Radius or 6)
+        return button
+    end
+
+    local function makeTextBox(parent, placeholder, position, size)
+        local box = newInstance("TextBox", {
+            Position = position,
+            Size = size,
+            BackgroundColor3 = C.INPUT,
+            BorderSizePixel = 0,
+            PlaceholderText = placeholder,
+            PlaceholderColor3 = C.DIM,
+            Text = "",
+            TextColor3 = C.TEXT,
+            TextSize = 11,
+            Font = Enum.Font.GothamMedium,
+            ClearTextOnFocus = false,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, parent)
+        addCorner(box, 6)
+        newInstance("UIPadding", {
+            PaddingLeft = UDim.new(0, 9),
+            PaddingRight = UDim.new(0, 7),
+        }, box)
+        return box
+    end
+
+    local function makeToggle(parent, title, position, onChanged)
+        local row = newInstance("Frame", {
+            Position = position,
+            Size = UDim2.new(1, -20, 0, 29),
+            BackgroundTransparency = 1,
+            ZIndex = 10,
+        }, parent)
+        makeLabel(row, title, UDim2.new(0, 0, 0, 0), UDim2.new(1, -65, 1, 0), {
+            TextSize = 11,
+            Color = C.TEXT,
+        })
+
+        local track = newInstance("Frame", {
+            Position = UDim2.new(1, -48, 0.5, -10),
+            Size = UDim2.new(0, 44, 0, 20),
+            BackgroundColor3 = C.TRACK,
+            BorderSizePixel = 0,
+            ZIndex = 11,
+        }, row)
+        addCorner(track, 10)
+
+        local knob = newInstance("Frame", {
+            Position = UDim2.new(0, 2, 0.5, -8),
+            Size = UDim2.new(0, 16, 0, 16),
+            BackgroundColor3 = Color3.fromRGB(245, 247, 252),
+            BorderSizePixel = 0,
+            ZIndex = 12,
+        }, track)
+        addCorner(knob, 8)
+
+        -- Hitbox phu kin ca dong; ZIndex cao hon track/label de luon nhan input.
+        local hitbox = newInstance("TextButton", {
+            Size = UDim2.new(1, 0, 1, 0),
+            BackgroundTransparency = 1,
+            Text = "",
+            Active = true,
+            Selectable = true,
+            AutoButtonColor = false,
+            ZIndex = 20,
+        }, row)
+
+        local state = false
+        local function renderState()
+            track.BackgroundColor3 = state and C.GREEN or C.TRACK
+            knob.Position = state and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
+        end
+
+        local function setState(value, silent)
+            state = value == true
+            renderState()
+            if not silent and onChanged then
+                local ok, err = pcall(onChanged, state)
+                if not ok then
+                    warn("[DUY UI] Toggle callback error:", err)
+                    state = not state
+                    renderState()
+                end
+            end
+        end
+
+        hitbox.Activated:Connect(function()
+            setState(not state, false)
+        end)
+
+        return setState, function() return state end
+    end
+
+    local function makeSlider(parent, title, position, minValue, maxValue, defaultValue, onChanged)
+        local holder = newInstance("Frame", {
+            Position = position,
+            Size = UDim2.new(1, -20, 0, 56),
+            BackgroundTransparency = 1,
+        }, parent)
+
+        makeLabel(holder, title, UDim2.new(0, 0, 0, 0), UDim2.new(0.65, 0, 0, 18), {
+            TextSize = 11,
+        })
+        local valueLabel = makeLabel(holder, string.format("%.2fx", defaultValue),
+            UDim2.new(0.65, 0, 0, 0), UDim2.new(0.35, 0, 0, 18), {
+                TextSize = 11,
+                Color = C.ACCENT,
+                Align = Enum.TextXAlignment.Right,
+            })
+
+        local track = newInstance("Frame", {
+            Position = UDim2.new(0, 0, 0, 30),
+            Size = UDim2.new(0.76, 0, 0, 6),
+            BackgroundColor3 = C.TRACK,
+            BorderSizePixel = 0,
+        }, holder)
+        addCorner(track, 4)
+
+        local fill = newInstance("Frame", {
+            Size = UDim2.new(0, 0, 1, 0),
+            BackgroundColor3 = C.ACCENT,
+            BorderSizePixel = 0,
+        }, track)
+        addCorner(fill, 4)
+
+        local knob = newInstance("Frame", {
+            Size = UDim2.new(0, 14, 0, 14),
+            Position = UDim2.new(0, -7, 0.5, -7),
+            BackgroundColor3 = Color3.fromRGB(245, 247, 252),
+            BorderSizePixel = 0,
+            ZIndex = 3,
+        }, track)
+        addCorner(knob, 7)
+
+        local reset = makeButton(holder, "RESET", UDim2.new(0.80, 0, 0, 22), UDim2.new(0.20, 0, 0, 22), {
+            TextSize = 9,
+            Background = C.INPUT,
+        })
+
+        local current = defaultValue
+        local dragging = false
+
+        local function updateFromRatio(ratio, silent)
+            ratio = math.clamp(ratio, 0, 1)
+            current = math.floor((minValue + (maxValue - minValue) * ratio) * 100 + 0.5) / 100
+            fill.Size = UDim2.new(ratio, 0, 1, 0)
+            knob.Position = UDim2.new(ratio, -7, 0.5, -7)
+            valueLabel.Text = string.format("%.2fx", current)
+            if not silent and onChanged then onChanged(current) end
+        end
+
+        local hitbox = newInstance("TextButton", {
+            Size = UDim2.new(1, 0, 0, 24),
+            Position = UDim2.new(0, 0, 0, -9),
+            BackgroundTransparency = 1,
+            Text = "",
+            ZIndex = 4,
+        }, track)
+
+        hitbox.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                local x = UserInputService:GetMouseLocation().X
+                updateFromRatio((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), false)
+            end
+        end)
+
+        local changedConnection = UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch) then
+                local x = UserInputService:GetMouseLocation().X
+                updateFromRatio((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), false)
+            end
+        end)
+        table.insert(GUI._connections, changedConnection)
+
+        local endedConnection = UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+        table.insert(GUI._connections, endedConnection)
+
+        reset.Activated:Connect(function()
+            updateFromRatio((defaultValue - minValue) / (maxValue - minValue), false)
+        end)
+
+        local function setValue(value, silent)
+            value = math.clamp(tonumber(value) or defaultValue, minValue, maxValue)
+            updateFromRatio((value - minValue) / (maxValue - minValue), silent == true)
+        end
+
+        setValue(defaultValue, true)
+        return setValue, function() return current end
+    end
+
+    local function makeDraggable(handle, target)
+        local dragging = false
+        local dragStart
+        local startPosition
+
+        handle.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = input.Position
+                startPosition = target.Position
+            end
+        end)
+
+        local moveConnection = UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch) then
+                local delta = input.Position - dragStart
+                target.Position = UDim2.new(
+                    startPosition.X.Scale, startPosition.X.Offset + delta.X,
+                    startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
+                )
+            end
+        end)
+        table.insert(GUI._connections, moveConnection)
+
+        local endConnection = UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+        table.insert(GUI._connections, endConnection)
+    end
+
+    function GUI:Build(callbacks)
+        local old = PlayerGui:FindFirstChild("DuySystem")
+        if old then old:Destroy() end
+
+        local screen = newInstance("ScreenGui", {
+            Name = "DuySystem",
+            ResetOnSpawn = false,
+            ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+            IgnoreGuiInset = true,
+        }, PlayerGui)
+        self._screen = screen
+
+        local window = newInstance("Frame", {
+            Name = "MainWindow",
+            Size = UDim2.new(0, 690, 0, 600),
+            Position = UDim2.new(0.5, -345, 0.5, -300),
+            BackgroundColor3 = C.BG,
+            BorderSizePixel = 0,
+        }, screen)
+        addCorner(window, 11)
+
+
+        local header = newInstance("Frame", {
+            Size = UDim2.new(1, 0, 0, 42),
+            BackgroundColor3 = C.HEADER,
+            BorderSizePixel = 0,
+        }, window)
+        addCorner(header, 11)
+        newInstance("Frame", {
+            Position = UDim2.new(0, 0, 1, -10),
+            Size = UDim2.new(1, 0, 0, 10),
+            BackgroundColor3 = C.HEADER,
+            BorderSizePixel = 0,
+        }, header)
+
+        makeLabel(header, "DUY TARGET FIRST  |  V2.7", UDim2.new(0, 15, 0, 0), UDim2.new(1, -120, 1, 0), {
+            Font = Enum.Font.GothamBold,
+            TextSize = 14,
+            Color = C.ACCENT,
+        })
+
+        local minimizeButton = makeButton(header, "−", UDim2.new(1, -75, 0.5, -15), UDim2.new(0, 30, 0, 30), {
+            TextSize = 20,
+            Background = C.HEADER,
+        })
+        local closeButton = makeButton(header, "×", UDim2.new(1, -39, 0.5, -15), UDim2.new(0, 30, 0, 30), {
+            TextSize = 17,
+            Background = C.HEADER,
+            TextColor = C.RED,
+        })
+
+        local logo = makeButton(screen, "D", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
+            TextSize = 23,
+            Background = Color3.fromRGB(18, 39, 70),
+            TextColor = C.ACCENT,
+            Radius = 27,
+        })
+        logo.Visible = false
+
+        makeDraggable(header, window)
+        makeDraggable(logo, logo)
+
+        minimizeButton.Activated:Connect(function()
+            window.Visible = false
+            logo.Visible = true
+        end)
+        logo.Activated:Connect(function()
+            window.Visible = true
+            logo.Visible = false
+        end)
+        closeButton.Activated:Connect(function()
+            callbacks.onClose()
+        end)
+
+        local sidebar = newInstance("Frame", {
+            Position = UDim2.new(0, 0, 0, 42),
+            Size = UDim2.new(0, 126, 1, -66),
+            BackgroundColor3 = C.SIDEBAR,
+            BorderSizePixel = 0,
+        }, window)
+
+        local content = newInstance("Frame", {
+            Position = UDim2.new(0, 126, 0, 42),
+            Size = UDim2.new(1, -126, 1, -66),
+            BackgroundTransparency = 1,
+        }, window)
+
+        local statusBar = newInstance("Frame", {
+            Position = UDim2.new(0, 0, 1, -24),
+            Size = UDim2.new(1, 0, 0, 24),
+            BackgroundColor3 = Color3.fromRGB(8, 10, 16),
+            BorderSizePixel = 0,
+        }, window)
+        local statusLabel = makeLabel(statusBar, "● He thong san sang", UDim2.new(0, 11, 0, 0), UDim2.new(1, -20, 1, 0), {
+            TextSize = 10,
+            Color = C.DIM,
+        })
+
+        local function setStatus(message, color)
+            statusLabel.Text = "● " .. tostring(message)
+            statusLabel.TextColor3 = color or C.DIM
+        end
+
+        local tabNames = { "MAIN", "WEBHOOK", "HIỆU NĂNG" }
+        local tabButtons = {}
+        local tabFrames = {}
+
+        for index, tabName in ipairs(tabNames) do
+            local tabButton = makeButton(sidebar, tabName,
+                UDim2.new(0, 8, 0, 13 + (index - 1) * 42),
+                UDim2.new(1, -16, 0, 34), {
+                    Background = C.SIDEBAR,
+                    TextColor = C.DIM,
+                    TextSize = 10,
+                })
+            tabButtons[index] = tabButton
+
+            local frame = newInstance("Frame", {
+                Size = UDim2.new(1, 0, 1, 0),
+                BackgroundTransparency = 1,
+                Visible = index == 1,
+            }, content)
+            tabFrames[index] = frame
+        end
+
+        local function switchTab(index)
+            for i, frame in ipairs(tabFrames) do
+                frame.Visible = i == index
+                tabButtons[i].BackgroundColor3 = i == index and Color3.fromRGB(27, 44, 68) or C.SIDEBAR
+                tabButtons[i].TextColor3 = i == index and C.ACCENT or C.DIM
+            end
+        end
+
+        for index, tabButton in ipairs(tabButtons) do
+            tabButton.Activated:Connect(function()
+                switchTab(index)
+            end)
+        end
+        switchTab(1)
+
+        -- MAIN TAB: LEFT PANEL
+        local main = tabFrames[1]
+        local leftPanel = newInstance("Frame", {
+            Position = UDim2.new(0, 9, 0, 9),
+            Size = UDim2.new(0.51, -12, 1, -18),
+            BackgroundColor3 = C.PANEL,
+            BorderSizePixel = 0,
+        }, main)
+        addCorner(leftPanel, 9)
+        newInstance("UIPadding", {
+            PaddingLeft = UDim.new(0, 10),
+            PaddingRight = UDim.new(0, 10),
+        }, leftPanel)
+
+        makeLabel(leftPanel, "MAP & SAVE MANAGER", UDim2.new(0, 0, 0, 8), UDim2.new(1, 0, 0, 21), {
+            Font = Enum.Font.GothamBold,
+            TextSize = 11,
+            Color = C.ACCENT,
+            Align = Enum.TextXAlignment.Center,
+        })
+
+        local spawnLabel = makeLabel(leftPanel, "Spawn: chua dat", UDim2.new(0, 0, 0, 34), UDim2.new(1, 0, 0, 16), {
+            TextSize = 10,
+            Color = C.DIM,
+        })
+        local destinationLabel = makeLabel(leftPanel, "Destination: chua dat", UDim2.new(0, 0, 0, 51), UDim2.new(1, 0, 0, 16), {
+            TextSize = 10,
+            Color = C.DIM,
+        })
+
+        local setSpawnButton = makeButton(leftPanel, "SET SPAWN", UDim2.new(0, 0, 0, 73), UDim2.new(0.48, -3, 0, 28))
+        local setDestinationButton = makeButton(leftPanel, "SET DEST", UDim2.new(0.52, 3, 0, 73), UDim2.new(0.48, -3, 0, 28))
+        local recordButton = makeButton(leftPanel, "START RECORD", UDim2.new(0, 0, 0, 106), UDim2.new(0.48, -3, 0, 27), { Background = C.BUTTON })
+        local routeStatusLabel = makeLabel(leftPanel, "Route: chua record", UDim2.new(0.52, 3, 0, 106), UDim2.new(0.48, -3, 0, 27), { TextSize = 8, Color = C.DIM, Wrapped = true })
+
+        local fileNameBox = makeTextBox(leftPanel, "Nhap ten file ban do...", UDim2.new(0, 0, 0, 138), UDim2.new(1, 0, 0, 27))
+        local createButton = makeButton(leftPanel, "+ CREATE FILE", UDim2.new(0, 0, 0, 171), UDim2.new(1, 0, 0, 27), {
+            Background = C.BUTTON,
+            TextColor = C.DIM,
+        })
+        createButton.Active = false
+        createButton:SetAttribute("DynamicColor", true)
+
+        makeLabel(leftPanel, "SAVED MAP FILES", UDim2.new(0, 0, 0, 208), UDim2.new(1, 0, 0, 16), {
+            TextSize = 10,
+            Color = C.DIM,
+        })
+
+        local dropdownButton = makeButton(leftPanel, "chua co file                         ▼",
+            UDim2.new(0, 0, 0, 227), UDim2.new(1, 0, 0, 30), {
+                Background = C.INPUT,
+                TextSize = 10,
+                ZIndex = 12,
+            })
+        dropdownButton.TextXAlignment = Enum.TextXAlignment.Left
+        newInstance("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 8) }, dropdownButton)
+
+        local dropdownList = newInstance("ScrollingFrame", {
+            Position = UDim2.new(0, 0, 0, 261),
+            Size = UDim2.new(1, 0, 0, 78),
+            BackgroundColor3 = Color3.fromRGB(12, 15, 23),
+            BorderSizePixel = 0,
+            ScrollBarThickness = 4,
+            ScrollBarImageColor3 = C.ACCENT,
+            CanvasSize = UDim2.new(0, 0, 0, 0),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            Visible = false,
+            Active = true,
+            Selectable = true,
+            ScrollingEnabled = true,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            ClipsDescendants = true,
+            ZIndex = 30,
+        }, leftPanel)
+        addCorner(dropdownList, 6)
+        addStroke(dropdownList, Color3.fromRGB(54, 75, 110), 1)
+        newInstance("UIListLayout", {
+            Padding = UDim.new(0, 3),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }, dropdownList)
+        newInstance("UIPadding", {
+            PaddingTop = UDim.new(0, 4),
+            PaddingLeft = UDim.new(0, 4),
+            PaddingRight = UDim.new(0, 4),
+            PaddingBottom = UDim.new(0, 4),
+        }, dropdownList)
+
+        local renameBox = makeTextBox(leftPanel, "Nhap ten moi de Rename...", UDim2.new(0, 0, 0, 347), UDim2.new(1, 0, 0, 27))
+        local renameButton = makeButton(leftPanel, "RENAME", UDim2.new(0, 0, 0, 380), UDim2.new(0.48, -3, 0, 27), {
+            Background = C.GREEN_DARK,
+        })
+        local deleteButton = makeButton(leftPanel, "DELETE", UDim2.new(0.52, 3, 0, 380), UDim2.new(0.48, -3, 0, 27), {
+            Background = C.RED_DARK,
+        })
+        makeLabel(leftPanel, "MAP FILE (vi du: duy_maps/Map_A.json)", UDim2.new(0, 0, 0, 413), UDim2.new(1, 0, 0, 15), { TextSize = 8, Color = C.DIM })
+        local mapFileBox = makeTextBox(leftPanel, "Nhap duong dan file JSON...", UDim2.new(0, 0, 0, 430), UDim2.new(1, 0, 0, 25))
+        mapFileBox.Text = "Map_A.json"
+        local importMapButton = makeButton(leftPanel, "IMPORT MAP", UDim2.new(0, 0, 0, 461), UDim2.new(0.48, -3, 0, 27), { Background = C.BUTTON, TextSize = 9 })
+        local exportMapButton = makeButton(leftPanel, "EXPORT MAP", UDim2.new(0.52, 3, 0, 461), UDim2.new(0.48, -3, 0, 27), { Background = C.GREEN_DARK, TextSize = 9 })
+        local mapFileStatusLabel = makeLabel(leftPanel, "Current Map: -- | Route Points: 0 | Status: NOT READY",
+            UDim2.new(0, 0, 0, 491), UDim2.new(1, 0, 0, 18), { TextSize = 8, Color = C.DIM, Wrapped = true })
+
+        -- MAIN TAB: RIGHT PANEL
+        local rightPanel = newInstance("Frame", {
+            Position = UDim2.new(0.51, 3, 0, 9),
+            Size = UDim2.new(0.49, -12, 1, -18),
+            BackgroundColor3 = C.PANEL,
+            BorderSizePixel = 0,
+        }, main)
+        addCorner(rightPanel, 9)
+
+        makeLabel(rightPanel, "PLAYER CONTROL", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 21), {
+            Font = Enum.Font.GothamBold,
+            TextSize = 11,
+            Color = C.ACCENT,
+            Align = Enum.TextXAlignment.Center,
+        })
+
+        local setSpeedUI = function() end
+        local speedModeButton = makeButton(rightPanel, "SPEED MODE: NORMAL", UDim2.new(0, 10, 0, 36), UDim2.new(1, -20, 0, 30), { Background = C.BUTTON })
+        local setNoclipUI = makeToggle(rightPanel, "NOCLIP", UDim2.new(0, 10, 0, 75), callbacks.onNoclip)
+        local setFollowUI = makeToggle(rightPanel, "AUTO FOLLOW", UDim2.new(0, 10, 0, 109), callbacks.onAutoFollow)
+        local setScannerUI = function() end
+
+        local targetLabel = makeLabel(rightPanel, "Target: --  |  HP: --\nRoute progress: --",
+            UDim2.new(0, 10, 0, 148), UDim2.new(1, -20, 0, 35), {
+                TextSize = 9,
+                Color = C.DIM,
+                Wrapped = true,
+                YAlign = Enum.TextYAlignment.Top,
+            })
+
+        makeLabel(rightPanel, "BOSS MAX HP", UDim2.new(0, 10, 0, 221), UDim2.new(0, 88, 0, 23), { TextSize = 9, Color = C.DIM })
+        local bossHPBox = makeTextBox(rightPanel, "128.5m", UDim2.new(0, 100, 0, 220), UDim2.new(1, -110, 0, 24))
+        local bossStatusLabel = makeLabel(rightPanel, "Boss: chua cau hinh", UDim2.new(0, 10, 0, 250), UDim2.new(1, -20, 0, 18), { TextSize = 9, Color = C.DIM })
+
+        local scannerPanel = newInstance("Frame", {
+            Position = UDim2.new(0, 10, 0, 274),
+            Size = UDim2.new(1, -20, 0, 76),
+            BackgroundColor3 = C.INPUT,
+            BorderSizePixel = 0,
+        }, rightPanel)
+        addCorner(scannerPanel, 6)
+
+        local scannerLabel = makeLabel(scannerPanel,
+            "Boss monitor: chua cau hinh\nTheo doi theo Max HP",
+            UDim2.new(0, 8, 0, 5), UDim2.new(1, -16, 1, -10), {
+                TextSize = 9,
+                Color = C.TEXT,
+                Wrapped = true,
+                YAlign = Enum.TextYAlignment.Top,
+            })
+
+        local scanNowButton = makeButton(rightPanel, "SET BOSS HP", UDim2.new(0, 10, 0, 359), UDim2.new(1, -20, 0, 25), { Background = Color3.fromRGB(39, 65, 99) })
+
+        -- TAB 2: DISCORD WEBHOOK
+        local webhookPanel = newInstance("Frame", {
+            Position = UDim2.new(0, 12, 0, 12),
+            Size = UDim2.new(1, -24, 0, 230),
+            BackgroundColor3 = C.PANEL,
+            BorderSizePixel = 0,
+        }, tabFrames[2])
+        addCorner(webhookPanel, 9)
+        makeLabel(webhookPanel, "WEBHOOK DISCORD", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
+            Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
+        })
+        makeLabel(webhookPanel, "Nhap webhook cua ban. URL chi giu trong bo nho script hien tai; dong script se mat URL.",
+            UDim2.new(0, 14, 0, 40), UDim2.new(1, -28, 0, 34), {
+                TextSize = 10, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
+            })
+        local webhookBox = makeTextBox(webhookPanel, "https://discord.com/api/webhooks/...",
+            UDim2.new(0, 14, 0, 82), UDim2.new(1, -28, 0, 32))
+        local saveWebhookButton = makeButton(webhookPanel, "SAVE WEBHOOK",
+            UDim2.new(0, 14, 0, 124), UDim2.new(0.48, -5, 0, 30), { Background = C.GREEN_DARK })
+        local testWebhookButton = makeButton(webhookPanel, "SEND TEST",
+            UDim2.new(0.52, 5, 0, 124), UDim2.new(0.48, -19, 0, 30), { Background = C.BUTTON })
+        local webhookStatusLabel = makeLabel(webhookPanel, "Webhook: chua cau hinh",
+            UDim2.new(0, 14, 0, 165), UDim2.new(1, -28, 0, 24), {
+                TextSize = 10, Color = C.DIM,
+            })
+        makeLabel(webhookPanel, "Bao cao ket qua tran va Boss khi duoc xac nhan bi ha.",
+            UDim2.new(0, 14, 0, 190), UDim2.new(1, -28, 0, 32), {
+                TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
+            })
+
+        saveWebhookButton.Activated:Connect(function()
+            local ok, message = callbacks.onConfigureWebhook(trim(webhookBox.Text))
+            webhookStatusLabel.Text = "Webhook: " .. tostring(message)
+            webhookStatusLabel.TextColor3 = ok and C.GREEN or C.RED
+            if ok then webhookBox.Text = "" end
+        end)
+        testWebhookButton.Activated:Connect(function()
+            local ok, message = callbacks.onTestWebhook()
+            webhookStatusLabel.Text = "Webhook: " .. tostring(message)
+            webhookStatusLabel.TextColor3 = ok and C.GREEN or C.RED
+        end)
+
+        -- TAB 3: HIỆU NĂNG
+        local performancePanel = newInstance("Frame", {
+            Position = UDim2.new(0, 12, 0, 12),
+            Size = UDim2.new(1, -24, 1, -24),
+            BackgroundColor3 = C.PANEL,
+            BorderSizePixel = 0,
+        }, tabFrames[3])
+        addCorner(performancePanel, 9)
+        makeLabel(performancePanel, "TỐI ƯU HIỆU NĂNG", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
+            Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
+        })
+        makeLabel(performancePanel, "Tất cả thay đổi chỉ áp dụng hiển thị ở máy bạn; không Destroy quái hay vật thể.",
+            UDim2.new(0, 14, 0, 34), UDim2.new(1, -28, 0, 28), {
+                TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
+            })
+        local performanceScroll = newInstance("ScrollingFrame", {
+            Position = UDim2.new(0, 10, 0, 66),
+            Size = UDim2.new(1, -20, 1, -76),
+            BackgroundColor3 = C.INPUT,
+            BorderSizePixel = 0,
+            ScrollBarThickness = 4,
+            ScrollBarImageColor3 = C.ACCENT,
+            CanvasSize = UDim2.new(0, 0, 0, 500),
+            Active = true,
+            ScrollingEnabled = true,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+        }, performancePanel)
+        addCorner(performanceScroll, 6)
+
+        local performanceSetters = {}
+        local performanceModeButtons = {}
+        makeLabel(performanceScroll, "CHỌN CHẾ ĐỘ THỦ CÔNG", UDim2.new(0, 10, 0, 6),
+            UDim2.new(1, -20, 0, 18), { Font = Enum.Font.GothamBold, TextSize = 10, Color = C.TEXT })
+        local performanceModes = {
+            { "NORMAL", "NORMAL", "Khôi phục hình ảnh gốc." },
+            { "BALANCED", "BALANCED", "Tắt bóng đổ; giữ phần lớn chi tiết." },
+            { "LOW", "LOW", "Giảm texture, vật liệu, bóng và hiệu ứng." },
+            { "ULTRA_LOW", "ULTRA LOW", "Giảm tối đa; có thể ẩn cả mô hình quái." },
+        }
+        local activePerformanceMode = "NORMAL"
+        local function refreshPerformanceModeButtons(mode)
+            activePerformanceMode = mode or "NORMAL"
+            for key, button in pairs(performanceModeButtons) do
+                local selected = key == activePerformanceMode
+                button.BackgroundColor3 = selected and C.ACCENT or C.BUTTON
+                button.TextColor3 = selected and Color3.fromRGB(255, 255, 255) or C.TEXT
+            end
+        end
+        for index, modeRow in ipairs(performanceModes) do
+            local column = (index - 1) % 2
+            local row = math.floor((index - 1) / 2)
+            local modeKey = modeRow[1]
+            local modeButton = makeButton(performanceScroll, modeRow[2],
+                UDim2.new(column * 0.5, 4, 0, 29 + row * 34),
+                UDim2.new(0.5, -8, 0, 28), { TextSize = 9 })
+            performanceModeButtons[modeKey] = modeButton
+            modeButton.MouseButton1Click:Connect(function()
+                callbacks.onPerformancePreset(modeKey)
+            end)
+        end
+        refreshPerformanceModeButtons("NORMAL")
+        makeLabel(performanceScroll, "Tùy chỉnh riêng (bật/tắt từng mục sẽ chuyển sang CUSTOM):",
+            UDim2.new(0, 10, 0, 103), UDim2.new(1, -20, 0, 25),
+            { TextSize = 8, Color = C.DIM, Wrapped = true })
+        local performanceRows = {
+            { "HideEnemyModels", "CHỈ HIỆN THANH HP QUÁI", "Ẩn mô hình 3D ở máy bạn; giữ HP, vị trí và va chạm." },
+            { "SimplifyMap", "SMOOTHPLASTIC MAP", "Đổi vật liệu Part sang SmoothPlastic; không xóa hình học." },
+            { "HideTextures", "ẨN DECAL / TEXTURE", "Ẩn ảnh dán và bản đồ PBR; có thể mất một số chi tiết." },
+            { "DisableShadows", "TẮT ĐỔ BÓNG", "Tắt GlobalShadows và CastShadow." },
+            { "DisableEffects", "TẮT HIỆU ỨNG", "Tắt Particle, Trail, Beam, đèn và hiệu ứng hậu kỳ." },
+            { "DisableFog", "TẮT SƯƠNG MÙ", "Giảm Fog và Atmosphere để nhìn bản đồ rõ hơn." },
+        }
+        for index, row in ipairs(performanceRows) do
+            local y = 133 + (index - 1) * 47
+            local optionName = row[1]
+            local setToggle = makeToggle(performanceScroll, row[2], UDim2.new(0, 10, 0, y), function(enabled)
+                callbacks.onPerformanceChanged(optionName, enabled)
+            end)
+            performanceSetters[optionName] = setToggle
+            makeLabel(performanceScroll, row[3], UDim2.new(0, 10, 0, y + 27),
+                UDim2.new(1, -30, 0, 17), { TextSize = 8, Color = C.DIM })
+        end
+        performanceScroll.CanvasSize = UDim2.new(0, 0, 0, 133 + #performanceRows * 47 + 8)
+
+
+        -- CREATE FILE state: text + Spawn + Destination.
+        local function updateCreateButton()
+            local cleanName = trim(fileNameBox.Text)
+            local ready = cleanName ~= ""
+            local hasFile = SaveManager:GetActiveFile() ~= nil
+            setSpawnButton.Active = hasFile
+            setDestinationButton.Active = hasFile
+            recordButton.Active = hasFile and MapManager:GetSpawn() ~= nil and MapManager:GetDestination() ~= nil
+            setSpawnButton.Selectable = hasFile
+            setDestinationButton.Selectable = hasFile
+            recordButton.Selectable = recordButton.Active
+            setSpawnButton.BackgroundColor3 = hasFile and C.BUTTON or C.PANEL
+            setDestinationButton.BackgroundColor3 = hasFile and C.BUTTON or C.PANEL
+            recordButton.BackgroundColor3 = recordButton.Active and C.BUTTON or C.PANEL
+            createButton.Active = ready
+            createButton.Selectable = ready
+            createButton.BackgroundColor3 = ready and C.GREEN or C.BUTTON
+            createButton.TextColor3 = ready and Color3.fromRGB(255, 255, 255) or C.DIM
+            return ready
+        end
+
+        fileNameBox:GetPropertyChangedSignal("Text"):Connect(updateCreateButton)
+
+        local selectedKey = nil
+        local confirmRenameAt = 0
+        local confirmDeleteAt = 0
+        local confirmWindow = 2
+
+        local function setDropdownTitle()
+            local data = selectedKey and SaveManager:GetFile(selectedKey)
+            local name = data and data.MapName or "chua co file"
+            dropdownButton.Text = name .. "                                      ▼"
+        end
+
+        local function refreshDropdown()
+            for _, child in ipairs(dropdownList:GetChildren()) do
+                if child:IsA("TextButton") then child:Destroy() end
+            end
+
+            local keys = SaveManager:GetFileList()
+            if #keys == 0 then
+                selectedKey = nil
+                dropdownList.Visible = false
+                dropdownButton.Text = "chua co file                                      ▼"
+            else
+                if selectedKey and not SaveManager:GetFile(selectedKey) then
+                    selectedKey = nil
+                end
+                if not selectedKey then
+                    local activeKey = SaveManager:GetActiveFile()
+                    selectedKey = activeKey
+                end
+                setDropdownTitle()
+
+                for index, key in ipairs(keys) do
+                    local data = SaveManager:GetFile(key)
+                    local name = data and data.MapName or key
+                    local active = key == selectedKey
+                    local item = makeButton(dropdownList,
+                        (active and "▶  " or "     ") .. name,
+                        UDim2.new(0, 0, 0, 0), UDim2.new(1, -2, 0, 27), {
+                            Background = active and C.ACTIVE_FILE or C.PANEL,
+                            TextColor = active and C.ACCENT or C.TEXT,
+                            TextSize = 10,
+                            ZIndex = 31,
+                        })
+                    item.LayoutOrder = index
+                    item.Active = true
+                    item.Selectable = true
+                    item.Activated:Connect(function()
+                        local ok, err = callbacks.onSelectFile(key)
+                        if ok then
+                            selectedKey = key
+                            dropdownList.Visible = false
+                            setDropdownTitle()
+                            refreshDropdown()
+                            updateCreateButton()
+                            setStatus("Da nap ban do: " .. name, C.GREEN)
+                        else
+                            setStatus(err or "Khong the chon file.", C.RED)
+                        end
+                    end)
+                end
+            end
+        end
+
+        dropdownButton.Activated:Connect(function()
+            if #SaveManager:GetFileList() == 0 then
+                setStatus("Chua co file ban do.", C.YELLOW)
+                return
+            end
+            dropdownList.Visible = not dropdownList.Visible
+        end)
+
+        setSpawnButton.Activated:Connect(function()
+            local ok, result = callbacks.onSetSpawn()
+            if ok then
+                spawnLabel.Text = string.format("Spawn: %.1f, %.1f, %.1f", result.X, result.Y, result.Z)
+                setStatus("Da ghi nhan Spawn Point.", C.GREEN)
+            else
+                setStatus("Loi Spawn: " .. tostring(result), C.RED)
+            end
+            updateCreateButton()
+        end)
+
+        setDestinationButton.Activated:Connect(function()
+            local ok, result = callbacks.onSetDestination()
+            if ok then
+                destinationLabel.Text = string.format("Destination: %.1f, %.1f, %.1f", result.X, result.Y, result.Z)
+                setStatus("Da ghi nhan Destination Point.", C.GREEN)
+            else
+                setStatus("Loi Destination: " .. tostring(result), C.RED)
+            end
+            updateCreateButton()
+        end)
+
+        recordButton.Activated:Connect(function()
+            local ok, message, recording = callbacks.onToggleRouteRecord()
+            recordButton.Text = recording and "STOP RECORD" or "START RECORD"
+            recordButton.BackgroundColor3 = recording and C.RED_DARK or C.BUTTON
+            routeStatusLabel.Text = "Route: " .. tostring(message)
+            routeStatusLabel.TextColor3 = ok and C.GREEN or C.YELLOW
+        end)
+
+        createButton.Activated:Connect(function()
+            if not updateCreateButton() then
+                setStatus("Can nhap ten file truoc.", C.YELLOW)
+                return
+            end
+
+            local ok, result = callbacks.onCreateFile(trim(fileNameBox.Text))
+            if ok then
+                selectedKey = result
+                fileNameBox.Text = ""
+                refreshDropdown()
+                updateCreateButton()
+                setStatus("Da tao va chon file moi.", C.GREEN)
+            else
+                setStatus("Khong tao duoc file: " .. tostring(result), C.RED)
+            end
+        end)
+
+        renameButton.Activated:Connect(function()
+            local now = os.clock()
+            if confirmRenameAt == 0 or now - confirmRenameAt > confirmWindow then
+                confirmRenameAt = now
+                renameButton.Text = "CONFIRM RENAME"
+                renameButton.BackgroundColor3 = C.YELLOW
+                setStatus("Nhan RENAME lan nua trong 2 giay de xac nhan.", C.YELLOW)
+                task.delay(confirmWindow, function()
+                    if os.clock() - confirmRenameAt >= confirmWindow then
+                        renameButton.Text = "RENAME"
+                        renameButton.BackgroundColor3 = C.GREEN_DARK
+                    end
+                end)
+                return
+            end
+
+            confirmRenameAt = 0
+            renameButton.Text = "RENAME"
+            renameButton.BackgroundColor3 = C.GREEN_DARK
+
+            if not selectedKey then
+                setStatus("Hay chon file can doi ten.", C.YELLOW)
+                return
+            end
+
+            local ok, result = callbacks.onRename(selectedKey, renameBox.Text)
+            if ok then
+                selectedKey = result
+                renameBox.Text = ""
+                refreshDropdown()
+                setStatus("Da doi ten file.", C.GREEN)
+            else
+                setStatus("Rename loi: " .. tostring(result), C.RED)
+            end
+        end)
+
+        deleteButton.Activated:Connect(function()
+            local now = os.clock()
+            if confirmDeleteAt == 0 or now - confirmDeleteAt > confirmWindow then
+                confirmDeleteAt = now
+                deleteButton.Text = "CONFIRM DELETE"
+                deleteButton.BackgroundColor3 = C.RED
+                setStatus("Xoa file dang chon? Nhan DELETE lan nua trong 2 giay de xac nhan.", C.YELLOW)
+                task.delay(confirmWindow, function()
+                    if os.clock() - confirmDeleteAt >= confirmWindow then
+                        deleteButton.Text = "DELETE"
+                        deleteButton.BackgroundColor3 = C.RED_DARK
+                    end
+                end)
+                return
+            end
+
+            confirmDeleteAt = 0
+            deleteButton.Text = "DELETE"
+            deleteButton.BackgroundColor3 = C.RED_DARK
+
+            if not selectedKey then
+                setStatus("Hay chon file can xoa.", C.YELLOW)
+                return
+            end
+
+            local ok, err = callbacks.onDelete(selectedKey)
+            if ok then
+                selectedKey = nil
+                refreshDropdown()
+                updateCreateButton()
+                setStatus("Da xoa file.", C.GREEN)
+            else
+                setStatus("Delete loi: " .. tostring(err), C.RED)
+            end
+        end)
+
+        importMapButton.Activated:Connect(function()
+            local ok, message = callbacks.onImportMap(trim(mapFileBox.Text))
+            setStatus(message, ok and C.GREEN or C.RED)
+        end)
+        exportMapButton.Activated:Connect(function()
+            local ok, message = callbacks.onExportMap(trim(mapFileBox.Text))
+            setStatus(message, ok and C.GREEN or C.RED)
+        end)
+
+        scanNowButton.Activated:Connect(function()
+            local ok, message = callbacks.onSetBossHP(bossHPBox.Text)
+            bossStatusLabel.Text = "Boss: " .. tostring(message)
+            bossStatusLabel.TextColor3 = ok and C.GREEN or C.RED
+        end)
+        speedModeButton.Activated:Connect(function()
+            local mode = callbacks.onToggleSpeedMode()
+            speedModeButton.Text = mode == "MATCH_ENEMY" and "SPEED MODE: THEO TỐC ĐỘ QUÁI" or "SPEED MODE: BÌNH THƯỜNG"
+        end)
+
+
+        local function formatUIValue(value)
+            if value == nil then return "null" end
+            local integer = math.floor(tonumber(value) or 0)
+            local reversed = tostring(integer):reverse():gsub("(%d%d%d)", "%1,"):reverse()
+            return reversed:gsub("^,", "")
+        end
+
+        self._api = {
+            setStatus = setStatus,
+            refreshDropdown = refreshDropdown,
+            updateCreateButton = updateCreateButton,
+            setSpawnLabel = function(position)
+                if position then
+                    spawnLabel.Text = string.format("Spawn: %.1f, %.1f, %.1f", position.X, position.Y, position.Z)
+                else
+                    spawnLabel.Text = "Spawn: chua dat"
+                end
+                updateCreateButton()
+            end,
+            setDestinationLabel = function(position)
+                if position then
+                    destinationLabel.Text = string.format("Destination: %.1f, %.1f, %.1f", position.X, position.Y, position.Z)
+                else
+                    destinationLabel.Text = "Destination: chua dat"
+                end
+                updateCreateButton()
+            end,
+            setTargetInfo = function(enemy, destination)
+                if enemy then
+                    local progress = projectProgress(enemy.Position, MapManager:GetRoute())
+                    targetLabel.Text = string.format(
+                        "Target: DETECTED\nHP: %s / %s\nRoute progress: %s",
+                        tostring(enemy.CurrentHP), tostring(enemy.MaxHP), progress and (string.format("%.1f%%", progress * 100)) or "chua xac dinh"
+                    )
+                else
+                    targetLabel.Text = "Target: --\nHP: --\nRoute progress: --"
+                end
+            end,
+            setScannerInfo = function(snapshot)
+                scannerLabel.Text = "Match scanner: " .. (snapshot.ScannerActive and "ACTIVE" or "READY")
+                    .. "\nKet qua: " .. tostring(snapshot.Result or "IN PROGRESS")
+                    .. "\nBoss monitor: theo Max HP da nhap"
+            end,
+            setPerformanceUI = function(values, silent)
+                for name, setter in pairs(performanceSetters) do
+                    setter(values and values[name] == true, silent == true)
+                end
+            end,
+            setPerformanceModeUI = function(mode)
+                refreshPerformanceModeButtons(mode)
+            end,
+            setSpeedUI = setSpeedUI,
+            setNoclipUI = setNoclipUI,
+            setFollowUI = setFollowUI,
+            setScannerUI = setScannerUI,
+            setSpeedModeUI = function(mode)
+                speedModeButton.Text = mode == "MATCH_ENEMY" and "SPEED MODE: THEO TỐC ĐỘ QUÁI" or "SPEED MODE: BÌNH THƯỜNG"
+            end,
+            setBossInfo = function(text)
+                bossStatusLabel.Text = "Boss: " .. tostring(text)
+            end,
+            setWebhookStatus = function(message, ok)
+                webhookStatusLabel.Text = "Webhook: " .. tostring(message)
+                webhookStatusLabel.TextColor3 = ok and C.GREEN or C.RED
+            end,
+            setSelectedKey = function(key)
+                selectedKey = key
+                refreshDropdown()
+                local _, active = SaveManager:GetActiveFile()
+                local routeCount = #(MapManager:GetRoute() or {})
+                mapFileStatusLabel.Text = string.format("Current Map: %s | Route Points: %d | Status: %s",
+                    active and tostring(active.MapName or key or "--") or "--", routeCount,
+                    MapManager:IsReady() and "READY" or "NOT READY")
+            end,
+            setRouteStatus = function(message)
+                routeStatusLabel.Text = "Route: " .. tostring(message)
+                local _, active = SaveManager:GetActiveFile()
+                local routeCount = #(MapManager:GetRoute() or {})
+                mapFileStatusLabel.Text = string.format("Current Map: %s | Route Points: %d | Status: %s",
+                    active and tostring(active.MapName or selectedKey or "--") or "--", routeCount,
+                    MapManager:IsReady() and "READY" or "NOT READY")
+            end,
+        }
+
+        updateCreateButton()
+        refreshDropdown()
+
+        if not SaveManager:HasPersistence() then
+            setStatus("writefile/readfile khong co san - save chi ton tai trong session.", C.YELLOW)
+        else
+            setStatus("He thong san sang - JSON persistence available.", C.GREEN)
+        end
+
+        return self._api
+    end
+
+    function GUI:Destroy()
+        for _, connection in ipairs(self._connections) do
+            pcall(function() connection:Disconnect() end)
+        end
+        table.clear(self._connections)
+        if self._screen then
+            self._screen:Destroy()
+            self._screen = nil
+        end
+    end
+end
+
+-- ============================================================
+-- MAIN CONTROLLER / CALLBACKS
+-- ============================================================
+local autoFollowEnabled = false
+local autoPlayScannerEnabled = false -- legacy compatibility; no UI toggle in V2.6
+local api = nil
+local enemyElapsed = 0
+local destroyed = false
+local manualMovementActive
+local syncManualMovementPause
+local runtimeConnections = {}
+
+local function sendMatchReport(report)
+    local isWin = report.Result == "WIN (VICTORY)"
+    local vietnamTime = os.date("!%H:%M:%S - %d/%m/%Y", os.time() + 7 * 3600)
+    local payload = {
+        embeds = {{
+            title = "GARDEN TOWER DEFENSE - MATCH REPORT",
+            color = isWin and 65280 or 16711680,
+            fields = {
+                { name = "So tran", value = "Tran thu " .. tostring(report.MatchNumber or "?"), inline = true },
+                { name = "Ket qua", value = isWin and "WIN (VICTORY)" or "LOSS (DEFEAT)", inline = true },
+                { name = "Wave ket thuc", value = tostring(report.WaveInfo or "N/A"), inline = true },
+                { name = "Gio Viet Nam (UTC+7)", value = vietnamTime, inline = true },
+            },
+            footer = { text = "DUY TARGET FIRST - Auto Report" },
+        }},
+    }
+    task.spawn(function()
+        local ok, message = postDiscordPayload(payload)
+        if not ok then warn("[DUY WEBHOOK] " .. tostring(message)) end
+    end)
+end
+
+local speedMode = "NORMAL"
+local function setAutoFollow(enabled)
+    autoFollowEnabled = enabled == true
+    if autoFollowEnabled then
+        if not MapManager:IsReady() then
+            autoFollowEnabled = false
+            if api then
+                api.setFollowUI(false, true)
+                api.setStatus("Can SET SPAWN, SET DEST va RECORD ROUTE truoc.", Color3.fromRGB(225, 172, 66))
+            end
+            return false
+        end
+
+        MovementController:Start(
+            function() return TargetSelector:Get() end,
+            function() return MapManager:GetDestination() end,
+            function() return speedMode end
+        )
+        if syncManualMovementPause then
+            syncManualMovementPause()
+        end
+    else
+        MovementController:Stop()
+        TargetSelector:Clear()
+    end
+
+    SaveManager:UpdateActiveSettings({ AutoFollow = autoFollowEnabled })
+    return true
+end
+
+local function setAutoPlayScanner(enabled)
+    autoPlayScannerEnabled = false
+    MatchScanner:Stop()
+end
+
+local RouteRecorder = { Recording = false, Points = {}, _connection = nil, _lastPoint = nil, _elapsed = 0 }
+function RouteRecorder:Start()
+    if self.Recording then return false, "Dang record roi." end
+    local _, fileData = SaveManager:GetActiveFile()
+    if not fileData then return false, "Hay tao/chon file truoc." end
+    if not MapManager:GetSpawn() or not MapManager:GetDestination() then return false, "Can SET SPAWN va SET DEST truoc." end
+    local root = getHRP()
+    if not root or (root.Position - MapManager:GetSpawn()).Magnitude > 10 then
+        return false, "Hay dung gan Spawn (toi da 10 studs) truoc khi START RECORD."
+    end
+    self.Points = { MapManager:GetSpawn() }
+    self._lastPoint = MapManager:GetSpawn()
+    self._elapsed = 0
+    self.Recording = true
+    self._connection = RunService.Heartbeat:Connect(function(dt)
+        if not self.Recording then return end
+        self._elapsed += dt
+        if self._elapsed < CONFIG.ROUTE_RECORD_INTERVAL then return end
+        self._elapsed = 0
+        local root = getHRP()
+        if not root then return end
+        local pos = root.Position
+        if (pos - self._lastPoint).Magnitude >= CONFIG.ROUTE_POINT_SPACING and #self.Points < CONFIG.ROUTE_MAX_POINTS then
+            table.insert(self.Points, pos)
+            self._lastPoint = pos
+        end
+    end)
+    return true, "Dang ghi tuyen duong...", true
+end
+function RouteRecorder:Stop()
+    if not self.Recording then return false, "Chua bat Record.", false end
+    self.Recording = false
+    if self._connection then self._connection:Disconnect(); self._connection = nil end
+    local destination = MapManager:GetDestination()
+    local root = getHRP()
+    if not destination or not root or (root.Position - destination).Magnitude > 12 then
+        return false, "Hay di den gan Destination (toi da 12 studs) roi moi STOP RECORD.", false
+    end
+    if #self.Points == 0 or (self.Points[#self.Points] - destination).Magnitude > 1 then
+        table.insert(self.Points, destination)
+    end
+    if #self.Points < 3 then return false, "Tuyen duong qua ngan; hay Record lai tu Spawn den Destination.", false end
+    MapManager:SetRoute(self.Points)
+    local ok, err = SaveManager:UpdateActiveRoute(self.Points)
+    if not ok then return false, err or "Khong luu duoc route.", false end
+    return true, string.format("Da luu %d diem route", #self.Points), false
+end
+function RouteRecorder:Toggle()
+    if self.Recording then return self:Stop() end
+    return self:Start()
+end
+
+local function parseCompactNumber(value)
+    local textValue = trim(value):lower():gsub(",", ""):gsub("%s+", "")
+    local number, suffix = textValue:match("^(%d+%.?%d*)([kmb]?)$")
+    number = tonumber(number)
+    if not number then return nil end
+    local multiplier = ({ k = 1e3, m = 1e6, b = 1e9 })[suffix] or 1
+    return number * multiplier
+end
+
+local BossTracker = {
+    MaxHP = nil,
+    Tracked = setmetatable({}, { __mode = "k" }),
+    Reported = setmetatable({}, { __mode = "k" }),
+}
+function BossTracker:SetMaxHP(value)
+    local parsed = parseCompactNumber(value)
+    if not parsed or parsed <= 250 then return false, "MaxHP khong hop le." end
+    self.MaxHP = parsed
+    self.Tracked = setmetatable({}, { __mode = "k" })
+    self.Reported = setmetatable({}, { __mode = "k" })
+    return true, "Da dat Boss MaxHP " .. tostring(value)
+end
+
+local function formatCompactHP(value)
+    value = tonumber(value) or 0
+    if value >= 1e9 then return string.format("%.3gB", value / 1e9) end
+    if value >= 1e6 then return string.format("%.3gM", value / 1e6) end
+    if value >= 1e3 then return string.format("%.3gK", value / 1e3) end
+    return tostring(value)
+end
+
+local function sendBossDefeatedReport(maxHP)
+    local payload = { embeds = {{
+        title = "GARDEN TOWER DEFENSE - BOSS DEFEATED",
+        color = 65280,
+        fields = {
+            { name = "Boss HP", value = formatCompactHP(maxHP), inline = true },
+            { name = "Status", value = "DEFEATED", inline = true },
+            { name = "Result", value = "SUCCESS", inline = true },
+            { name = "Gio Viet Nam", value = os.date("!%H:%M:%S - %d/%m/%Y", os.time() + 25200), inline = true },
+        },
+        footer = { text = "DUY TARGET FIRST - Boss report" },
+    }} }
+    task.spawn(function()
+        local ok, err = postDiscordPayload(payload)
+        if not ok then warn("[DUY WEBHOOK] " .. tostring(err)) end
+    end)
+end
+
+local function monitorBoss(enemies)
+    if not BossTracker.MaxHP then return end
+    local present = {}
+    local tolerance = math.max(1, BossTracker.MaxHP * 0.0005)
+    for _, enemy in ipairs(enemies) do
+        local billboard = enemy.Billboard
+        if billboard and math.abs((enemy.MaxHP or 0) - BossTracker.MaxHP) <= tolerance then
+            present[billboard] = true
+            local state = BossTracker.Tracked[billboard]
+            if not state then
+                state = { WasAlive = false, MaxHP = enemy.MaxHP, Reported = false, MissingScans = 0 }
+                BossTracker.Tracked[billboard] = state
+            end
+            -- Always use the current MaxHP parsed from the right side of HP text.
+            state.MaxHP = enemy.MaxHP
+            state.MissingScans = 0
+            if enemy.CurrentHP > 0 then
+                state.WasAlive = true
+            elseif enemy.CurrentHP <= 0 and state.WasAlive and not state.Reported
+                and not BossTracker.Reported[billboard] then
+                state.Reported = true
+                BossTracker.Reported[billboard] = true
+                sendBossDefeatedReport(state.MaxHP)
+                if api then api.setBossInfo("Da xac nhan ha Boss " .. formatCompactHP(state.MaxHP)) end
+            end
+        end
+    end
+    -- A missing billboard is NOT proof of defeat. Drop its live tracking state silently.
+    for billboard, state in pairs(BossTracker.Tracked) do
+        if not present[billboard] then
+            state.MissingScans = (state.MissingScans or 0) + 1
+            -- A temporarily missing HP label/scan is not a defeat signal.
+            if state.MissingScans >= 2 or not billboard or not billboard.Parent then
+                BossTracker.Tracked[billboard] = nil
+            end
+        end
+    end
+end
+
+local callbacks = {}
+
+callbacks.onClose = function()
+    destroyed = true
+    if RouteRecorder and RouteRecorder._connection then
+        RouteRecorder.Recording = false
+        RouteRecorder._connection:Disconnect()
+        RouteRecorder._connection = nil
+    end
+    MovementController:Stop()
+    MatchScanner:Stop()
+    PlayerController:SetNoclip(false)
+    PerformanceManager:Destroy()
+    EnemyDetector:Destroy()
+    for _, connection in ipairs(runtimeConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(runtimeConnections)
+    GUI:Destroy()
+end
+
+callbacks.onSetSpawn = function()
+    if not SaveManager:GetActiveFile() then return false, "Hay CREATE FILE va chon file truoc." end
+    local ok, result = MapManager:SetSpawn()
+    if ok then
+        SaveManager:UpdateActivePoints(MapManager:GetSpawn(), nil)
+        SaveManager:UpdateActiveRoute({})
+        if api then api.setRouteStatus("can Record lai") end
+    end
+    return ok, result
+end
+
+callbacks.onSetDestination = function()
+    if not SaveManager:GetActiveFile() then return false, "Hay CREATE FILE va chon file truoc." end
+    local ok, result = MapManager:SetDestination()
+    if ok then
+        SaveManager:UpdateActivePoints(nil, MapManager:GetDestination())
+        SaveManager:UpdateActiveRoute({})
+        if api then api.setRouteStatus("can Record lai") end
+    end
+    return ok, result
+end
+
+local function cleanMapFileName(path)
+    path = trim(path):gsub("\\", "/")
+    if path == "" then return nil end
+    if not path:match("%.json$") then path ..= ".json" end
+    if path:find("../", 1, true) or path:sub(1, 1) == "/" then return nil end
+    return path
+end
+
+local function validateMapData(data)
+    if type(data) ~= "table" then return false, "JSON root phai la object." end
+    local function validPoint(point)
+        if type(point) ~= "table" then return false end
+        local x, y, z = tonumber(point.X), tonumber(point.Y), tonumber(point.Z)
+        return x ~= nil and y ~= nil and z ~= nil
+            and x == x and y == y and z == z
+            and math.abs(x) < 1e7 and math.abs(y) < 1e7 and math.abs(z) < 1e7
+    end
+    if not validPoint(data.SpawnPoint) then return false, "SpawnPoint khong hop le." end
+    if not validPoint(data.DestinationPoint) then return false, "DestinationPoint khong hop le." end
+    if type(data.RoutePoints) ~= "table" or #data.RoutePoints < 2 then
+        return false, "RoutePoints can it nhat 2 diem."
+    end
+    for index, point in ipairs(data.RoutePoints) do
+        if not validPoint(point) then return false, "RoutePoints loi tai diem " .. tostring(index) end
+    end
+    if type(data.Name) ~= "string" or trim(data.Name) == "" then
+        return false, "Name khong hop le."
+    end
+    return true
+end
+
+callbacks.onExportMap = function(path)
+    local _, active = SaveManager:GetActiveFile()
+    if not active then return false, "Hay tao/chon Map truoc." end
+    local filePath = cleanMapFileName(path)
+    if not filePath then return false, "Duong dan file khong hop le." end
+    if type(writefile) ~= "function" then return false, "Moi truong khong ho tro writefile." end
+    local mapData = {
+        Version = "2.7",
+        Name = tostring(active.MapName or "Map"),
+        SpawnPoint = active.SpawnPoint,
+        DestinationPoint = active.DestinationPoint,
+        RoutePoints = active.RoutePoints,
+    }
+    local valid, reason = validateMapData(mapData)
+    if not valid then return false, "Khong the Export: " .. reason end
+    local ok, err = pcall(function()
+        local folder = filePath:match("^(.*)/[^/]+$")
+        if folder and folder ~= "" and type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(folder) then
+            makefolder(folder)
+        end
+        writefile(filePath, HttpService:JSONEncode(mapData))
+    end)
+    if not ok then return false, "Export loi: " .. tostring(err) end
+    return true, "Export thanh cong: " .. filePath
+end
+
+callbacks.onImportMap = function(path)
+    local filePath = cleanMapFileName(path)
+    if not filePath then return false, "Duong dan file khong hop le." end
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then
+        return false, "Moi truong khong ho tro readfile/isfile."
+    end
+    if not isfile(filePath) then return false, "Khong tim thay file: " .. filePath end
+    local okRead, raw = pcall(readfile, filePath)
+    if not okRead or type(raw) ~= "string" then return false, "Khong doc duoc file JSON." end
+    local okDecode, imported = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not okDecode then return false, "JSON khong hop le." end
+    local valid, reason = validateMapData(imported)
+    if not valid then return false, "Import bi tu choi: " .. reason end
+    -- Prepare all values first. A valid import becomes a new SaveManager map file,
+    -- so the currently selected map is never overwritten accidentally.
+    local staged = {
+        MapName = imported.Name,
+        SpawnPoint = { X = tonumber(imported.SpawnPoint.X), Y = tonumber(imported.SpawnPoint.Y), Z = tonumber(imported.SpawnPoint.Z) },
+        DestinationPoint = { X = tonumber(imported.DestinationPoint.X), Y = tonumber(imported.DestinationPoint.Y), Z = tonumber(imported.DestinationPoint.Z) },
+        RoutePoints = {},
+    }
+    for _, point in ipairs(imported.RoutePoints) do
+        table.insert(staged.RoutePoints, { X = tonumber(point.X), Y = tonumber(point.Y), Z = tonumber(point.Z) })
+    end
+    if SaveManager:NameExists(staged.MapName) then
+        return false, "Ten Map da ton tai trong File Manager. Hay doi ten file JSON roi Import lai."
+    end
+    local created, activeKey = SaveManager:CreateFile(staged.MapName)
+    if not created then return false, "Khong tao duoc Map moi: " .. tostring(activeKey) end
+    local _, active = SaveManager:GetActiveFile()
+    if not active then return false, "Khong kich hoat duoc Map vua Import." end
+    active.MapName = staged.MapName
+    active.SpawnPoint = staged.SpawnPoint
+    active.DestinationPoint = staged.DestinationPoint
+    active.RoutePoints = staged.RoutePoints
+    -- New file starts with default Settings; map import never imports personal settings.
+    SaveManager:UpdateActivePoints(Vector3.new(staged.SpawnPoint.X, staged.SpawnPoint.Y, staged.SpawnPoint.Z), Vector3.new(staged.DestinationPoint.X, staged.DestinationPoint.Y, staged.DestinationPoint.Z))
+    local routeVectors = {}
+    for _, point in ipairs(staged.RoutePoints) do
+        table.insert(routeVectors, Vector3.new(point.X, point.Y, point.Z))
+    end
+    SaveManager:UpdateActiveRoute(routeVectors)
+    MapManager:LoadFromFile(active)
+    if api then
+        api.setSpawnLabel(MapManager:GetSpawn())
+        api.setDestinationLabel(MapManager:GetDestination())
+        api.setRouteStatus(tostring(#MapManager:GetRoute()) .. " diem - IMPORTED")
+        api.setSelectedKey(activeKey)
+    end
+    return true, "Import thanh cong: " .. staged.MapName
+end
+
+callbacks.onCreateFile = function(name)
+    local ok, key = SaveManager:CreateFile(name)
+    if ok then
+        MapManager:LoadFromFile({})
+        api.setSpawnLabel(nil)
+        api.setDestinationLabel(nil)
+        api.setRouteStatus("chua record")
+    end
+    return ok, key
+end
+
+callbacks.onToggleRouteRecord = function()
+    return RouteRecorder:Toggle()
+end
+
+callbacks.onSetBossHP = function(value)
+    return BossTracker:SetMaxHP(value)
+end
+
+callbacks.onToggleSpeedMode = function()
+    speedMode = speedMode == "NORMAL" and "MATCH_ENEMY" or "NORMAL"
+    SaveManager:UpdateActiveSettings({ SpeedMode = speedMode })
+    if speedMode == "MATCH_ENEMY" then
+        local target = TargetSelector:Get()
+        local humanoid = getHumanoid()
+        if target and humanoid then
+            -- speed estimate updated by movement loop; mode never clamps configured WalkSpeed.
+        end
+    end
+    return speedMode
+end
+
+callbacks.onRename = function(oldKey, newName)
+    return SaveManager:RenameFile(oldKey, newName)
+end
+
+callbacks.onDelete = function(key)
+    local ok, err = SaveManager:DeleteFile(key)
+    if not ok then return false, err end
+
+    local nextKey, nextData = SaveManager:GetActiveFile()
+    if nextData then
+        callbacks.onSelectFile(nextKey)
+    else
+        MovementController:Stop()
+        TargetSelector:Clear()
+        autoFollowEnabled = false
+        autoPlayScannerEnabled = false
+        MatchScanner:Stop()
+        MapManager:LoadFromFile({})
+        PlayerController:SetSpeed(1)
+        PlayerController:SetNoclip(false)
+        local defaults = {
+            HideEnemyModels = false, SimplifyMap = false, HideTextures = false,
+            DisableShadows = false, DisableEffects = false, DisableFog = false,
+        }
+        for name in pairs(defaults) do PerformanceManager:SetOption(name, false) end
+        if api then
+            api.setPerformanceUI(defaults, true)
+            api.setPerformanceModeUI("NORMAL")
+            api.setSpawnLabel(nil)
+            api.setDestinationLabel(nil)
+            api.setFollowUI(false, true)
+            api.setScannerUI(false, true)
+            api.setSpeedUI(1, true)
+        end
+    end
+    return true
+end
+
+callbacks.onSpeedChange = function(value)
+    PlayerController:SetSpeed(value)
+    SaveManager:UpdateActiveSettings({ Speed = value })
+end
+
+callbacks.onNoclip = function(enabled)
+    PlayerController:SetNoclip(enabled)
+    SaveManager:UpdateActiveSettings({ Noclip = enabled })
+end
+
+callbacks.onAutoFollow = function(enabled)
+    local ok = setAutoFollow(enabled)
+    if not ok and api then
+        api.setStatus("Auto Follow chua bat: thieu Spawn/Destination/Route.", Color3.fromRGB(225, 172, 66))
+    end
+end
+
+callbacks.onAutoPlayScanner = function(enabled)
+    autoPlayScannerEnabled = false
+    MatchScanner:Stop()
+end
+
+callbacks.onScanNow = function()
+    local snapshot = MatchScanner:ScanOnce()
+    MatchScanner:DebugUI() -- chi quet UI khi nguoi dung bam SCAN NOW
+    if api then
+        api.setScannerInfo(snapshot)
+        api.setStatus("Da kiem tra UI mot lan. Auto Scanner chi lang nghe su kien.", Color3.fromRGB(91, 169, 255))
+    end
+end
+
+callbacks.onResetScanner = function()
+    MatchScanner:Reset()
+    if api then
+        api.setScannerInfo(MatchScanner:GetSnapshot())
+        api.setStatus("Da reset bo dem tran dau.", Color3.fromRGB(225, 172, 66))
+    end
+end
+
+
+
+local PERFORMANCE_PRESETS = {
+    NORMAL = { HideEnemyModels = false, SimplifyMap = false, HideTextures = false, DisableShadows = false, DisableEffects = false, DisableFog = false },
+    BALANCED = { HideEnemyModels = false, SimplifyMap = false, HideTextures = false, DisableShadows = true, DisableEffects = false, DisableFog = false },
+    LOW = { HideEnemyModels = false, SimplifyMap = true, HideTextures = true, DisableShadows = true, DisableEffects = true, DisableFog = true },
+    ULTRA_LOW = { HideEnemyModels = true, SimplifyMap = true, HideTextures = true, DisableShadows = true, DisableEffects = true, DisableFog = true },
+}
+
+callbacks.onPerformancePreset = function(mode)
+    local preset = PERFORMANCE_PRESETS[mode]
+    if not preset then return false, "Chế độ hiệu năng không hợp lệ." end
+    PerformanceManager:ApplyOptions(preset)
+    if api then
+        api.setPerformanceUI(preset, true)
+        api.setPerformanceModeUI(mode)
+    end
+    local settings = { PerformanceMode = mode }
+    for name, enabled in pairs(preset) do
+        settings["Performance_" .. name] = enabled == true
+    end
+    SaveManager:UpdateActiveSettings(settings)
+    if api then
+        local labels = { NORMAL = "NORMAL", BALANCED = "BALANCED", LOW = "LOW", ULTRA_LOW = "ULTRA LOW" }
+        api.setStatus("Đã áp dụng chế độ " .. labels[mode] .. " (thủ công).", Color3.fromRGB(47, 163, 100))
+    end
+    return true
+end
+
+callbacks.onPerformanceChanged = function(name, enabled)
+    local ok, message = PerformanceManager:SetOption(name, enabled)
+    if ok then
+        SaveManager:UpdateActiveSettings({ ["Performance_" .. name] = enabled == true, PerformanceMode = "CUSTOM" })
+        if api then api.setPerformanceModeUI("CUSTOM") end
+    end
+    if api then
+        api.setStatus(message, enabled and Color3.fromRGB(47, 163, 100) or Color3.fromRGB(133, 143, 164))
+    end
+    return ok, message
+end
+
+-- TAB WEBHOOK callbacks: client-only, URL chi giu trong RAM cua script.
+callbacks.onConfigureWebhook = function(url)
+    url = trim(url)
+    if url == "" then
+        return false, "Hay nhap webhook URL moi."
+    end
+    if not isValidDiscordWebhook(url) then
+        return false, "URL khong dung dinh dang Discord webhook."
+    end
+    if type(executorRequest) ~= "function" then
+        return false, "Executor khong ho tro HTTP request."
+    end
+    savedWebhookUrl = url
+    return true, "Da luu webhook trong bo nho script."
+end
+
+callbacks.onTestWebhook = function()
+    local payload = {
+        embeds = {{
+            title = "DUY TARGET FIRST - TEST",
+            description = "Ket noi Discord webhook hoat dong.",
+            color = 3447003,
+            fields = {{ name = "Trang thai", value = "SEND TEST thanh cong", inline = true }},
+            footer = { text = "Garden Tower Defense Auto Report" },
+        }},
+    }
+    return postDiscordPayload(payload)
+end
+
+-- ============================================================
+-- STARTUP / RESTORE
+-- ============================================================
+SaveManager:Init()
+api = GUI:Build(callbacks)
+
+api.setWebhookStatus("chua SAVE WEBHOOK", false)
+
+local function applyFileSettings(data)
+    -- Dung target/path cu truoc khi ap dung cau hinh file moi.
+    MovementController:Stop()
+    TargetSelector:Clear()
+    autoFollowEnabled = false
+
+    local settings = type(data.Settings) == "table" and data.Settings or {}
+    local speed = math.clamp(safeNumber(settings.Speed, 1), CONFIG.MIN_SPEED, CONFIG.MAX_SPEED)
+    local noclip = settings.Noclip == true
+    local follow = settings.AutoFollow == true
+    local performanceOptions = {
+        HideEnemyModels = settings.Performance_HideEnemyModels == true,
+        SimplifyMap = settings.Performance_SimplifyMap == true,
+        HideTextures = settings.Performance_HideTextures == true,
+        DisableShadows = settings.Performance_DisableShadows == true,
+        DisableEffects = settings.Performance_DisableEffects == true,
+        DisableFog = settings.Performance_DisableFog == true,
+    }
+    local performanceMode = settings.PerformanceMode
+    if PERFORMANCE_PRESETS[performanceMode] then
+        performanceOptions = PERFORMANCE_PRESETS[performanceMode]
+    elseif performanceMode ~= "CUSTOM" then
+        local anyEnabled = false
+        for _, enabled in pairs(performanceOptions) do if enabled then anyEnabled = true break end end
+        performanceMode = anyEnabled and "CUSTOM" or "NORMAL"
+        SaveManager:UpdateActiveSettings({ PerformanceMode = performanceMode })
+    end
+    PerformanceManager:ApplyOptions(performanceOptions)
+    api.setPerformanceUI(performanceOptions, true)
+    api.setPerformanceModeUI(performanceMode or "NORMAL")
+
+    PlayerController:SetSpeed(speed)
+    PlayerController:SetNoclip(noclip)
+
+    api.setSpeedUI(speed, true)
+    api.setNoclipUI(noclip, true)
+    api.setFollowUI(false, true)
+    api.setScannerUI(false, true)
+    speedMode = settings.SpeedMode == "MATCH_ENEMY" and "MATCH_ENEMY" or "NORMAL"
+    api.setSpeedModeUI(speedMode)
+    autoFollowEnabled = false
+    if follow and MapManager:IsReady() then
+        setAutoFollow(true)
+        api.setFollowUI(true, true)
+    end
+end
+
+callbacks.onSelectFile = function(key)
+    local ok, err = SaveManager:SelectFile(key)
+    if not ok then return false, err end
+
+    local _, data = SaveManager:GetActiveFile()
+    if not data then return false, "Du lieu file khong ton tai." end
+
+    MapManager:LoadFromFile(data)
+    api.setSpawnLabel(MapManager:GetSpawn())
+    api.setDestinationLabel(MapManager:GetDestination())
+    api.updateCreateButton()
+    api.setRouteStatus(string.format("%d diem", #(MapManager:GetRoute() or {})))
+    applyFileSettings(data)
+    return true
+end
+
+callbacks.getFileList = function()
+    return SaveManager:GetFileList()
+end
+
+-- Restore most recent file.
+local activeKey, activeData = SaveManager:GetActiveFile()
+if activeData then
+    MapManager:LoadFromFile(activeData)
+    api.setSpawnLabel(MapManager:GetSpawn())
+    api.setDestinationLabel(MapManager:GetDestination())
+    api.setSelectedKey(activeKey)
+    api.setRouteStatus(string.format("%d diem", #(MapManager:GetRoute() or {})))
+    applyFileSettings(activeData)
+else
+    api.setStatus("Chua co file. CREATE FILE truoc, sau do SET SPAWN / DEST va RECORD ROUTE.", Color3.fromRGB(225, 172, 66))
+end
+
+api.setScannerInfo(MatchScanner:GetSnapshot())
+
+-- ============================================================
+-- AUTO FOLLOW MANUAL OVERRIDE
+-- ============================================================
+local heldMovementKeys = {}
+local gamepadMoving = false
+local externalMovementOverride = false
+local resumeToken = 0
+
+local movementKeyCodes = {
+    [Enum.KeyCode.W] = true,
+    [Enum.KeyCode.A] = true,
+    [Enum.KeyCode.S] = true,
+    [Enum.KeyCode.D] = true,
+    [Enum.KeyCode.Up] = true,
+    [Enum.KeyCode.Down] = true,
+    [Enum.KeyCode.Left] = true,
+    [Enum.KeyCode.Right] = true,
+}
+
+manualMovementActive = function()
+    return externalMovementOverride or gamepadMoving or next(heldMovementKeys) ~= nil
+end
+
+syncManualMovementPause = function()
+    resumeToken += 1
+    local token = resumeToken
+
+    if autoFollowEnabled and manualMovementActive() then
+        MovementController:SetPaused(true)
+        return
+    end
+
+    if autoFollowEnabled then
+        task.delay(0.01, function()
+            if token == resumeToken and autoFollowEnabled and not manualMovementActive() then
+                MovementController:SetPaused(false)
+                -- Khi resume, MovementController se bo goal cu va lay lai target hien tai.
+            end
+        end)
+    end
+end
+
+table.insert(runtimeConnections, UserInputService.InputBegan:Connect(function(input)
+    if movementKeyCodes[input.KeyCode] then
+        heldMovementKeys[input.KeyCode] = true
+        syncManualMovementPause()
+    end
+end))
+
+table.insert(runtimeConnections, UserInputService.InputEnded:Connect(function(input)
+    if movementKeyCodes[input.KeyCode] then
+        heldMovementKeys[input.KeyCode] = nil
+        syncManualMovementPause()
+    end
+end))
+
+table.insert(runtimeConnections, UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Gamepad1
+        and input.KeyCode == Enum.KeyCode.Thumbstick1 then
+        gamepadMoving = input.Position.Magnitude > 0.20
+        syncManualMovementPause()
+    end
+end))
+
+table.insert(runtimeConnections, movementOverrideEvent.Event:Connect(function(active)
+    externalMovementOverride = active == true
+    syncManualMovementPause()
+end))
+
+-- Bat nhay dich chuyen lon (teleport) tu script khac. Doi voi script MoveTo
+-- di chuyen muot, script do nen phat BindableEvent Begin/End o tren.
+local lastObservedPosition = nil
+local teleportResumeToken = 0
+
+-- ============================================================
+-- RUNTIME UPDATE LOOP (ENEMY CACHE, EVENT-DRIVEN UI SCANNER)
+-- ============================================================
+local heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
+    if destroyed then return end
+
+    local root = getHRP()
+    if root then
+        if autoFollowEnabled and lastObservedPosition and not manualMovementActive() then
+            local displacement = (root.Position - lastObservedPosition).Magnitude
+            local expectedMovement = CONFIG.BASE_WALK_SPEED * PlayerController:GetSpeed()
+                * math.max(deltaTime, 1 / 60) * 2.5 + 8
+            if displacement > expectedMovement then
+                teleportResumeToken += 1
+                local token = teleportResumeToken
+                MovementController:SetPaused(true)
+                task.delay(0.01, function()
+                    if token == teleportResumeToken and autoFollowEnabled and not manualMovementActive() then
+                        MovementController:SetPaused(false)
+                    end
+                end)
+            end
+        end
+        lastObservedPosition = root.Position
+    else
+        lastObservedPosition = nil
+    end
+
+    enemyElapsed += deltaTime
+    if enemyElapsed >= CONFIG.ENEMY_SCAN_INTERVAL then
+        enemyElapsed = 0
+        if autoFollowEnabled or PerformanceManager:IsEnabled("HideEnemyModels") or BossTracker.MaxHP ~= nil then
+            local enemies = EnemyDetector:ScanAll()
+            if BossTracker.MaxHP ~= nil then monitorBoss(enemies) end -- chi doc cache enemy hop le
+            if PerformanceManager:IsEnabled("HideEnemyModels") then
+                PerformanceManager:RefreshEnemyModels(enemies)
+            end
+            if autoFollowEnabled then
+                local destination = MapManager:GetDestination()
+                if destination then
+                    local target = TargetSelector:Select(enemies, MapManager:GetSpawn(), destination, MapManager:GetRoute())
+                    api.setTargetInfo(target, destination)
+                else
+                    TargetSelector:Clear()
+                    api.setTargetInfo(nil, nil)
+                end
+            else
+                api.setTargetInfo(nil, nil)
+            end
+        else
+            api.setTargetInfo(nil, nil)
+        end
+    end
+end)
+table.insert(runtimeConnections, heartbeatConnection)
+
+print("[DUY SYSTEM] V2.8 da khoi dong - Destination Idle Zone + Faster Return.")
+print("[DUY SYSTEM] Record route: bat dau tai Spawn, di theo tuyen, Stop gan Destination.")
+print("[DUY SYSTEM] External movement pause API: PlayerGui.DuySystemMovementOverride:Fire(true/false)")
 
