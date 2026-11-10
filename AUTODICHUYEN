@@ -1,1 +1,3297 @@
+-- ==========================================================
+-- SMART EVADE ENGINE V8.1 - CROWD STABILITY - DELTA ANDROID
+-- Giữ lõi Duy Target First + Spherecast + GUI + Enter x2
+-- Kế thừa V7.1 Smart Route, adaptive narrow passage, safe-zone priority, escape commitment.
+-- V8: thoát vùng cấm tức thời theo hợp vùng, né quái theo cả đoạn đường, chọn đường rộng,
+-- bám biên/tránh đường cụt, chống đứng im + chống lặp tuyến thất bại, cổng MoveTo duy nhất.
+-- V8.0 Deep Escape: không tạo vùng cấm lồng bên trong vùng đã nhớ; chống lao vào Enemy khi thoát;
+-- phát hiện kẹt nhanh hơn; lọc dự đoán Enemy đang bay/văng bất thường.
+-- JSON schema v3 được giữ nguyên; không reset hoặc xóa dữ liệu vùng cấm hiện có.
+-- Không có chức năng nhảy chống kẹt.
+-- ==========================================================
 
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService") -- Giữ service gốc của V5
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local DEST_MAX_HP = 250 -- Bỏ qua HP nhà chính
+
+local AppState = {
+    IsActive = false,
+    ScanRadius = 60,
+    FleeDistance = 20,
+    InForbiddenZone = false,
+    ManualOverride = false, -- V8: true khi người chơi đang kéo joystick/bấm phím di chuyển
+    UrgentThreat = false,   -- V8: quái đang áp sát -> vòng lặp chạy nhanh hơn
+}
+
+-- Cấu hình dò vật cản và ghi nhớ đường thất bại
+local OBSTACLE_CONFIG = {
+    MainLoopInterval = 0.08,   -- Radar + kiểm tra trạng thái khoảng 12.5 lần/giây
+    TriggerDistance = 7,       -- Gặp vật cản trong 7 studs thì quét rộng
+    ScanRadius = 100,          -- Tầm quét hành lang
+    ScanDirections = 36,       -- 360 độ / 36 hướng
+    CharacterRadius = 1.8,     -- Bán kính Spherecast thông thường
+    CorridorRadius = 3.2,      -- Ưu tiên hành lang rộng, tránh khe vừa khít
+    CorridorHalfWidth = 8,     -- Bề rộng vùng kiểm tra quái trên hành lang
+    MemoryZoneRadius = 10,     -- Mỗi vị trí bị chặn tạo một vùng cấm bán kính 10 studs
+    ProgressCheckInterval = 0.12, -- Phát hiện thiếu tiến triển nhanh hơn
+    MinProgress = 0.65,        -- Dưới 0.65 studs/chu kỳ: nghi bị chặn
+    PlanCooldown = 0.03,       -- Chờ rất ngắn trước khi lập chặng mới
+    MinMoveTimeout = 1.0,      -- Timeout tối thiểu cho mỗi chặng
+    MaxPlanStartDrift = 2.5,   -- Bỏ kết quả lập đường nếu nhân vật đã đi lệch quá xa
+    MaxReactiveStep = 12,      -- Đi từng chặng ngắn rồi quét lại (V8: 8 -> 12, kèm lập đường gối đầu)
+    EnemyVelocityLimit = 12,   -- Giới hạn vận tốc ngang dự đoán, lọc cú văng/lag vật lý
+    EnemyGroundCheckDistance = 8, -- Tầm kiểm tra mặt đất cho Enemy không có Humanoid
+    EnemyGroundCheckInterval = 0.20, -- Cache raycast mặt đất để không quét lại mỗi frame
+    EnemyAirborneVerticalLimit = 6, -- Vận tốc dọc vượt mức này: không tin dự đoán khi đang bay
+    PredictionHorizon = 0.9,   -- Dự đoán quái trong tối đa 0.9 giây
+    EscapeLockSeconds = 1.8,   -- V8.1: giữ hướng lâu hơn để tránh đổi trái/phải liên tục
+    ReversePenalty = 260,      -- V8.1: phạt mạnh hơn khi đảo chiều đột ngột
+    HeadingBonus = 70,         -- V8.1: ưu tiên tiếp tục tuyến đang có nếu vẫn an toàn
+    EmergencyEnemyDistance = 5.5, -- Chỉ hủy tuyến khi quái thực sự áp sát
+    EmergencyLaneDistance = 2.6,  -- Bề rộng hành lang nguy hiểm tức thời
+    FineScanOffsets = { -7.5, -5, -2.5, 2.5, 5, 7.5 },
+    NarrowEnemyBuffer = 12,    -- Vùng đệm lớn quanh quái
+    NarrowEnemyHardReject = 155, -- Loại tuyến quá sát quái
+    PreferredCorridorRadius = 3.2, -- Ưu tiên lối đủ rộng thay vì khe vừa khít
+    ForbiddenZoneReplanDelay = 0.10, -- Nhịp thử lập lại nhanh khi không có tuyến thoát đang hoạt động
+    EnemyRouteHardReject = 11, -- Không chọn tuyến có điểm dự đoán quá gần quái
+    EnemyRouteCautionDistance = 17, -- Bắt đầu phạt mạnh tuyến nằm trong vùng cảnh báo
+    EnemyRouteSampleSpacing = 3, -- Lấy mẫu dày trên toàn bộ từng đoạn đường
+    EnemyPredictionSpeed = 12, -- Tốc độ giả định của nhân vật khi dự đoán thời điểm gặp quái
+    EnemyRoutePenaltyWeight = 95, -- Ưu tiên né quái hơn rút ngắn đường
+    EmergencyCrowdDistance = 16, -- Kích hoạt thoát tức thời khi quái áp sát
+    EmergencyCrowdCount = 3, -- Hoặc có ít nhất 3 quái trong vùng gần
+    EmergencyStepDistance = 16, -- Bước thoát hiểm nhanh, không chờ Pathfinding
+    EmergencyRefresh = 0.10, -- Làm mới hướng thoát nhanh khi bị truy đuổi
+    EmergencyObstacleBuffer = 2.5, -- Chừa khoảng cách vật cản cho bước khẩn cấp
+    ForbiddenZoneEscapeStep = 96, -- V8: bước thoát vùng cấm gấp đôi (48 -> 96 studs)
+    ForbiddenZoneEmergencyStep = 72, -- V8: bước thoát khẩn cấp trong vùng cấm gấp đôi (36 -> 72 studs)
+    ForbiddenZoneLoopInterval = 0.02, -- Tăng tốc vòng xử lý khi đang ở vùng cấm
+    ForbiddenZonePlanCooldown = 0, -- Không chờ cooldown khi đang thoát vùng cấm
+    ForbiddenZonePathRefresh = 0.10, -- Làm mới Pathfinding nhanh hơn khi ở vùng cấm
+    ForbiddenZoneWalkSpeed = 40, -- Tăng tốc thoát vùng cấm; tự khôi phục khi ra ngoài
+    ManualTouchDeadzone = 0.14, -- Ngưỡng nhận biết joystick cảm ứng
+    -- ===== UPGRADE V8 (khóa mới, không trùng khóa cũ) =====
+    ZoneEscapeDistanceMultiplier = 2, -- Nhân đôi khoảng cách thoát vùng cấm so với V7.1
+    ZoneEscapeTopCandidates = 6,      -- Số hướng được kiểm tra vật lý trong thoát tức thời
+    ZoneLookahead = 30,               -- Chỉ kiểm tra vùng cấm trong 30 studs phía trước (trước đây 100)
+    ZoneDedupeRadius = 4,             -- Không chồng thêm vùng cấm vĩnh viễn trong 4 studs quanh tâm vùng cũ
+    ZoneEscapeReissueInterval = 0.05, -- Thử lại thoát tức thời nhanh khi chưa có hướng
+    ZoneEscapeEmergencyEnemyFloor = 6.5, -- Fallback tuyệt đối không chọn tuyến gần Enemy hơn mức này
+    UrgentLoopInterval = 0.04,        -- Vòng lặp khi quái áp sát
+    PredictiveContactTime = 1.4,      -- Quái sẽ chạm trong <= 1.4 giây -> thoát hiểm sớm
+    PredictiveApproachDistance = 15,  -- Quái đang lao tới trong 15 studs -> thoát hiểm sớm
+    FailedRouteTTL = 6,               -- Nhớ tuyến thất bại trong phiên 6 giây
+    FailedRouteRadius = 9,            -- Chỉ phạt khi đang ở gần nơi từng thất bại
+    FailedRouteCosine = 0.82,         -- Hướng lệch dưới ~35 độ xem là cùng tuyến
+    PathfindingBudget = 0.5,          -- Ngân sách thời gian cho các lần ComputeAsync (giây)
+    PathfindingMaxCandidates = 7,     -- Giới hạn số đích Pathfinding (trước đây tới 11)
+    PathLookahead = 22,               -- Đi theo waypoint xa nhất nhìn thấy được trong 22 studs
+    OpennessProbeDistance = 14,       -- Dò độ thoáng quanh đích để tránh góc kín/đường cụt
+    SideProbeDistance = 9,            -- Dò khoảng trống hai bên lối đi
+    MinSideClearance = 2.2,           -- Dưới mức này coi là sát tường/hành lang hẹp
+    ManualDeadzoneRelease = 0.07,     -- Ngưỡng nhả joystick (trễ so với ngưỡng bấm)
+    ManualReleaseGrace = 0.12,        -- Chờ 0.12s sau khi thả để tránh chập chờn
+}
+
+-- Tính sẵn vector hướng để không tạo lại sin/cos trong mỗi lần quét.
+local DIRECTIONS_16 = {}
+for i = 1, 16 do
+    local angle = (i / 16) * math.pi * 2
+    DIRECTIONS_16[i] = Vector3.new(math.cos(angle), 0, math.sin(angle))
+end
+
+local DIRECTIONS_36 = {}
+for i = 1, OBSTACLE_CONFIG.ScanDirections do
+    local angle = ((i - 1) / OBSTACLE_CONFIG.ScanDirections) * math.pi * 2
+    DIRECTIONS_36[i] = Vector3.new(math.cos(angle), 0, math.sin(angle))
+end
+
+-- V8: 24 hướng cho bộ chọn thoát hiểm tức thời.
+local DIRECTIONS_24 = {}
+for i = 1, 24 do
+    local angle = ((i - 1) / 24) * math.pi * 2
+    DIRECTIONS_24[i] = Vector3.new(math.cos(angle), 0, math.sin(angle))
+end
+
+if _G.EvadeConnections then
+    for _, c in pairs(_G.EvadeConnections) do
+        pcall(function() c:Disconnect() end)
+    end
+end
+_G.EvadeConnections = {}
+local function addConn(c)
+    table.insert(_G.EvadeConnections, c)
+end
+
+-- ==========================================
+-- 1. LÕI NHẬN DIỆN QUÁI TỪ "DUY TARGET FIRST"
+-- ==========================================
+local EnemyDetector = {}
+do
+    local tracked = {}
+    local records = {}
+
+    local function stripRichText(text)
+        return tostring(text or ""):gsub("<[^>]+>", "")
+    end
+
+    local function parseHP(text)
+        local clean = stripRichText(text)
+        local current, maximum = clean:match("(%d+)%s*/%s*(%d+)")
+        current, maximum = tonumber(current), tonumber(maximum)
+        if not current or not maximum then return false end
+        if current <= 0 or maximum <= 0 then return false end
+        if maximum == DEST_MAX_HP then return false end
+        return true, current, maximum
+    end
+
+    local function firstPartInModel(model)
+        local root = model:FindFirstChild("HumanoidRootPart")
+        if root and root:IsA("BasePart") then return root end
+        if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+            return model.PrimaryPart
+        end
+        return model:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local function getPositionPart(billboard)
+        local adornee = billboard.Adornee
+        if adornee then
+            if adornee:IsA("BasePart") then return adornee end
+            if adornee:IsA("Attachment") and adornee.Parent and adornee.Parent:IsA("BasePart") then
+                return adornee.Parent
+            end
+        end
+
+        local node = billboard.Parent
+        while node and node ~= workspace do
+            if node:IsA("BasePart") then return node end
+            if node:IsA("Model") then
+                local part = firstPartInModel(node)
+                if part then return part end
+            end
+            node = node.Parent
+        end
+        return nil
+    end
+
+    local function refreshBillboard(billboard)
+        local info = tracked[billboard]
+        if not info or not billboard.Parent or not billboard.Enabled then
+            records[billboard] = nil
+            return
+        end
+
+        local currentHP, maxHP
+        for label in pairs(info.labels) do
+            if label and label.Parent then
+                local valid, current, maximum = parseHP(label.Text)
+                if valid then
+                    currentHP, maxHP = current, maximum
+                    break
+                end
+            end
+        end
+
+        if not currentHP then
+            records[billboard] = nil
+            return
+        end
+
+        local part = getPositionPart(billboard)
+        if not part or not part.Parent then
+            records[billboard] = nil
+            return
+        end
+
+        records[billboard] = {
+            Billboard = billboard,
+            Part = part,
+            Position = part.Position,
+            CurrentHP = currentHP,
+            MaxHP = maxHP,
+        }
+    end
+
+    local function addLabel(billboard, label)
+        if not label:IsA("TextLabel") and not label:IsA("TextButton") then return end
+        local info = tracked[billboard]
+        if not info or info.labels[label] then return end
+
+        info.labels[label] = true
+        table.insert(info.connections, label:GetPropertyChangedSignal("Text"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+        refreshBillboard(billboard)
+    end
+
+    local function register(billboard)
+        if not billboard:IsA("BillboardGui") or tracked[billboard] then return end
+
+        local info = { labels = {}, connections = {} }
+        tracked[billboard] = info
+
+        for _, child in ipairs(billboard:GetDescendants()) do
+            addLabel(billboard, child)
+        end
+
+        table.insert(info.connections, billboard.DescendantAdded:Connect(function(child)
+            addLabel(billboard, child)
+        end))
+
+        table.insert(info.connections, billboard.DescendantRemoving:Connect(function(child)
+            if info.labels[child] then
+                info.labels[child] = nil
+                refreshBillboard(billboard)
+            end
+        end))
+
+        table.insert(info.connections, billboard:GetPropertyChangedSignal("Adornee"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+
+        table.insert(info.connections, billboard:GetPropertyChangedSignal("Enabled"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+
+        refreshBillboard(billboard)
+    end
+
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        if instance:IsA("BillboardGui") then
+            register(instance)
+        end
+    end
+
+    addConn(workspace.DescendantAdded:Connect(function(instance)
+        if instance:IsA("BillboardGui") then
+            register(instance)
+        end
+    end))
+
+    function EnemyDetector:ScanAll()
+        local results = {}
+        for billboard, record in pairs(records) do
+            if billboard and billboard.Parent and record.Part and record.Part.Parent then
+                record.Position = record.Part.Position
+                table.insert(results, record)
+            else
+                records[billboard] = nil
+            end
+        end
+        return results
+    end
+end
+
+-- ==========================================
+-- 2. OBSTACLE RADAR + OBSTACLE MEMORY
+-- ==========================================
+local ObstacleMemory = {}
+local MemoryTxt = nil
+local loadedObstacleCount = 0
+
+local function updateMemoryLabel()
+    if MemoryTxt then
+        local total = #ObstacleMemory
+        local added = math.max(0, total - loadedObstacleCount)
+        MemoryTxt.Text = string.format("Vùng cấm: %d | Từ JSON: %d | Mới: %d", total, loadedObstacleCount, added)
+    end
+end
+
+-- ==========================================
+-- DELTA ANDROID PERSISTENT OBSTACLE MEMORY
+-- Lưu vĩnh viễn theo PlaceId + MapName (nếu map cung cấp attribute).
+-- Vùng cấm không tự hết hạn và không tự xóa bản ghi theo thời gian.
+-- ==========================================
+local MEMORY_FOLDER = "SmartEvadeData"
+
+local function sanitizeFilePart(value)
+    local text = tostring(value or "default")
+    text = text:gsub("[^%w_%-]", "_")
+    text = text:sub(1, 40)
+    if text == "" then text = "default" end
+    return text
+end
+
+local mapName = "default"
+pcall(function()
+    mapName = workspace:GetAttribute("MapName")
+        or workspace:GetAttribute("CurrentMap")
+        or workspace:GetAttribute("MapId")
+        or "default"
+end)
+
+local MEMORY_FILE = string.format(
+    "%s/obstacle_memory_%s_%s.json",
+    MEMORY_FOLDER,
+    tostring(game.PlaceId),
+    sanitizeFilePart(mapName)
+)
+
+local function getExecutorEnvironment()
+    if type(getgenv) == "function" then
+        local ok, env = pcall(getgenv)
+        if ok and type(env) == "table" then
+            return env
+        end
+    end
+    return _G
+end
+
+local ExecutorEnv = getExecutorEnvironment()
+
+local function getFileApi(name)
+    local api = ExecutorEnv and ExecutorEnv[name]
+    if type(api) ~= "function" then
+        api = _G and _G[name]
+    end
+    if type(api) == "function" then
+        return api
+    end
+    return nil
+end
+
+local executorReadFile = getFileApi("readfile")
+local executorWriteFile = getFileApi("writefile")
+local executorMakeFolder = getFileApi("makefolder")
+local executorIsFolder = getFileApi("isfolder")
+local executorIsFile = getFileApi("isfile")
+
+local memoryStorageAvailable = type(executorReadFile) == "function"
+    and type(executorWriteFile) == "function"
+    and type(executorMakeFolder) == "function"
+
+local memorySaveQueued = false
+
+local function ensureMemoryFolder()
+    if not memoryStorageAvailable then
+        return false
+    end
+
+    local exists = false
+    if executorIsFolder then
+        local ok, result = pcall(executorIsFolder, MEMORY_FOLDER)
+        exists = ok and result == true
+    end
+
+    if not exists then
+        -- Delta có thể báo lỗi nếu folder đã tồn tại; pcall xử lý an toàn.
+        pcall(executorMakeFolder, MEMORY_FOLDER)
+    end
+
+    if executorIsFolder then
+        local ok, result = pcall(executorIsFolder, MEMORY_FOLDER)
+        if ok then
+            return result == true
+        end
+    end
+
+    -- Một số phiên bản Delta không trả trạng thái nhất quán từ isfolder.
+    return true
+end
+
+local function flatUnit(vector)
+    local flat = Vector3.new(vector.X, 0, vector.Z)
+    if flat.Magnitude <= 0.001 then
+        return Vector3.new(1, 0, 0)
+    end
+    return flat.Unit
+end
+
+-- Escape Commitment: ghi nhớ hướng chạy đã chọn để tránh quay đầu vì quái thoáng qua.
+local escapeHeading = nil
+local escapeHeadingUntil = 0
+
+local function getHeadingBias(direction, now)
+    if not escapeHeading or now > escapeHeadingUntil then return 0 end
+    local alignment = flatUnit(direction):Dot(flatUnit(escapeHeading))
+    if alignment < -0.25 then
+        return -OBSTACLE_CONFIG.ReversePenalty
+    elseif alignment > 0.55 then
+        return OBSTACLE_CONFIG.HeadingBonus * alignment
+    end
+    return 0
+end
+
+
+local function loadObstacleMemory()
+    if not ensureMemoryFolder() then
+        warn("[SMART EVADE] Delta filesystem chưa sẵn sàng; bộ nhớ chỉ tồn tại trong phiên này.")
+        return 0
+    end
+
+    if executorIsFile then
+        local ok, exists = pcall(executorIsFile, MEMORY_FILE)
+        if ok and not exists then
+            return 0
+        end
+    end
+
+    local okRead, raw = pcall(executorReadFile, MEMORY_FILE)
+    if not okRead or type(raw) ~= "string" or raw == "" then
+        return 0
+    end
+
+    local okDecode, data = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+
+    if not okDecode or type(data) ~= "table" or type(data.entries) ~= "table" then
+        warn("[SMART EVADE] JSON cũ/không hợp lệ; khởi tạo bộ nhớ mới.")
+        return 0
+    end
+
+    -- Schema 2 dùng bán kính cũ; không nạp bất kỳ vùng cấm cũ nào.
+    if tonumber(data.version) ~= 3 then
+        warn("[SMART EVADE] Đã phát hiện JSON cũ; bỏ toàn bộ dữ liệu vùng cấm để reset bộ nhớ.")
+        return 0
+    end
+
+    if tonumber(data.placeId) ~= tonumber(game.PlaceId) then
+        warn("[SMART EVADE] PlaceId không khớp; bỏ qua file bộ nhớ này.")
+        return 0
+    end
+
+    local loaded = 0
+    for _, entry in ipairs(data.entries) do
+        if type(entry) == "table" then
+            local x = tonumber(entry.x)
+            local y = tonumber(entry.y)
+            local z = tonumber(entry.z)
+            local radius = tonumber(entry.radius) or OBSTACLE_CONFIG.MemoryZoneRadius
+
+            local validNumbers = x and y and z
+                and x == x and y == y and z == z
+                and math.abs(x) < 1000000
+                and math.abs(y) < 1000000
+                and math.abs(z) < 1000000
+                and radius > 0 and radius <= 100
+
+            if validNumbers then
+                table.insert(ObstacleMemory, {
+                    Position = Vector3.new(x, y, z),
+                    Radius = radius,
+                    Reason = tostring(entry.reason or "Vùng từng bị chặn"),
+                })
+                loaded += 1
+            end
+        end
+    end
+
+    return loaded
+end
+
+local function saveObstacleMemoryNow()
+    if not memoryStorageAvailable then
+        return false
+    end
+
+    if not ensureMemoryFolder() then
+        warn("[SMART EVADE] Không thể tạo thư mục lưu bộ nhớ vật cản.")
+        return false
+    end
+
+    local entries = {}
+    for _, item in ipairs(ObstacleMemory) do
+        table.insert(entries, {
+            x = item.Position.X,
+            y = item.Position.Y,
+            z = item.Position.Z,
+            radius = item.Radius or OBSTACLE_CONFIG.MemoryZoneRadius,
+            reason = tostring(item.Reason or "Vùng từng bị chặn"),
+        })
+    end
+
+    local encodedOk, encoded = pcall(function()
+        return HttpService:JSONEncode({
+            version = 3,
+            placeId = tostring(game.PlaceId),
+            mapName = tostring(mapName),
+            entries = entries,
+        })
+    end)
+
+    if not encodedOk then
+        warn("[SMART EVADE] Không mã hóa được bộ nhớ vật cản:", encoded)
+        return false
+    end
+
+    local writeOk, writeError = pcall(executorWriteFile, MEMORY_FILE, encoded)
+    if not writeOk then
+        warn("[SMART EVADE] Ghi bộ nhớ vật cản thất bại:", writeError)
+        return false
+    end
+
+    return true
+end
+
+-- Gom các lần phát hiện sát nhau thành một lần ghi để tránh spam filesystem.
+local function queueObstacleMemorySave()
+    if not memoryStorageAvailable or memorySaveQueued then
+        return
+    end
+
+    memorySaveQueued = true
+    task.delay(0.4, function()
+        memorySaveQueued = false
+        saveObstacleMemoryNow()
+    end)
+end
+
+loadedObstacleCount = loadObstacleMemory()
+updateMemoryLabel()
+print(string.format(
+    "[SMART EVADE] Persistent obstacle memory: loaded %d records | %s",
+    loadedObstacleCount,
+    MEMORY_FILE
+))
+
+-- Nếu file cũ không có schema v3, ghi đè bằng JSON rỗng.
+-- Các lần chạy sau sẽ nạp dữ liệu v3 bình thường, không reset lặp lại.
+if memoryStorageAvailable and loadedObstacleCount == 0 then
+    saveObstacleMemoryNow()
+end
+
+
+local function getEnemyModel(part)
+    local node = part
+    while node and node ~= workspace do
+        if node:IsA("Model") then
+            return node
+        end
+        node = node.Parent
+    end
+    return nil
+end
+
+local function createObstacleRayParams(character, enemies)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+    params.RespectCanCollide = true
+
+    local filter = {}
+    if character then
+        table.insert(filter, character)
+    end
+
+    -- Không xem thân quái là tường; quái được đánh giá riêng bằng EnemyDetector.
+    local addedModels = {}
+    for _, enemy in ipairs(enemies or {}) do
+        local model = enemy.Part and getEnemyModel(enemy.Part)
+        if model and model ~= character and not addedModels[model] then
+            addedModels[model] = true
+            table.insert(filter, model)
+        end
+    end
+
+    params.FilterDescendantsInstances = filter
+    return params
+end
+
+-- Bộ nhớ vùng cấm là vĩnh viễn: không tự hết hạn và không gộp vùng.
+local function cleanObstacleMemory()
+    -- Cố ý để trống để giữ nguyên các lời gọi ở phần thuật toán bên dưới.
+end
+
+local function getContainingObstacleZone(position)
+    for _, zone in ipairs(ObstacleMemory) do
+        local dx = position.X - zone.Position.X
+        local dz = position.Z - zone.Position.Z
+        local radius = zone.Radius or OBSTACLE_CONFIG.MemoryZoneRadius
+        if (dx * dx + dz * dz) <= (radius * radius) then
+            return zone
+        end
+    end
+    return nil
+end
+
+-- Kiểm tra đoạn di chuyển có cắt qua vùng cấm hay không.
+-- Nếu đang ở trong vùng, chỉ cho phép đi theo hướng ra ngoài vùng đó.
+local function isDirectionRemembered(position, direction, checkDistanceOverride)
+    local dir = flatUnit(direction)
+    local checkDistance = checkDistanceOverride or OBSTACLE_CONFIG.ScanRadius
+    local finish = position + dir * checkDistance
+    local segment = Vector3.new(finish.X - position.X, 0, finish.Z - position.Z)
+    local lengthSquared = segment:Dot(segment)
+
+    for _, zone in ipairs(ObstacleMemory) do
+        local center = zone.Position
+        local radius = zone.Radius or OBSTACLE_CONFIG.MemoryZoneRadius
+        local startDX = position.X - center.X
+        local startDZ = position.Z - center.Z
+        local startInside = (startDX * startDX + startDZ * startDZ) <= (radius * radius)
+
+        if startInside then
+            -- Đang ở trong vùng: chỉ chặn hướng không đưa nhân vật ra xa tâm vùng.
+            local outward = Vector3.new(startDX, 0, startDZ)
+            if outward.Magnitude > 0.001 and dir:Dot(outward.Unit) <= 0.05 then
+                return true
+            end
+        else
+            -- Ở ngoài vùng: không chọn đường đi cắt qua vùng cấm.
+            local offset = Vector3.new(center.X - position.X, 0, center.Z - position.Z)
+            local t = 0
+
+            if lengthSquared > 0.001 then
+                t = math.clamp(offset:Dot(segment) / lengthSquared, 0, 1)
+            end
+
+            local closestX = position.X + segment.X * t
+            local closestZ = position.Z + segment.Z * t
+            local dx = closestX - center.X
+            local dz = closestZ - center.Z
+
+            if (dx * dx + dz * dz) <= (radius * radius) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function rememberBlockedDirection(position, direction, reason)
+    -- Mỗi lần xác nhận bị chặn tạo đúng một vùng mới; không dò trùng, không gộp.
+    table.insert(ObstacleMemory, {
+        Position = position,
+        Radius = OBSTACLE_CONFIG.MemoryZoneRadius,
+        Reason = reason or "Vị trí bị chặn",
+    })
+
+    updateMemoryLabel()
+    queueObstacleMemorySave()
+    print(string.format(
+        "[SMART EVADE] Đã tạo vùng cấm #%d | tâm %.1f, %.1f, %.1f | bán kính %.1f studs",
+        #ObstacleMemory,
+        position.X,
+        position.Y,
+        position.Z,
+        OBSTACLE_CONFIG.MemoryZoneRadius
+    ))
+    return true
+end
+
+local function getEnemyDangerScore(targetPosition, enemies)
+    local totalDanger = 0
+    for _, enemy in ipairs(enemies) do
+        local dx = targetPosition.X - enemy.Position.X
+        local dz = targetPosition.Z - enemy.Position.Z
+        local distance = math.sqrt(dx * dx + dz * dz)
+        totalDanger = totalDanger + (1 / math.max(distance, 1))
+    end
+    return totalDanger
+end
+
+-- Đánh giá cả đoạn đường dựa trên vị trí dự đoán của quái.
+-- Vận tốc được lấy từ các lần radar liên tiếp và giới hạn để tránh nhiễu.
+local function getPredictedRouteDanger(startPosition, direction, stepDistance, enemies)
+    local dir = flatUnit(direction)
+    local duration = math.clamp(stepDistance / 12, 0.2, OBSTACLE_CONFIG.PredictionHorizon)
+    local danger = 0
+
+    for sample = 1, 4 do
+        local alpha = sample / 4
+        local t = duration * alpha
+        local routePoint = startPosition + dir * (stepDistance * alpha)
+
+        for _, enemy in ipairs(enemies) do
+            local velocity = enemy.Velocity or Vector3.zero
+            local speed = velocity.Magnitude
+            if speed > OBSTACLE_CONFIG.EnemyVelocityLimit then
+                velocity = velocity.Unit * OBSTACLE_CONFIG.EnemyVelocityLimit
+            end
+
+            local predicted = enemy.Position + velocity * t
+            local dx = routePoint.X - predicted.X
+            local dz = routePoint.Z - predicted.Z
+            local distance = math.sqrt(dx * dx + dz * dz)
+            local safeDistance = 7
+            if distance < safeDistance then
+                danger = danger + ((safeDistance - distance) / safeDistance) * (1.5 - alpha * 0.35)
+            end
+        end
+    end
+
+    return danger
+end
+
+-- Đánh giá nguy hiểm trên TOÀN BỘ đoạn đường, không chỉ điểm đến.
+-- Mỗi điểm lấy mẫu được so với vị trí quái dự đoán tại đúng thời điểm nhân vật đi tới đó.
+local function assessEnemyRiskOnSegment(startPosition, endPosition, enemies, elapsedBeforeSegment)
+    local offset = endPosition - startPosition
+    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
+    local distance = flatOffset.Magnitude
+    if distance < 0.1 then return 0, math.huge, false end
+
+    local direction = flatOffset.Unit
+    local samples = math.max(2, math.ceil(distance / OBSTACLE_CONFIG.EnemyRouteSampleSpacing))
+    local minDistance = math.huge
+    local penalty = 0
+
+    for sample = 1, samples do
+        local alpha = sample / samples
+        local routePoint = startPosition + flatOffset * alpha
+        local travelTime = (elapsedBeforeSegment + distance * alpha / OBSTACLE_CONFIG.EnemyPredictionSpeed)
+        for _, enemy in ipairs(enemies or {}) do
+            local velocity = enemy.Velocity or Vector3.zero
+            local speed = velocity.Magnitude
+            if speed > OBSTACLE_CONFIG.EnemyVelocityLimit then
+                velocity = velocity.Unit * OBSTACLE_CONFIG.EnemyVelocityLimit
+            end
+            local predicted = enemy.Position + velocity * math.min(travelTime, OBSTACLE_CONFIG.PredictionHorizon)
+            local dx = routePoint.X - predicted.X
+            local dz = routePoint.Z - predicted.Z
+            local separation = math.sqrt(dx * dx + dz * dz)
+            minDistance = math.min(minDistance, separation)
+
+            if separation < OBSTACLE_CONFIG.EnemyRouteCautionDistance then
+                local factor = (OBSTACLE_CONFIG.EnemyRouteCautionDistance - separation)
+                    / OBSTACLE_CONFIG.EnemyRouteCautionDistance
+                penalty = penalty + factor * factor * 18
+            end
+        end
+    end
+
+    return penalty, minDistance, minDistance < OBSTACLE_CONFIG.EnemyRouteHardReject
+end
+
+local function castObstacle(position, direction, distance, radius, rayParams)
+    local origin = position + Vector3.new(0, 1.2, 0)
+    local castDirection = flatUnit(direction) * distance
+
+    local ok, result = pcall(function()
+        return workspace:Spherecast(origin, radius, castDirection, rayParams)
+    end)
+
+    if not ok then
+        warn("[SMART EVADE] Spherecast error:", result)
+        return nil
+    end
+
+    return result
+end
+
+local function getLaneEnemyPenalty(startPosition, direction, clearDistance, enemies)
+    local penalty = 0
+    local dir = flatUnit(direction)
+
+    for _, enemy in ipairs(enemies) do
+        local offset = enemy.Position - startPosition
+        local forwardDistance = offset:Dot(dir)
+
+        if forwardDistance > 0 and forwardDistance <= clearDistance then
+            local lateralDistance = math.abs(offset.X * dir.Z - offset.Z * dir.X)
+
+            if lateralDistance < OBSTACLE_CONFIG.CorridorHalfWidth then
+                local centeredFactor = 1 - (lateralDistance / OBSTACLE_CONFIG.CorridorHalfWidth)
+                local nearFactor = 1 - (math.min(forwardDistance, 100) / 160)
+                penalty = penalty + 150 * centeredFactor * nearFactor
+            end
+        end
+    end
+
+    return penalty
+end
+
+-- Phạt riêng đường đi sát quái, kể cả khi quái không nằm chính giữa hành lang.
+-- Mục tiêu là tránh chọn khe giữa hai quái chỉ vì Spherecast thấy vừa lọt.
+local function getEnemyProximityPenalty(startPosition, direction, stepDistance, enemies)
+    local penalty = 0
+    local dir = flatUnit(direction)
+    local buffer = OBSTACLE_CONFIG.NarrowEnemyBuffer
+
+    for _, enemy in ipairs(enemies) do
+        local offset = enemy.Position - startPosition
+        local forwardDistance = offset:Dot(dir)
+        local lateralDistance = math.abs(offset.X * dir.Z - offset.Z * dir.X)
+
+        if forwardDistance > -2 and forwardDistance < stepDistance + buffer then
+            local distanceToRoute = math.sqrt(
+                lateralDistance * lateralDistance
+                + math.max(0, -forwardDistance) * math.max(0, -forwardDistance)
+                + math.max(0, forwardDistance - stepDistance) * math.max(0, forwardDistance - stepDistance)
+            )
+
+            if distanceToRoute < buffer then
+                local proximity = 1 - (distanceToRoute / buffer)
+                local frontWeight = forwardDistance >= 0 and 1 or 0.65
+                penalty = penalty + 260 * proximity * frontWeight
+            end
+        end
+    end
+
+    return penalty
+end
+
+local function getRouteClearanceBonus(clearDistance)
+    -- Đường rộng được thưởng nhẹ; không để khoảng trống dài lấn át độ an toàn.
+    return math.clamp(clearDistance - 5, 0, 30) * 0.45
+end
+
+-- ==========================================================
+-- UPGRADE V8 (A) - HÌNH HỌC VÙNG CẤM / BỘ NHỚ TUYẾN THẤT BẠI /
+-- ĐỘ RỘNG LỐI ĐI / PHÂN TÍCH VÒNG VÂY CỦA ĐÀN QUÁI
+-- Chỉ THÊM hàm mới; không xóa hay thay thế hàm cũ nào ở khối này.
+-- ==========================================================
+local ADAPTIVE_RADII = {
+    OBSTACLE_CONFIG.CorridorRadius,
+    2.4,
+    OBSTACLE_CONFIG.CharacterRadius,
+}
+local ADAPTIVE_ENOUGH_CLEAR = 8
+-- Thứ tự thử góc cho các đích Pathfinding quanh vùng cấm: hướng ra ngoài trước, luân phiên hai bên.
+local RING_ORDER = {
+    0, math.rad(45), -math.rad(45), math.rad(90),
+    -math.rad(90), math.rad(135), -math.rad(135), math.pi,
+}
+
+-- Bộ nhớ tuyến thất bại CHỈ tồn tại trong phiên (không ghi JSON), tự hết hạn.
+local FailedRoutes = {}
+
+local function recordFailedRoute(position, direction)
+    table.insert(FailedRoutes, {
+        Position = position,
+        Direction = flatUnit(direction),
+        Expires = tick() + OBSTACLE_CONFIG.FailedRouteTTL,
+    })
+    while #FailedRoutes > 24 do
+        table.remove(FailedRoutes, 1)
+    end
+end
+
+-- Trả về mức phạt (>= 0) nếu hướng này gần giống một tuyến vừa thất bại ở gần đây.
+local function getFailedRoutePenalty(position, direction, now)
+    local penalty = 0
+    local dir = flatUnit(direction)
+    local radius = OBSTACLE_CONFIG.FailedRouteRadius
+    local index = 1
+    while index <= #FailedRoutes do
+        local item = FailedRoutes[index]
+        if now > item.Expires then
+            table.remove(FailedRoutes, index)
+        else
+            local dx = position.X - item.Position.X
+            local dz = position.Z - item.Position.Z
+            if dx * dx + dz * dz <= radius * radius then
+                local alignment = dir:Dot(item.Direction)
+                if alignment > OBSTACLE_CONFIG.FailedRouteCosine then
+                    penalty = penalty + 220 * alignment
+                end
+            end
+            index += 1
+        end
+    end
+    return penalty
+end
+
+local function isNearExistingZoneCenter(position, range)
+    for _, zone in ipairs(ObstacleMemory) do
+        local dx = position.X - zone.Position.X
+        local dz = position.Z - zone.Position.Z
+        if dx * dx + dz * dz <= range * range then
+            return true
+        end
+    end
+    return false
+end
+
+-- Bản an toàn của rememberBlockedDirection: luôn ghi nhớ tuyến thất bại (tạm thời),
+-- nhưng không chồng thêm vùng cấm vĩnh viễn lên đúng chỗ đã có vùng cấm.
+local function rememberBlockedDirectionSafe(position, direction, reason)
+    -- Ở bên trong vùng đã nhớ là lỗi tuyến/thoát vùng, không phải vật cản mới.
+    -- Chỉ ghi tuyến thất bại tạm thời; tuyệt đối không sinh vùng cấm lồng bên trong.
+    recordFailedRoute(position, direction)
+    if getContainingObstacleZone(position) then
+        return false
+    end
+    if isNearExistingZoneCenter(position, OBSTACLE_CONFIG.ZoneDedupeRadius) then
+        return false
+    end
+    return rememberBlockedDirection(position, direction, reason)
+end
+
+-- Lọc trước các vùng cấm ở gần để các phép tính lặp không phải duyệt toàn bộ bộ nhớ.
+local function getNearbyZones(position, range)
+    local list = {}
+    for _, zone in ipairs(ObstacleMemory) do
+        local radius = zone.Radius or OBSTACLE_CONFIG.MemoryZoneRadius
+        local reach = range + radius
+        local dx = position.X - zone.Position.X
+        local dz = position.Z - zone.Position.Z
+        if dx * dx + dz * dz <= reach * reach then
+            table.insert(list, zone)
+        end
+    end
+    return list
+end
+
+local function findZoneIn(zones, x, z)
+    for _, zone in ipairs(zones) do
+        local radius = zone.Radius or OBSTACLE_CONFIG.MemoryZoneRadius
+        local dx = x - zone.Position.X
+        local dz = z - zone.Position.Z
+        if dx * dx + dz * dz <= radius * radius then
+            return zone
+        end
+    end
+    return nil
+end
+
+-- Khoảng cách phải đi thẳng theo `direction` để ra khỏi HỢP của mọi vùng cấm chồng nhau.
+-- Trả về 0 nếu đang ở ngoài, math.huge nếu không thoát được trong giới hạn lặp.
+local function getZoneUnionExitDistance(position, direction, zones)
+    zones = zones or ObstacleMemory
+    local dir = flatUnit(direction)
+    local travelled = 0
+    for _ = 1, 16 do
+        local px = position.X + dir.X * travelled
+        local pz = position.Z + dir.Z * travelled
+        local farthestExit = nil
+        for _, zone in ipairs(zones) do
+            local radius = zone.Radius or OBSTACLE_CONFIG.MemoryZoneRadius
+            local ox = px - zone.Position.X
+            local oz = pz - zone.Position.Z
+            local c = ox * ox + oz * oz - radius * radius
+            if c <= 0 then
+                local b = ox * dir.X + oz * dir.Z
+                local t = -b + math.sqrt(math.max(b * b - c, 0))
+                if not farthestExit or t > farthestExit then
+                    farthestExit = t
+                end
+            end
+        end
+        if not farthestExit then
+            return travelled
+        end
+        travelled = travelled + math.max(farthestExit, 0.05) + 0.05
+    end
+    return math.huge
+end
+
+-- Đoạn [fromDistance, toDistance] dọc `direction` có cắt qua vùng cấm nào không.
+local function zoneCrossingAlong(position, direction, fromDistance, toDistance, zones)
+    zones = zones or ObstacleMemory
+    if #zones == 0 or toDistance <= fromDistance then
+        return false
+    end
+    local dir = flatUnit(direction)
+    local d = math.max(fromDistance, 0)
+    while d < toDistance do
+        if findZoneIn(zones, position.X + dir.X * d, position.Z + dir.Z * d) then
+            return true
+        end
+        d = d + 1.5
+    end
+    return findZoneIn(zones, position.X + dir.X * toDistance, position.Z + dir.Z * toDistance) ~= nil
+end
+
+-- Spherecast thích ứng: ưu tiên bán kính rộng; chỉ thử bán kính hẹp hơn khi lối rộng bị chặn gần.
+-- Trả về hit, clearDistance, bán kính đã dùng. Bán kính nhỏ hơn sẽ bị phạt khi chấm điểm.
+local function castObstacleAdaptive(position, direction, distance, rayParams)
+    local wideRadius = ADAPTIVE_RADII[1]
+    local wideHit = castObstacle(position, direction, distance, wideRadius, rayParams)
+    local wideClear = wideHit and math.max(0, wideHit.Distance - 1.5) or distance
+    if wideClear >= ADAPTIVE_ENOUGH_CLEAR or wideClear >= distance then
+        return wideHit, wideClear, wideRadius
+    end
+
+    local bestHit, bestClear, bestRadius = wideHit, wideClear, wideRadius
+    for index = 2, #ADAPTIVE_RADII do
+        local radius = ADAPTIVE_RADII[index]
+        local hit = castObstacle(position, direction, distance, radius, rayParams)
+        local clear = hit and math.max(0, hit.Distance - 1.5) or distance
+        if clear > bestClear + 0.5 then
+            bestHit, bestClear, bestRadius = hit, clear, radius
+        end
+        if clear >= ADAPTIVE_ENOUGH_CLEAR then
+            break
+        end
+    end
+    return bestHit, bestClear, bestRadius
+end
+
+local function probeRay(origin, direction, distance, rayParams)
+    local ok, result = pcall(workspace.Raycast, workspace, origin, direction * distance, rayParams)
+    if ok and result then
+        return result.Distance
+    end
+    return distance
+end
+
+-- Khoảng trống hai bên lối đi (tia vuông góc, đặt hơi phía trước nhân vật).
+local function measureSideClearance(position, direction, rayParams)
+    local dir = flatUnit(direction)
+    local left = Vector3.new(-dir.Z, 0, dir.X)
+    local origin = position + Vector3.new(0, 1.2, 0) + dir * 4
+    local probe = OBSTACLE_CONFIG.SideProbeDistance
+    return probeRay(origin, left, probe, rayParams), probeRay(origin, -left, probe, rayParams)
+end
+
+local function getSideClearanceScore(leftClear, rightClear)
+    local minSide = math.min(leftClear, rightClear)
+    local score = math.min(leftClear + rightClear, 18) * 0.8
+    if minSide < OBSTACLE_CONFIG.MinSideClearance then
+        score = score - (OBSTACLE_CONFIG.MinSideClearance - minSide) * 6
+    end
+    return score
+end
+
+-- Độ thoáng quanh một điểm đích (0..1). Gần 0 nghĩa là góc kín / đường cụt.
+local function measureOpenness(point, rayParams)
+    local origin = point + Vector3.new(0, 1.2, 0)
+    local probe = OBSTACLE_CONFIG.OpennessProbeDistance
+    local open = 0
+    for index = 2, 16, 2 do
+        local dist = probeRay(origin, DIRECTIONS_16[index], probe, rayParams)
+        open = open + math.min(dist / probe, 1)
+    end
+    return open / 8
+end
+
+-- Phân tích toàn bộ đàn quái: tìm khoảng hở góc lớn nhất giữa các quái (hướng ít bị bao vây nhất).
+local function makeCrowdGap(position, enemies)
+    local bearings = {}
+    for _, enemy in ipairs(enemies or {}) do
+        local velocity = enemy.Velocity or Vector3.zero
+        local dx = (enemy.Position.X + velocity.X * 0.4) - position.X
+        local dz = (enemy.Position.Z + velocity.Z * 0.4) - position.Z
+        local dist = math.sqrt(dx * dx + dz * dz)
+        if dist > 0.01 and dist <= 45 then
+            table.insert(bearings, math.atan2(dz, dx))
+        end
+    end
+
+    local count = #bearings
+    if count == 0 then
+        return nil
+    end
+
+    table.sort(bearings)
+    local bestGap, bestCenter = -1, 0
+    for i = 1, count do
+        local a = bearings[i]
+        local b = bearings[i + 1] or (bearings[1] + math.pi * 2)
+        local gap = b - a
+        if gap > bestGap then
+            bestGap = gap
+            bestCenter = a + gap / 2
+        end
+    end
+
+    return {
+        Center = Vector3.new(math.cos(bestCenter), 0, math.sin(bestCenter)),
+        Size = bestGap,
+        Count = count,
+    }
+end
+
+local function getCrowdGapBonus(direction, gap)
+    if not gap then return 0 end
+    local alignment = flatUnit(direction):Dot(gap.Center)
+    return alignment * 35 * (math.min(gap.Count, 5) / 5)
+end
+
+-- Điểm cộng/trừ bổ sung cho một hướng ứng viên: tuyến từng thất bại, vòng vây, bán kính hẹp,
+-- khoảng trống hai bên và độ thoáng tại đích.
+local function getUpgradeRouteBonus(position, direction, targetPosition, usedRadius, rayParams, crowdGap, now)
+    local bonus = 0
+    bonus = bonus - getFailedRoutePenalty(position, direction, now)
+    bonus = bonus + getCrowdGapBonus(direction, crowdGap)
+    bonus = bonus - math.max(0, OBSTACLE_CONFIG.CorridorRadius - (usedRadius or OBSTACLE_CONFIG.CorridorRadius)) * 12
+
+    local leftClear, rightClear = measureSideClearance(position, direction, rayParams)
+    bonus = bonus + getSideClearanceScore(leftClear, rightClear)
+
+    local openness = measureOpenness(targetPosition, rayParams)
+    bonus = bonus + openness * 22
+    if openness < 0.25 then
+        bonus = bonus - 40
+    end
+    return bonus
+end
+
+-- Quét 36 hướng trong 100 studs để tìm hành lang rộng, ít quái.
+local function scanWideCorridors(hrpPosition, enemies, rayParams)
+    cleanObstacleMemory()
+    local crowdGap = makeCrowdGap(hrpPosition, enemies)
+    local bestScore = -math.huge
+    local bestPosition = nil
+    local bestDirection = nil
+    local bestClearDistance = 0
+
+    for i = 1, OBSTACLE_CONFIG.ScanDirections do
+        local direction = DIRECTIONS_36[i]
+
+        if not isDirectionRemembered(hrpPosition, direction, OBSTACLE_CONFIG.ZoneLookahead) then
+            -- V8: bán kính thích ứng; lối rộng được ưu tiên, lối hẹp bị phạt thay vì bị loại cứng.
+            local hit, clearDistance, usedRadius = castObstacleAdaptive(
+                hrpPosition, direction, OBSTACLE_CONFIG.ScanRadius, rayParams
+            )
+
+            -- Cần có đủ khoảng trống để thực hiện ít nhất một bước ngắn.
+            if clearDistance >= 2 then
+                local stepDistance = math.min(
+                    AppState.FleeDistance,
+                    OBSTACLE_CONFIG.MaxReactiveStep,
+                    clearDistance
+                )
+                local targetPosition = hrpPosition + direction * stepDistance
+
+                local lanePenalty = getLaneEnemyPenalty(
+                    hrpPosition,
+                    direction,
+                    clearDistance,
+                    enemies
+                )
+
+                local endpointDanger = getEnemyDangerScore(targetPosition, enemies)
+                local predictedDanger = getPredictedRouteDanger(
+                    hrpPosition, direction, stepDistance, enemies
+                )
+                local proximityPenalty = getEnemyProximityPenalty(
+                    hrpPosition, direction, stepDistance, enemies
+                )
+                local routePenalty, minEnemyDistance, routeBlocked =
+                    assessEnemyRiskOnSegment(hrpPosition, targetPosition, enemies, 0)
+
+                -- Không được phép chọn một hành lang có quái chắn ở bất kỳ điểm nào trên đoạn đi.
+                local score = (clearDistance * 0.55)
+                    + getRouteClearanceBonus(clearDistance)
+                    - lanePenalty
+                    - proximityPenalty
+                    - (endpointDanger * 30)
+                    - (predictedDanger * 70)
+                    - (routePenalty * OBSTACLE_CONFIG.EnemyRoutePenaltyWeight)
+                    + getHeadingBias(direction, tick())
+
+                -- V8: chỉ tính phần thưởng/phạt tốn kém cho ứng viên có khả năng thắng.
+                if not routeBlocked and minEnemyDistance >= OBSTACLE_CONFIG.EnemyRouteHardReject
+                    and score + 75 > bestScore then
+                    score = score + getUpgradeRouteBonus(
+                        hrpPosition, direction, targetPosition, usedRadius, rayParams, crowdGap, tick()
+                    )
+                end
+
+                if not routeBlocked and minEnemyDistance >= OBSTACLE_CONFIG.EnemyRouteHardReject
+                    and score > bestScore then
+                    bestScore = score
+                    bestPosition = targetPosition
+                    bestDirection = direction
+                    bestClearDistance = clearDistance
+                end
+            end
+        end
+    end
+
+    -- Adaptive Narrow Passage: tinh chỉnh quanh hướng tốt nhất để tìm khe hẹp
+    -- mà lưới 36 hướng ban đầu có thể bỏ sót. Vẫn dùng Spherecast với bán kính nhân vật.
+    if bestDirection then
+        for _, degrees in ipairs(OBSTACLE_CONFIG.FineScanOffsets) do
+            local angle = math.rad(degrees)
+            local direction = Vector3.new(
+                bestDirection.X * math.cos(angle) - bestDirection.Z * math.sin(angle),
+                0,
+                bestDirection.X * math.sin(angle) + bestDirection.Z * math.cos(angle)
+            ).Unit
+
+            if not isDirectionRemembered(hrpPosition, direction, OBSTACLE_CONFIG.ZoneLookahead) then
+                local hit = castObstacle(
+                    hrpPosition, direction, OBSTACLE_CONFIG.ScanRadius,
+                    OBSTACLE_CONFIG.PreferredCorridorRadius, rayParams
+                )
+                local clearDistance = hit and math.max(0, hit.Distance - 1.5)
+                    or OBSTACLE_CONFIG.ScanRadius
+                if clearDistance >= 2 then
+                    local stepDistance = math.min(
+                        AppState.FleeDistance, OBSTACLE_CONFIG.MaxReactiveStep, clearDistance
+                    )
+                    local targetPosition = hrpPosition + direction * stepDistance
+                    local lanePenalty = getLaneEnemyPenalty(hrpPosition, direction, clearDistance, enemies)
+                    local endpointDanger = getEnemyDangerScore(targetPosition, enemies)
+                    local predictedDanger = getPredictedRouteDanger(hrpPosition, direction, stepDistance, enemies)
+                    local proximityPenalty = getEnemyProximityPenalty(
+                        hrpPosition, direction, stepDistance, enemies
+                    )
+                    local routePenalty, minEnemyDistance, routeBlocked =
+                        assessEnemyRiskOnSegment(hrpPosition, targetPosition, enemies, 0)
+                    local score = clearDistance * 0.55 + getRouteClearanceBonus(clearDistance)
+                        - lanePenalty - proximityPenalty
+                        - endpointDanger * 30 - predictedDanger * 70
+                        - routePenalty * OBSTACLE_CONFIG.EnemyRoutePenaltyWeight
+                        + getHeadingBias(direction, tick())
+                    if not routeBlocked
+                        and minEnemyDistance >= OBSTACLE_CONFIG.EnemyRouteHardReject
+                        and score + 75 > bestScore then
+                        score = score + getUpgradeRouteBonus(
+                            hrpPosition, direction, targetPosition,
+                            OBSTACLE_CONFIG.PreferredCorridorRadius, rayParams, crowdGap, tick()
+                        )
+                    end
+                    -- Không chọn khe hẹp hoặc bất kỳ đoạn nào cắt sát vùng quái.
+                    if not routeBlocked
+                        and minEnemyDistance >= OBSTACLE_CONFIG.EnemyRouteHardReject
+                        and proximityPenalty < OBSTACLE_CONFIG.NarrowEnemyHardReject
+                        and score > bestScore then
+                        bestScore = score
+                        bestPosition = targetPosition
+                        bestDirection = direction
+                        bestClearDistance = clearDistance
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPosition, bestDirection, bestClearDistance
+end
+
+-- Chọn hướng né thông thường; nếu hướng ưu tiên bị chắn gần thì quét rộng.
+local function findSafestFleePosition(hrpPosition, enemies, forceWideScan)
+    cleanObstacleMemory()
+    local character = LocalPlayer.Character
+    local rayParams = createObstacleRayParams(character, enemies)
+    local rankedDirections = {}
+    local crowdGap = makeCrowdGap(hrpPosition, enemies)
+    for i = 1, #DIRECTIONS_16 do
+        local direction = DIRECTIONS_16[i]
+        local targetPosition = hrpPosition + direction * AppState.FleeDistance
+        local dangerScore = getEnemyDangerScore(targetPosition, enemies)
+        local predictedDanger = getPredictedRouteDanger(
+            hrpPosition, direction,
+            math.min(AppState.FleeDistance, OBSTACLE_CONFIG.MaxReactiveStep),
+            enemies
+        )
+
+        local proximityPenalty = getEnemyProximityPenalty(
+            hrpPosition, direction,
+            math.min(AppState.FleeDistance, OBSTACLE_CONFIG.MaxReactiveStep),
+            enemies
+        )
+        local routeDistance = math.min(AppState.FleeDistance, OBSTACLE_CONFIG.MaxReactiveStep)
+        local routePenalty, minEnemyDistance, routeBlocked = assessEnemyRiskOnSegment(
+            hrpPosition, hrpPosition + direction * routeDistance, enemies, 0
+        )
+        table.insert(rankedDirections, {
+            Direction = direction,
+            Target = targetPosition,
+            RouteBlocked = routeBlocked or minEnemyDistance < OBSTACLE_CONFIG.EnemyRouteHardReject,
+            Score = -(dangerScore * 30) - (predictedDanger * 70)
+                - proximityPenalty - routePenalty * OBSTACLE_CONFIG.EnemyRoutePenaltyWeight
+                + getHeadingBias(direction, tick())
+                + getCrowdGapBonus(direction, crowdGap)
+                - getFailedRoutePenalty(hrpPosition, direction, tick()),
+        })
+    end
+
+    table.sort(rankedDirections, function(a, b)
+        return a.Score > b.Score
+    end)
+
+    local preferred = rankedDirections[1]
+    local shouldWideScan = forceWideScan == true
+
+    -- Corner Escape: khi hướng tốt nhất bị ép bởi tường/vùng cấm,
+    -- chuyển sang quét 36 hướng để tìm hành lang thoát rộng thay vì cố đi tiếp.
+    if preferred then
+        if isDirectionRemembered(hrpPosition, preferred.Direction, OBSTACLE_CONFIG.ZoneLookahead) then
+            shouldWideScan = true
+        else
+            local preferredHit = castObstacle(
+                hrpPosition,
+                preferred.Direction,
+                AppState.FleeDistance + 2,
+                OBSTACLE_CONFIG.CharacterRadius,
+                rayParams
+            )
+
+            if preferredHit and preferredHit.Distance <= OBSTACLE_CONFIG.TriggerDistance then
+                shouldWideScan = true
+            end
+        end
+    end
+
+    if shouldWideScan then
+        local target, direction, clearDistance = scanWideCorridors(
+            hrpPosition,
+            enemies,
+            rayParams
+        )
+
+        if target and direction then
+            return target, direction, true, clearDistance
+        end
+    end
+
+    -- Thử các hướng thông thường theo mức độ an toàn.
+    for _, candidate in ipairs(rankedDirections) do
+        local direction = candidate.Direction
+
+        if not candidate.RouteBlocked
+            and not isDirectionRemembered(hrpPosition, direction, OBSTACLE_CONFIG.ZoneLookahead)
+            and getFailedRoutePenalty(hrpPosition, direction, tick()) < 100 then
+            local hit = castObstacle(
+                hrpPosition,
+                direction,
+                AppState.FleeDistance + 2,
+                OBSTACLE_CONFIG.CharacterRadius,
+                rayParams
+            )
+
+            local clearDistance = hit
+                and (hit.Distance - 1.2)
+                or AppState.FleeDistance
+
+            local stepDistance = math.min(
+                AppState.FleeDistance,
+                OBSTACLE_CONFIG.MaxReactiveStep,
+                clearDistance
+            )
+
+            if stepDistance >= 2 then
+                local routeDanger = getPredictedRouteDanger(
+                    hrpPosition, direction, stepDistance, enemies
+                )
+                local proximityPenalty = getEnemyProximityPenalty(
+                    hrpPosition, direction, stepDistance, enemies
+                )
+                local targetPosition = hrpPosition + direction * stepDistance
+                local routePenalty, minEnemyDistance, routeBlocked =
+                    assessEnemyRiskOnSegment(hrpPosition, targetPosition, enemies, 0)
+                if not routeBlocked
+                    and minEnemyDistance >= OBSTACLE_CONFIG.EnemyRouteHardReject
+                    and routeDanger < 2.2
+                    and proximityPenalty < OBSTACLE_CONFIG.NarrowEnemyHardReject then
+                    return targetPosition, direction, false, clearDistance
+                end
+            end
+        end
+    end
+
+    -- Không còn hướng ngắn hợp lệ: quét rộng lần cuối.
+    local target, direction, clearDistance = scanWideCorridors(
+        hrpPosition,
+        enemies,
+        rayParams
+    )
+
+    if target and direction then
+        return target, direction, true, clearDistance
+    end
+
+    return nil, nil, true, 0
+end
+
+-- ==========================================
+-- 3. GIAO DIỆN GUI (GIỮ NGUYÊN V5)
+-- ==========================================
+-- Dọn GUI cũ nếu script được chạy lại.
+pcall(function()
+    local oldGui = CoreGui:FindFirstChild("SmartFleeGUI")
+    if oldGui then oldGui:Destroy() end
+end)
+pcall(function()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local oldGui = playerGui and playerGui:FindFirstChild("SmartFleeGUI")
+    if oldGui then oldGui:Destroy() end
+end)
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "SmartFleeGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.DisplayOrder = 999
+
+-- Delta Android: ưu tiên gethui nếu executor cung cấp; nếu không thì dùng PlayerGui.
+local guiParent = nil
+if type(gethui) == "function" then
+    local ok, hiddenGui = pcall(gethui)
+    if ok and hiddenGui then
+        guiParent = hiddenGui
+    end
+end
+if guiParent then
+    local ok = pcall(function() ScreenGui.Parent = guiParent end)
+    if not ok then guiParent = nil end
+end
+if not guiParent then
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not playerGui then
+        playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+    end
+    guiParent = playerGui
+    ScreenGui.Parent = guiParent
+end
+
+local Frame = Instance.new("Frame", ScreenGui)
+Frame.Size = UDim2.new(0, 260, 0, 145)
+Frame.Position = UDim2.new(0.5, 200, 0.5, -200)
+Frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+Frame.Active = true
+Frame.Draggable = true
+Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", Frame).Color = Color3.fromRGB(60, 60, 80)
+
+local Title = Instance.new("TextLabel", Frame)
+Title.Size = UDim2.new(1, -88, 0, 30)
+Title.Position = UDim2.new(0, 10, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "SMART EVADE V6 - DELTA"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 12
+Title.TextXAlignment = Enum.TextXAlignment.Left
+
+-- Nút Đóng (Dấu X)
+local MinimizeBtn = Instance.new("TextButton", Frame)
+MinimizeBtn.Size = UDim2.new(0, 24, 0, 24)
+MinimizeBtn.Position = UDim2.new(1, -56, 0, 3)
+MinimizeBtn.BackgroundColor3 = Color3.fromRGB(85, 95, 120)
+MinimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MinimizeBtn.Text = "−"
+MinimizeBtn.Font = Enum.Font.GothamBold
+MinimizeBtn.TextSize = 16
+Instance.new("UICorner", MinimizeBtn).CornerRadius = UDim.new(0, 4)
+
+local CloseBtn = Instance.new("TextButton", Frame)
+CloseBtn.Size = UDim2.new(0, 24, 0, 24)
+CloseBtn.Position = UDim2.new(1, -28, 0, 3)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.Text = "X"
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 12
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 4)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    ScreenGui:Destroy()
+end)
+
+MinimizeBtn.MouseButton1Click:Connect(function()
+    Frame.Visible = false
+end)
+
+-- Hai lần chạm bằng ba ngón tay để mở lại menu đang ẩn.
+local activeTouches = {}
+local threeFingerGestureActive = false
+local lastThreeFingerTap = 0
+local touchGestureStartedAt = 0
+addConn(UserInputService.TouchStarted:Connect(function(input)
+    activeTouches[input] = true
+    local count = 0
+    for _ in pairs(activeTouches) do count += 1 end
+    if count >= 3 and not threeFingerGestureActive then
+        threeFingerGestureActive = true
+        touchGestureStartedAt = tick()
+    end
+end))
+addConn(UserInputService.TouchEnded:Connect(function(input)
+    activeTouches[input] = nil
+    if threeFingerGestureActive then
+        local count = 0
+        for _ in pairs(activeTouches) do count += 1 end
+        if count == 0 then
+            threeFingerGestureActive = false
+            if tick() - touchGestureStartedAt <= 0.65 then
+                local currentTime = tick()
+                if currentTime - lastThreeFingerTap <= 1.5 then
+                    Frame.Visible = true
+                    lastThreeFingerTap = 0
+                else
+                    lastThreeFingerTap = currentTime
+                end
+            end
+        end
+    end
+end))
+
+local ToggleBtn = Instance.new("TextButton", Frame)
+ToggleBtn.Size = UDim2.new(0.9, 0, 0, 35)
+ToggleBtn.Position = UDim2.new(0.05, 0, 0, 32)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleBtn.Text = "AUTO EVADE: OFF"
+ToggleBtn.Font = Enum.Font.GothamBold
+ToggleBtn.TextSize = 13
+Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 6)
+
+local StatusTxt = Instance.new("TextLabel", Frame)
+StatusTxt.Size = UDim2.new(0.9, 0, 0, 30)
+StatusTxt.Position = UDim2.new(0.05, 0, 0, 70)
+StatusTxt.BackgroundTransparency = 1
+StatusTxt.TextColor3 = Color3.fromRGB(160, 160, 160)
+StatusTxt.Text = "Radar: " .. AppState.ScanRadius .. " studs | Đã tắt"
+StatusTxt.Font = Enum.Font.Code
+StatusTxt.TextSize = 11
+StatusTxt.TextWrapped = true
+
+MemoryTxt = Instance.new("TextLabel", Frame)
+MemoryTxt.Size = UDim2.new(0.9, 0, 0, 24)
+MemoryTxt.Position = UDim2.new(0.05, 0, 0, 108)
+MemoryTxt.BackgroundTransparency = 1
+MemoryTxt.TextColor3 = Color3.fromRGB(130, 190, 255)
+MemoryTxt.Font = Enum.Font.Code
+MemoryTxt.TextSize = 10
+MemoryTxt.TextXAlignment = Enum.TextXAlignment.Left
+updateMemoryLabel()
+
+local function updateState(newState)
+    AppState.IsActive = newState
+
+    if AppState.IsActive then
+        ToggleBtn.Text = "AUTO EVADE: ON"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 180, 80)
+    else
+        ToggleBtn.Text = "AUTO EVADE: OFF"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+        StatusTxt.Text = "Radar: " .. AppState.ScanRadius .. " studs | Đã tắt"
+        StatusTxt.TextColor3 = Color3.fromRGB(160, 160, 160)
+
+        local char = LocalPlayer.Character
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if humanoid and hrp then
+            humanoid:MoveTo(hrp.Position)
+        end
+    end
+end
+
+ToggleBtn.MouseButton1Click:Connect(function()
+    updateState(not AppState.IsActive)
+end)
+
+-- ==========================================
+-- 4. LOGIC BẤM ENTER 2 LẦN ĐỂ BẬT / TẮT
+-- ==========================================
+local lastEnterTime = 0
+addConn(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if input.KeyCode == Enum.KeyCode.Return then
+        local currentTime = tick()
+        if currentTime - lastEnterTime <= 0.5 then
+            updateState(not AppState.IsActive)
+            lastEnterTime = 0
+        else
+            lastEnterTime = currentTime
+        end
+    end
+
+    -- Phím L để ẩn/hiện bảng GUI
+    if not gameProcessed and input.KeyCode == Enum.KeyCode.L then
+        Frame.Visible = not Frame.Visible
+    end
+end))
+
+-- ==========================================
+-- 5. TURBO MOVEMENT + VERIFY + REMEMBER + RE-ROUTE
+-- ==========================================
+local isFleeing = false
+local activeMove = nil
+local nextPlanTime = 0
+local forceWideScan = false
+local isPlanning = false
+local planVersion = 0
+local latestDangerCount = 0
+local enemyMotionHistory = {}
+local enemyGroundCache = {}
+-- DELTA ADD-ON: di chuyển thoát hiểm tức thời trong lúc planner tính đường.
+local emergencyMoveUntil = 0
+local emergencyDirection = nil
+local lastEmergencyRefresh = 0
+
+-- Last Safe Position: giữ một lịch sử ngắn các điểm đã đi qua an toàn.
+local lastSafePositions = {}
+local lastSafeRecordTime = 0
+local recoveryActive = false
+local recoveryReason = nil
+-- DELTA ADD-ON: theo dõi thời gian ở liên tục trong cùng một vùng cấm.
+local forbiddenZoneEnteredAt = nil
+local timedZoneReplanDone = false
+local timedZoneReference = nil
+local RECOVERY_CONFIG = {
+    RecordInterval = 0.45,
+    MinRecordSpacing = 3,
+    MaxRecords = 16,
+    BacktrackMin = 5,
+    BacktrackMax = 10,
+    SafeEnemyDistance = 8,
+}
+
+local function recordLastSafePosition(position, now)
+    if getContainingObstacleZone(position) then return end
+    if now - lastSafeRecordTime < RECOVERY_CONFIG.RecordInterval then return end
+
+    local last = lastSafePositions[#lastSafePositions]
+    if last and (last.Position - position).Magnitude < RECOVERY_CONFIG.MinRecordSpacing then
+        return
+    end
+
+    table.insert(lastSafePositions, {
+        Position = position,
+        Time = now,
+    })
+    while #lastSafePositions > RECOVERY_CONFIG.MaxRecords do
+        table.remove(lastSafePositions, 1)
+    end
+    lastSafeRecordTime = now
+end
+
+-- Ưu tiên quay về một điểm đã đứng/đi qua an toàn, thường cách 5-10 studs.
+-- Nếu đường lùi bị tường, vùng cấm hoặc quái cắt ngang thì bỏ điểm đó.
+local function findLastSafeRecoveryTarget(position, enemies, rayParams, currentZone)
+    local maxBacktrackDistance = currentZone and (RECOVERY_CONFIG.BacktrackMax * 2) or RECOVERY_CONFIG.BacktrackMax
+    for index = #lastSafePositions, 1, -1 do
+        local safe = lastSafePositions[index]
+        local offset = safe.Position - position
+        local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
+
+        if distance >= RECOVERY_CONFIG.BacktrackMin
+            and distance <= maxBacktrackDistance + 3
+            and not getContainingObstacleZone(safe.Position) then
+
+            local direction = flatUnit(offset)
+            local hit = castObstacle(
+                position,
+                direction,
+                distance,
+                OBSTACLE_CONFIG.CharacterRadius,
+                rayParams
+            )
+            local clearDistance = hit and (hit.Distance - 1.25) or distance
+
+            if clearDistance >= distance - 1.5
+                and not isDirectionRemembered(position, direction, distance + 2) then
+                local danger = getPredictedRouteDanger(position, direction, distance, enemies)
+                local endpointDanger = getEnemyDangerScore(safe.Position, enemies)
+                local routePenalty, minEnemyDistance, routeBlocked =
+                    assessEnemyRiskOnSegment(position, safe.Position, enemies, 0)
+                if not routeBlocked
+                    and minEnemyDistance >= OBSTACLE_CONFIG.EnemyRouteHardReject
+                    and danger < 1.8 and endpointDanger < 0.9
+                    and routePenalty < 0.9 then
+                    return safe.Position, direction, false, clearDistance, "Lùi về vị trí an toàn"
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ==========================================================
+-- UPGRADE V8 (B1) - THOÁT VÙNG CẤM TỨC THỜI (không Pathfinding, không yield)
+-- Dùng hình học hợp các vùng cấm để xác định hướng thật sự ra ngoài, kiểm tra cả điểm đến
+-- lẫn toàn đoạn đường (tường, vùng cấm khác, quái dự đoán), có bám biên khi bị chặn.
+-- ==========================================================
+local function measureProgressToExit(position, zones)
+    local best = math.huge
+    for i = 1, OBSTACLE_CONFIG.ScanDirections do
+        local distance = getZoneUnionExitDistance(position, DIRECTIONS_36[i], zones)
+        if distance < best then
+            best = distance
+        end
+    end
+    return best
+end
+
+-- Trả về target, direction, usedWide, clearDistance, label (cùng dạng với findRecoveryTarget).
+local function findInstantZoneEscape(position, enemies, headingHint)
+    if #ObstacleMemory == 0 then return nil end
+
+    local character = LocalPlayer.Character
+    local rayParams = createObstacleRayParams(character, enemies)
+    local now = tick()
+    local maxStep = OBSTACLE_CONFIG.ForbiddenZoneEscapeStep
+    local zones = getNearbyZones(position, maxStep + 20)
+    if not findZoneIn(zones, position.X, position.Z) then return nil end
+
+    local crowdGap = makeCrowdGap(position, enemies)
+    local multiplier = OBSTACLE_CONFIG.ZoneEscapeDistanceMultiplier
+    local hasHeading = headingHint and headingHint.Magnitude > 0.05
+    local headingDir = hasHeading and flatUnit(headingHint) or nil
+
+    -- Pha 1: chấm điểm rẻ (hình học thuần) cho 36 hướng.
+    local candidates = {}
+    for i = 1, OBSTACLE_CONFIG.ScanDirections do
+        local direction = DIRECTIONS_36[i]
+        local exitDistance = getZoneUnionExitDistance(position, direction, zones)
+        if exitDistance < math.huge then
+            -- Khoảng cách thoát gấp đôi so với V7.1: (đến mép + đệm) x multiplier.
+            local required = math.max(16, (exitDistance + 2) * 2) * multiplier
+            local step = math.min(required, maxStep)
+            if exitDistance + 3 <= step then
+                local endpoint = position + direction * step
+                local endpointDanger = getEnemyDangerScore(endpoint, enemies)
+                local routeProximity = getEnemyProximityPenalty(
+                    position, direction, math.min(step, 24), enemies
+                )
+                -- Pha hình học chỉ xếp hạng sơ bộ; phạt nặng điểm đến gần Enemy.
+                -- Pha 2 vẫn phải kiểm tra nguy hiểm trên toàn đoạn đường trước khi chấp nhận.
+                local score = -exitDistance * 3
+                    - getFailedRoutePenalty(position, direction, now)
+                    - routeProximity * 1.5
+                    - endpointDanger * 150
+                    + getCrowdGapBonus(direction, crowdGap)
+                if headingDir then
+                    local alignment = direction:Dot(headingDir)
+                    if alignment > 0.55 then
+                        score = score + 18 * alignment
+                    end
+                end
+                table.insert(candidates, {
+                    Direction = direction,
+                    Exit = exitDistance,
+                    Step = step,
+                    Score = score,
+                })
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.Score > b.Score
+    end)
+
+    -- Pha 2: kiểm tra vật lý cho các ứng viên tốt nhất.
+    local best, bestFinal = nil, -math.huge
+    local relaxed, relaxedFinal = nil, -math.huge
+    local blockedHits = {}
+    local checked = 0
+
+    for _, candidate in ipairs(candidates) do
+        if checked >= OBSTACLE_CONFIG.ZoneEscapeTopCandidates then break end
+        checked += 1
+
+        local direction = candidate.Direction
+        local hit, clear, usedRadius = castObstacleAdaptive(position, direction, candidate.Step, rayParams)
+        local needed = candidate.Exit + 3
+
+        if clear >= needed then
+            local goDistance = math.min(candidate.Step, clear)
+            if not zoneCrossingAlong(position, direction, candidate.Exit + 0.5, goDistance, zones) then
+                local target = position + direction * goDistance
+                local routePenalty, minEnemy, blocked = assessEnemyRiskOnSegment(position, target, enemies, 0)
+                local leftClear, rightClear = measureSideClearance(position, direction, rayParams)
+                local openness = measureOpenness(target, rayParams)
+                local final = candidate.Score
+                    + goDistance * 0.35
+                    + (usedRadius / OBSTACLE_CONFIG.CorridorRadius) * 8
+                    + getSideClearanceScore(leftClear, rightClear)
+                    + openness * 24
+                    - routePenalty * OBSTACLE_CONFIG.EnemyRoutePenaltyWeight
+
+                if not blocked and minEnemy >= OBSTACLE_CONFIG.EnemyRouteHardReject then
+                    if final > bestFinal then
+                        bestFinal = final
+                        best = { Target = target, Direction = direction, Clear = goDistance, Label = "Thoát vùng cấm tức thì" }
+                    end
+                elseif minEnemy >= OBSTACLE_CONFIG.ZoneEscapeEmergencyEnemyFloor then
+                    -- Chỉ giữ phương án dự phòng nếu không có tuyến an toàn hoàn toàn.
+                    -- Không cho phép fallback lao sát vào Enemy; ưu tiên tuyến có khoảng cách tốt
+                    -- và tổng mức phạt thấp hơn, thay vì chỉ chọn Enemy gần nhất trong các lựa chọn.
+                    local fallbackScore = final
+                        - math.max(0, OBSTACLE_CONFIG.EnemyRouteHardReject - minEnemy) * 60
+                    if fallbackScore > relaxedFinal then
+                        relaxedFinal = fallbackScore
+                        relaxed = {
+                            Target = target,
+                            Direction = direction,
+                            Clear = goDistance,
+                            Label = "Thoát vùng cấm (lối khẩn cấp)"
+                        }
+                    end
+                end
+            end
+        elseif hit then
+            table.insert(blockedHits, { Direction = direction, Hit = hit })
+        end
+    end
+
+    if best then
+        return best.Target, best.Direction, true, best.Clear, best.Label
+    end
+    if relaxed then
+        return relaxed.Target, relaxed.Direction, true, relaxed.Clear, relaxed.Label
+    end
+
+    -- Pha 3: bám biên vật cản. Trượt dọc tiếp tuyến của tường và chỉ nhận nếu thật sự
+    -- tiến gần lối ra hơn vị trí hiện tại.
+    local currentExit = measureProgressToExit(position, zones)
+    local bestSlide, bestImprovement = nil, 0
+    local tried = 0
+    for _, info in ipairs(blockedHits) do
+        local normal = info.Hit.Normal
+        local flatNormal = Vector3.new(normal.X, 0, normal.Z)
+        if flatNormal.Magnitude > 0.05 then
+            flatNormal = flatNormal.Unit
+            local tangent = Vector3.new(-flatNormal.Z, 0, flatNormal.X)
+            for _, sign in ipairs({ 1, -1 }) do
+                if tried >= 4 then break end
+                tried += 1
+                local slideDirection = flatUnit(tangent * sign + flatNormal * 0.25)
+                local _, slideClear = castObstacleAdaptive(position, slideDirection, 24, rayParams)
+                if slideClear >= 6 then
+                    local goDistance = math.min(slideClear, 24)
+                    local slideTarget = position + slideDirection * goDistance
+                    local progress = measureProgressToExit(slideTarget, zones)
+                    local _, slideMinEnemy, slideBlocked = assessEnemyRiskOnSegment(position, slideTarget, enemies, 0)
+                    local improvement = currentExit - progress
+                    if improvement > 1.5 and improvement > bestImprovement
+                        and not slideBlocked and slideMinEnemy >= OBSTACLE_CONFIG.EnemyRouteHardReject then
+                        bestImprovement = improvement
+                        bestSlide = { Target = slideTarget, Direction = slideDirection, Clear = goDistance }
+                    end
+                end
+            end
+        end
+    end
+
+    if bestSlide then
+        return bestSlide.Target, bestSlide.Direction, true, bestSlide.Clear, "Bám biên thoát vùng cấm"
+    end
+    return nil
+end
+
+-- Kiểm tra lại một đích đã lập sẵn từ VỊ TRÍ HIỆN TẠI (nhân vật có thể đã chạy lệch trong lúc tính đường).
+local function revalidatePlanTarget(position, target, enemies, currentZone, rayParams)
+    local flat = Vector3.new(target.X - position.X, 0, target.Z - position.Z)
+    local distance = flat.Magnitude
+    if distance < 1.5 then return false end
+    local direction = flat.Unit
+
+    rayParams = rayParams or createObstacleRayParams(LocalPlayer.Character, enemies)
+    local hit = castObstacle(position, direction, distance, OBSTACLE_CONFIG.CharacterRadius, rayParams)
+    if hit and hit.Distance < distance - 1.2 then
+        return false
+    end
+
+    if #ObstacleMemory > 0 then
+        local zones = getNearbyZones(position, distance + 5)
+        local insideNow = findZoneIn(zones, position.X, position.Z) ~= nil
+        if currentZone or insideNow then
+            local exitDistance = getZoneUnionExitDistance(position, direction, zones)
+            if exitDistance == math.huge then return false end
+            if zoneCrossingAlong(position, direction, exitDistance + 0.5, distance, zones) then
+                return false
+            end
+        elseif zoneCrossingAlong(position, direction, 0, distance, zones) then
+            return false
+        end
+    end
+
+    local _, minEnemy, blocked = assessEnemyRiskOnSegment(position, target, enemies, 0)
+    if blocked or minEnemy < OBSTACLE_CONFIG.EnemyRouteHardReject then
+        return false
+    end
+    return true
+end
+
+-- Từ chuỗi waypoint Pathfinding, chọn waypoint XA NHẤT (trong tầm nhìn thẳng an toàn) thay vì chỉ
+-- waypoint thứ 2. Nhờ vậy nhân vật chạy liền mạch thay vì dừng lại tính đường sau mỗi ~4 studs.
+local function pickPathLookahead(position, waypoints, enemies, currentZone, rayParams)
+    local chosen = nil
+    local accumulated = 0
+    local previous = waypoints[1].Position
+    for index = 2, #waypoints do
+        local waypointPosition = waypoints[index].Position
+        accumulated = accumulated + (waypointPosition - previous).Magnitude
+        previous = waypointPosition
+        if accumulated > OBSTACLE_CONFIG.PathLookahead then
+            break
+        end
+        if revalidatePlanTarget(position, waypointPosition, enemies, currentZone, rayParams) then
+            chosen = waypointPosition
+        elseif chosen then
+            break
+        end
+    end
+    return chosen
+end
+
+-- Thoát vùng cấm / góc kẹt: thử điểm an toàn trước, sau đó quét 36 hướng.
+-- DELTA ADD-ON: tìm đường vòng bằng PathfindingService khi tia thẳng bị góc/tường chặn.
+-- Chỉ trả về waypoint kế tiếp; mỗi chặng sẽ được radar kiểm tra lại để tránh chạy mù.
+local lastPathfindingRecoveryAt = 0
+local function findPathfindingRecoveryStep(position, enemies, currentZone)
+    local now = tick()
+    local pathRefresh = currentZone and OBSTACLE_CONFIG.ForbiddenZonePathRefresh or 0.8
+    if now - lastPathfindingRecoveryAt < pathRefresh then return nil end
+    lastPathfindingRecoveryAt = now
+
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return nil end
+    local routeRayParams = createObstacleRayParams(character, enemies)
+
+    local candidates = {}
+    local seen = {}
+    local function addCandidate(point, label)
+        if not point or getContainingObstacleZone(point) then return end
+        local flat = Vector3.new(point.X, position.Y, point.Z)
+        local key = string.format("%.0f:%.0f", flat.X, flat.Z)
+        if not seen[key] then
+            seen[key] = true
+            table.insert(candidates, { Position = flat, Label = label })
+        end
+    end
+
+    -- Thử các điểm đã từng an toàn trước, nhưng để Pathfinding tự tìm đường vòng.
+    for index = #lastSafePositions, 1, -1 do
+        local safe = lastSafePositions[index]
+        local distance = (Vector3.new(safe.Position.X - position.X, 0, safe.Position.Z - position.Z)).Magnitude
+        if distance >= 3 and distance <= OBSTACLE_CONFIG.ScanRadius then
+            addCandidate(safe.Position, "Đi vòng về điểm an toàn")
+        end
+        if #candidates >= 3 then break end
+    end
+
+    -- Nếu đang ở vùng cấm, tạo các đích nằm ngoài rìa vùng theo nhiều góc khác nhau.
+    -- Nếu không có currentZone, thử các đích quanh nhân vật để thoát góc tường.
+    local center = currentZone and currentZone.Position or position
+    local baseRadius = currentZone
+        and ((currentZone.Radius or OBSTACLE_CONFIG.MemoryZoneRadius) + 7)
+        or math.min(OBSTACLE_CONFIG.ScanRadius * 0.55, 24)
+    local angleOffset = 0
+    if currentZone then
+        local outward = Vector3.new(position.X - center.X, 0, position.Z - center.Z)
+        if outward.Magnitude > 0.1 then
+            angleOffset = math.atan2(outward.Z, outward.X)
+        end
+    end
+    for i = 0, 7 do
+        local angle = angleOffset + RING_ORDER[i + 1]
+        local radius = baseRadius + ((i % 2) * 4)
+        addCandidate(Vector3.new(center.X + math.cos(angle) * radius, position.Y, center.Z + math.sin(angle) * radius), "Đi vòng góc/tường")
+    end
+
+    -- V8: giới hạn số đích và thời gian ComputeAsync để không đứng chờ quá lâu.
+    while #candidates > OBSTACLE_CONFIG.PathfindingMaxCandidates do
+        table.remove(candidates)
+    end
+    local searchStartedAt = tick()
+    local bestWaypoints = nil
+    local bestScore = math.huge
+    local bestWaypoint, bestDirection, bestLabel = nil, nil, nil
+    for _, candidate in ipairs(candidates) do
+        if bestWaypoint and tick() - searchStartedAt > OBSTACLE_CONFIG.PathfindingBudget then
+            break
+        end
+        local path = PathfindingService:CreatePath({
+            AgentRadius = OBSTACLE_CONFIG.CharacterRadius + 0.5,
+            AgentHeight = 5,
+            AgentCanJump = false,
+            WaypointSpacing = 4,
+        })
+        local ok = pcall(function()
+            path:ComputeAsync(position, candidate.Position)
+        end)
+
+        if ok and path.Status == Enum.PathStatus.Success then
+            local waypoints = path:GetWaypoints()
+            if #waypoints >= 2 then
+                local valid = true
+                local exitedCurrentZone = currentZone == nil
+                local pathLength = 0
+                local fullRouteEnemyPenalty = 0
+                local routeMinEnemyDistance = math.huge
+                local cumulativeTravelTime = 0
+                for index = 2, #waypoints do
+                    local previousWaypoint = waypoints[index - 1].Position
+                    local waypointPosition = waypoints[index].Position
+                    local segmentLength = (waypointPosition - previousWaypoint).Magnitude
+                    local segmentDirection = flatUnit(waypointPosition - previousWaypoint)
+                    local widthHit = castObstacle(
+                        previousWaypoint,
+                        segmentDirection,
+                        math.max(0, segmentLength - 0.8),
+                        OBSTACLE_CONFIG.PreferredCorridorRadius,
+                        routeRayParams
+                    )
+                    if widthHit and widthHit.Distance < segmentLength - 1.2 then
+                        valid = false
+                        break
+                    end
+                    local segmentPenalty, segmentMinDistance, segmentBlocked =
+                        assessEnemyRiskOnSegment(previousWaypoint, waypointPosition, enemies, cumulativeTravelTime)
+                    fullRouteEnemyPenalty = fullRouteEnemyPenalty + segmentPenalty
+                    routeMinEnemyDistance = math.min(routeMinEnemyDistance, segmentMinDistance)
+                    if segmentBlocked or segmentMinDistance < OBSTACLE_CONFIG.EnemyRouteHardReject then
+                        valid = false
+                        break
+                    end
+                    cumulativeTravelTime = cumulativeTravelTime + segmentLength / OBSTACLE_CONFIG.EnemyPredictionSpeed
+                    local zoneAtWaypoint = getContainingObstacleZone(waypointPosition)
+                    if zoneAtWaypoint then
+                        -- Cho phép đi vòng/tạt ngang bên trong vùng hiện tại, nhưng không được
+                        -- xuyên qua vùng cấm khác hoặc quay lại vùng cũ sau khi đã thoát.
+                        if zoneAtWaypoint ~= currentZone or exitedCurrentZone then
+                            valid = false
+                            break
+                        end
+                    else
+                        exitedCurrentZone = true
+                    end
+                    pathLength = pathLength + segmentLength
+                end
+
+                if valid and exitedCurrentZone then
+                    local nextWaypoint = waypoints[2].Position
+                    local direction = flatUnit(nextWaypoint - position)
+                    local firstDistance = (Vector3.new(nextWaypoint.X - position.X, 0, nextWaypoint.Z - position.Z)).Magnitude
+                    if firstDistance >= 1.5 then
+                        local danger = getPredictedRouteDanger(position, direction, math.min(firstDistance, 10), enemies)
+                        local score = pathLength + danger * 18
+                            + fullRouteEnemyPenalty * OBSTACLE_CONFIG.EnemyRoutePenaltyWeight
+                            + getEnemyDangerScore(candidate.Position, enemies) * 8
+                        if routeMinEnemyDistance >= OBSTACLE_CONFIG.EnemyRouteHardReject
+                            and score < bestScore then
+                            bestScore = score
+                            bestWaypoint = nextWaypoint
+                            bestDirection = direction
+                            bestLabel = candidate.Label
+                            bestWaypoints = waypoints
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if bestWaypoint then
+        -- V8: đi tới waypoint xa nhất nhìn thấy được thay vì chỉ ~4 studs đầu tiên.
+        if bestWaypoints then
+            local farWaypoint = pickPathLookahead(position, bestWaypoints, enemies, currentZone, routeRayParams)
+            if farWaypoint then
+                bestWaypoint = farWaypoint
+                bestDirection = flatUnit(farWaypoint - position)
+            end
+        end
+        return bestWaypoint, bestDirection, true, bestScore, bestLabel
+    end
+    return nil
+end
+
+local function findRecoveryTarget(position, enemies, currentZone)
+    local character = LocalPlayer.Character
+    local rayParams = createObstacleRayParams(character, enemies)
+
+    -- V8: thoát vùng cấm tức thời (không yield) được thử trước các phương án chậm hơn.
+    if currentZone then
+        local zoneTarget, zoneDirection, zoneWide, zoneClear, zoneLabel =
+            findInstantZoneEscape(position, enemies, escapeHeading)
+        if zoneTarget and zoneDirection then
+            return zoneTarget, zoneDirection, zoneWide, zoneClear, zoneLabel
+        end
+    end
+
+    local backtrackTarget, backtrackDirection, usedWide, clearDistance, label =
+        findLastSafeRecoveryTarget(position, enemies, rayParams, currentZone)
+    if backtrackTarget then
+        return backtrackTarget, backtrackDirection, usedWide, clearDistance, label
+    end
+
+    -- Tường/góc thường làm Spherecast đường thẳng thất bại dù vẫn có lối vòng.
+    -- Dùng navmesh để tìm chuỗi waypoint; nếu navmesh không có đường thì fallback quét cũ.
+    local pathTarget, pathDirection, pathUsedWide, pathClear, pathLabel =
+        findPathfindingRecoveryStep(position, enemies, currentZone)
+    if pathTarget and pathDirection then
+        return pathTarget, pathDirection, pathUsedWide, pathClear, pathLabel
+    end
+
+    local bestScore = -math.huge
+    local bestTarget, bestDirection, bestClear = nil, nil, 0
+    local zoneOffset = currentZone and Vector3.new(
+        position.X - currentZone.Position.X, 0, position.Z - currentZone.Position.Z
+    ) or nil
+
+    for i = 1, OBSTACLE_CONFIG.ScanDirections do
+        local direction = DIRECTIONS_36[i]
+        local outwardAllowed = true
+        if currentZone and zoneOffset and zoneOffset.Magnitude > 0.05 then
+            outwardAllowed = direction:Dot(zoneOffset.Unit) > 0.02
+        end
+
+        if outwardAllowed and not isDirectionRemembered(position, direction, OBSTACLE_CONFIG.ZoneLookahead) then
+            local hit = castObstacle(
+                position, direction,
+                OBSTACLE_CONFIG.ScanRadius,
+                OBSTACLE_CONFIG.CorridorRadius,
+                rayParams
+            )
+            local clear = hit and math.max(0, hit.Distance - 1.5) or OBSTACLE_CONFIG.ScanRadius
+            local requiredDistance = 8
+            if currentZone then
+                local radial = zoneOffset and zoneOffset.Magnitude or 0
+                requiredDistance = math.max(
+                    16,
+                    ((currentZone.Radius or OBSTACLE_CONFIG.MemoryZoneRadius) - radial + 2) * 2
+                ) * OBSTACLE_CONFIG.ZoneEscapeDistanceMultiplier -- V8: gấp đôi khoảng cách thoát
+            end
+            local maxEscapeStep = currentZone
+                and OBSTACLE_CONFIG.ForbiddenZoneEscapeStep
+                or 16
+            local step = math.min(math.max(requiredDistance, RECOVERY_CONFIG.BacktrackMax), clear, maxEscapeStep)
+
+            if clear >= math.min(requiredDistance, 5) and step >= 5 then
+                local target = position + direction * step
+                local routeDanger = getPredictedRouteDanger(position, direction, step, enemies)
+                local endpointDanger = getEnemyDangerScore(target, enemies)
+                local lanePenalty = getLaneEnemyPenalty(position, direction, clear, enemies)
+                local routePenalty, minEnemyDistance, routeBlocked =
+                    assessEnemyRiskOnSegment(position, target, enemies, 0)
+                local score = clear * 0.9 - routeDanger * 60 - endpointDanger * 22
+                    - lanePenalty - routePenalty * OBSTACLE_CONFIG.EnemyRoutePenaltyWeight
+
+                if routeBlocked or minEnemyDistance < OBSTACLE_CONFIG.EnemyRouteHardReject then
+                    score = -math.huge
+                end
+
+                if currentZone and getContainingObstacleZone(target) == currentZone then
+                    score = score - 1000
+                end
+
+                if score > bestScore then
+                    bestScore = score
+                    bestTarget = target
+                    bestDirection = direction
+                    bestClear = clear
+                end
+            end
+        end
+    end
+
+    if bestTarget then
+        return bestTarget, bestDirection, true, bestClear,
+            currentZone and "Thoát vùng cấm" or "Thoát góc kẹt"
+    end
+    return nil, nil, true, 0, "Chưa tìm được lối thoát an toàn"
+end
+
+local function invalidatePlanner()
+    planVersion += 1
+    isPlanning = false
+end
+
+local function stopCurrentMove(humanoid, hrp)
+    activeMove = nil
+    invalidatePlanner()
+    if humanoid and hrp and not AppState.ManualOverride then
+        humanoid:MoveTo(hrp.Position)
+    end
+end
+
+-- DELTA ADD-ON: chọn hướng thoát khẩn cấp bằng phép tính nhẹ, không gọi Pathfinding.
+-- Chấm điểm 24 hướng theo khoảng trống vật cản, khoảng cách dự đoán tới toàn bộ quái,
+-- và xu hướng đi ngược về phía ít quái. Dùng Humanoid:Move để không đứng chờ task.spawn.
+-- V8: loại thân quái khỏi tia quét + tôn trọng CanCollide, tránh vùng cấm, đánh giá cả đoạn đường,
+-- phân tích khoảng hở của đàn quái, tránh góc kín/đường cụt, giữ hướng ổn định (hysteresis).
+-- Trả về: hướng thoát, khoảng cách có thể đi thật sự (đã kiểm tra khoảng trống).
+local function chooseImmediateEscapeDirection(position, character, enemies, currentDirection)
+    local params = createObstacleRayParams(character, enemies)
+    local now = tick()
+    local inZone = AppState.InForbiddenZone
+    local stepDistance = inZone
+        and OBSTACLE_CONFIG.ForbiddenZoneEmergencyStep
+        or OBSTACLE_CONFIG.EmergencyStepDistance
+
+    local zones = nil
+    if #ObstacleMemory > 0 then
+        zones = getNearbyZones(position, stepDistance + 20)
+    end
+    local crowdGap = makeCrowdGap(position, enemies)
+
+    local candidates = {}
+    for i = 1, #DIRECTIONS_24 do
+        candidates[#candidates + 1] = DIRECTIONS_24[i]
+    end
+    local currentFlat = nil
+    if currentDirection and currentDirection.Magnitude > 0.05 then
+        currentFlat = flatUnit(currentDirection)
+        candidates[#candidates + 1] = currentFlat
+    end
+
+    local function evaluate(ignoreZones)
+        local scored = {}
+        for _, direction in ipairs(candidates) do
+            local hit = workspace:Raycast(position + Vector3.new(0, 2, 0), direction * stepDistance, params)
+            local clearDistance = hit
+                and math.max(0, hit.Distance - OBSTACLE_CONFIG.EmergencyObstacleBuffer)
+                or stepDistance
+
+            if clearDistance >= 4 then
+                local goDistance = math.min(stepDistance, clearDistance)
+                local target = position + direction * goDistance
+                local zoneOk = true
+                local zonePenalty = 0
+
+                if zones and #zones > 0 then
+                    if inZone then
+                        local exitDistance = getZoneUnionExitDistance(position, direction, zones)
+                        if exitDistance == math.huge then
+                            zoneOk = false
+                        else
+                            zonePenalty = exitDistance * 3
+                            if exitDistance > goDistance then
+                                zonePenalty = zonePenalty + 40
+                            end
+                            if zoneCrossingAlong(position, direction, exitDistance + 0.5, goDistance, zones) then
+                                zoneOk = false
+                            end
+                        end
+                    elseif zoneCrossingAlong(position, direction, 0, goDistance, zones) then
+                        zoneOk = false
+                    end
+                end
+
+                if ignoreZones then
+                    zoneOk = true
+                    zonePenalty = zonePenalty + 60
+                end
+
+                if zoneOk then
+                    local score = clearDistance * 2 - zonePenalty
+                    local totalThreat = 0
+                    local nearestPredicted = math.huge
+
+                    for _, enemy in ipairs(enemies) do
+                        local velocity = enemy.Velocity or Vector3.zero
+                        local predicted = enemy.Position + velocity * 0.45
+                        local delta = Vector3.new(target.X - predicted.X, 0, target.Z - predicted.Z)
+                        local distance = delta.Magnitude
+                        if distance < nearestPredicted then nearestPredicted = distance end
+                        totalThreat = totalThreat + 1 / math.max(distance, 2)
+                        if distance < OBSTACLE_CONFIG.EnemyRouteHardReject then
+                            score = score - (OBSTACLE_CONFIG.EnemyRouteHardReject - distance) * 18
+                        end
+                    end
+                    score = score + math.min(nearestPredicted, 40) * 2 - totalThreat * 90
+
+                    -- Đánh giá TOÀN BỘ đoạn đường theo vị trí quái dự đoán, không chỉ điểm đến.
+                    local routePenalty, minEnemyDistance, routeBlocked =
+                        assessEnemyRiskOnSegment(position, target, enemies, 0)
+                    score = score - routePenalty * OBSTACLE_CONFIG.EnemyRoutePenaltyWeight
+                    if routeBlocked then
+                        -- Không ưu tiên đường xuyên sát Enemy chỉ vì thoát tường nhanh.
+                        score = score - 420
+                    elseif minEnemyDistance < OBSTACLE_CONFIG.EnemyRouteCautionDistance then
+                        local dangerRatio = (OBSTACLE_CONFIG.EnemyRouteCautionDistance - minEnemyDistance)
+                            / OBSTACLE_CONFIG.EnemyRouteCautionDistance
+                        score = score - 180 * dangerRatio * dangerRatio
+                    end
+
+                    -- Khi đang ở trong vùng cấm, fallback cũng không được lao vào Enemy
+                    -- chỉ vì mọi hướng khác đã bị vùng cấm chặn.
+                    if inZone and minEnemyDistance < OBSTACLE_CONFIG.ZoneEscapeEmergencyEnemyFloor then
+                        zoneOk = false
+                    end
+
+                    score = score + getCrowdGapBonus(direction, crowdGap)
+                    score = score - getFailedRoutePenalty(position, direction, now)
+
+                    if currentFlat then
+                        -- V8.1: hysteresis chống rung hướng. Giữ hướng cũ nếu nó vẫn có khoảng trống
+                        -- và không có nguy cơ Enemy hard-reject; chỉ rẽ mạnh khi tuyến hiện tại xấu rõ rệt.
+                        local alignment = direction:Dot(currentFlat)
+                        if alignment > 0.70 then
+                            score = score + 110 * alignment
+                        elseif alignment < -0.25 then
+                            score = score - 180 * math.abs(alignment)
+                        else
+                            score = score + alignment * 22
+                        end
+                    end
+
+                    if zoneOk then
+                        table.insert(scored, {
+                            Direction = direction,
+                            Score = score,
+                            Target = target,
+                            Go = goDistance,
+                        })
+                    end
+                end
+            end
+        end
+        return scored
+    end
+
+    local scored = evaluate(false)
+    if #scored == 0 and zones and #zones > 0 then
+        scored = evaluate(true)
+    end
+    if #scored == 0 then
+        return nil
+    end
+
+    table.sort(scored, function(a, b)
+        return a.Score > b.Score
+    end)
+
+    -- Chỉ đo độ rộng hai bên + độ thoáng (tốn hơn) cho vài ứng viên đứng đầu.
+    local bestEntry, bestFinal = nil, -math.huge
+    for index = 1, math.min(4, #scored) do
+        local entry = scored[index]
+        local leftClear, rightClear = measureSideClearance(position, entry.Direction, params)
+        local openness = measureOpenness(entry.Target, params)
+        local minSide = math.min(leftClear, rightClear)
+        local final = entry.Score + getSideClearanceScore(leftClear, rightClear) + openness * 30
+        -- V8.1: tránh thoát khỏi một bức tường để lao vào góc/tường thứ hai.
+        if minSide < OBSTACLE_CONFIG.MinSideClearance then
+            final = final - (OBSTACLE_CONFIG.MinSideClearance - minSide) * 18
+        end
+        if openness < 0.25 then
+            final = final - 90
+        elseif openness < 0.40 then
+            final = final - 35
+        end
+        if final > bestFinal then
+            bestFinal = final
+            bestEntry = entry
+        end
+    end
+
+    return bestEntry.Direction, bestEntry.Go
+end
+
+local function isEnemyDirectlyInLane(position, direction, enemies)
+    local dir = flatUnit(direction)
+    local proactiveLookAhead = math.max(18, OBSTACLE_CONFIG.MaxReactiveStep * 2)
+
+    for _, enemy in ipairs(enemies) do
+        local offset = enemy.Position - position
+        local forwardDistance = offset:Dot(dir)
+        local lateralDistance = math.abs(offset.X * dir.Z - offset.Z * dir.X)
+
+        -- Dự đoán vị trí quái tại lúc nhân vật tới ngang vị trí đó.
+        -- Chủ động đổi tuyến từ xa, không chờ quái áp sát mới quay đầu.
+        if forwardDistance > 0 and forwardDistance <= proactiveLookAhead
+            and lateralDistance <= OBSTACLE_CONFIG.CorridorHalfWidth then
+            local interceptTime = math.clamp(
+                forwardDistance / OBSTACLE_CONFIG.EnemyPredictionSpeed,
+                0,
+                OBSTACLE_CONFIG.PredictionHorizon
+            )
+            local velocity = enemy.Velocity or Vector3.zero
+            if velocity.Magnitude > OBSTACLE_CONFIG.EnemyVelocityLimit then
+                velocity = velocity.Unit * OBSTACLE_CONFIG.EnemyVelocityLimit
+            end
+            local predicted = enemy.Position + velocity * interceptTime
+            local predictedOffset = predicted - position
+            local predictedForward = predictedOffset:Dot(dir)
+            local predictedLateral = math.abs(
+                predictedOffset.X * dir.Z - predictedOffset.Z * dir.X
+            )
+            local predictedDistance = Vector3.new(
+                predictedOffset.X, 0, predictedOffset.Z
+            ).Magnitude
+
+            if predictedForward > 0
+                and predictedForward <= proactiveLookAhead
+                and predictedLateral <= OBSTACLE_CONFIG.EmergencyLaneDistance + 2
+                and predictedDistance <= OBSTACLE_CONFIG.EnemyRouteCautionDistance then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+-- DELTA ADD-ON: nhận biết joystick cảm ứng mà không tắt radar/logic né.
+-- Khi người chơi tự kéo joystick, chỉ nhường quyền điều khiển chuyển động;
+-- các vòng quét quái, theo dõi vùng cấm và cập nhật trạng thái vẫn chạy bình thường.
+local cachedPlayerControls = nil
+local playerControlsResolved = false
+local manualTouchOverrideActive = false
+local boostedHumanoid = nil
+local boostedOriginalWalkSpeed = nil
+
+local function getTouchMoveVector()
+    if not UserInputService.TouchEnabled then
+        return Vector3.zero
+    end
+    if not playerControlsResolved then
+        playerControlsResolved = true
+        task.spawn(function()
+            pcall(function()
+                local playerScripts = LocalPlayer:WaitForChild("PlayerScripts", 5)
+                local playerModule = playerScripts and playerScripts:WaitForChild("PlayerModule", 5)
+                if playerModule then
+                    local module = require(playerModule)
+                    cachedPlayerControls = module:GetControls()
+                end
+            end)
+        end)
+    end
+    if cachedPlayerControls then
+        local ok, moveVector = pcall(function()
+            return cachedPlayerControls:GetMoveVector()
+        end)
+        if ok and typeof(moveVector) == "Vector3" then
+            return moveVector
+        end
+    end
+    return Vector3.zero
+end
+
+local function setForbiddenZoneSpeed(humanoid, insideZone)
+    if insideZone then
+        if boostedHumanoid ~= humanoid then
+            if boostedHumanoid and boostedOriginalWalkSpeed then
+                pcall(function() boostedHumanoid.WalkSpeed = boostedOriginalWalkSpeed end)
+            end
+            boostedHumanoid = humanoid
+            boostedOriginalWalkSpeed = humanoid.WalkSpeed
+        end
+        if humanoid.WalkSpeed < OBSTACLE_CONFIG.ForbiddenZoneWalkSpeed then
+            humanoid.WalkSpeed = OBSTACLE_CONFIG.ForbiddenZoneWalkSpeed
+        end
+    elseif boostedHumanoid then
+        if boostedHumanoid == humanoid and boostedOriginalWalkSpeed then
+            -- Chỉ khôi phục nếu WalkSpeed vẫn là mức boost do script đặt.
+            if math.abs(humanoid.WalkSpeed - OBSTACLE_CONFIG.ForbiddenZoneWalkSpeed) < 0.1 then
+                humanoid.WalkSpeed = boostedOriginalWalkSpeed
+            end
+        end
+        boostedHumanoid = nil
+        boostedOriginalWalkSpeed = nil
+    end
+end
+
+-- ==========================================================
+-- UPGRADE V8 (B2) - CỔNG LỆNH DI CHUYỂN DUY NHẤT + NHƯỜNG QUYỀN JOYSTICK
+-- Mọi lệnh MoveTo của hệ thống tự động đi qua issueAutoMove; khi người chơi đang điều khiển tay
+-- cổng này từ chối ra lệnh, nhưng radar/phân tích vùng cấm/lập đường nền vẫn chạy.
+-- ==========================================================
+local lastAutoMoveCommandAt = 0
+local nextInstantZoneAt = 0
+local zoneDwellAnchor = nil
+local recoveryIdleSince = nil
+
+local MANUAL_KEYS = {
+    Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+    Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right,
+}
+local manualReleaseSince = nil
+local manualResolveStartedAt = nil
+local manualFallbackStreak = 0
+
+-- Quyết định người chơi có đang điều khiển tay hay không.
+-- Nguồn 1: PlayerModule/ControlModule (joystick cảm ứng). Nguồn 2: phím di chuyển (khi có bàn phím).
+-- Nguồn 3 (dự phòng, chỉ khi không đọc được ControlModule): Humanoid.MoveDirection mà script không ra lệnh.
+-- Có trễ (hysteresis) và thời gian ân hạn khi thả để joystick không bị ngắt/bật chập chờn.
+local function resolveManualInputActive(humanoid, now, previouslyActive)
+    manualResolveStartedAt = manualResolveStartedAt or now
+    local deadzone = OBSTACLE_CONFIG.ManualTouchDeadzone
+    local strength = getTouchMoveVector().Magnitude
+
+    if strength < deadzone then
+        local focused = nil
+        pcall(function()
+            focused = UserInputService:GetFocusedTextBox()
+        end)
+        if not focused then
+            for _, key in ipairs(MANUAL_KEYS) do
+                local okKey, down = pcall(UserInputService.IsKeyDown, UserInputService, key)
+                if okKey and down then
+                    strength = 1
+                    break
+                end
+            end
+        end
+    end
+
+    if strength < deadzone and not cachedPlayerControls and playerControlsResolved
+        and now - manualResolveStartedAt > 6 then
+        local ownCommand = activeMove ~= nil
+            or now < emergencyMoveUntil
+            or (now - lastAutoMoveCommandAt) < 0.9
+        if not ownCommand and humanoid.MoveDirection.Magnitude > 0.3 then
+            manualFallbackStreak += 1
+            if manualFallbackStreak >= 3 then
+                strength = 1
+            end
+        else
+            manualFallbackStreak = 0
+        end
+    else
+        manualFallbackStreak = 0
+    end
+
+    local threshold = previouslyActive and OBSTACLE_CONFIG.ManualDeadzoneRelease or deadzone
+    if strength >= threshold then
+        manualReleaseSince = nil
+        return true
+    end
+
+    if previouslyActive then
+        manualReleaseSince = manualReleaseSince or now
+        if now - manualReleaseSince < OBSTACLE_CONFIG.ManualReleaseGrace then
+            return true
+        end
+    end
+    manualReleaseSince = nil
+    return false
+end
+
+-- Cổng lệnh di chuyển duy nhất của hệ thống tự động.
+local function issueAutoMove(humanoid, targetPosition)
+    if AppState.ManualOverride then return false end
+    if not humanoid or not humanoid.Parent then return false end
+    lastAutoMoveCommandAt = tick()
+    humanoid:MoveTo(targetPosition)
+    return true
+end
+
+-- Bắt đầu một chặng di chuyển có theo dõi tiến triển (dùng chung cấu trúc activeMove của V7.1).
+local function startAutoMove(humanoid, hrp, targetPosition, direction, kind)
+    local current = hrp.Position
+    local stepDistance = Vector3.new(targetPosition.X - current.X, 0, targetPosition.Z - current.Z).Magnitude
+    if stepDistance < 1.5 then return false end
+    if not issueAutoMove(humanoid, targetPosition) then return false end
+
+    local walkSpeed = math.max(humanoid.WalkSpeed, 1)
+    local timeout = math.max(OBSTACLE_CONFIG.MinMoveTimeout, (stepDistance / walkSpeed) * 1.8 + 0.2)
+    escapeHeading = flatUnit(direction)
+    escapeHeadingUntil = tick() + OBSTACLE_CONFIG.EscapeLockSeconds
+    activeMove = {
+        StartPosition = current,
+        TargetPosition = targetPosition,
+        Direction = flatUnit(direction),
+        StepDistance = stepDistance,
+        StartedAt = tick(),
+        LastProgressPosition = current,
+        LastProgressCheck = tick(),
+        Timeout = timeout,
+        Kind = kind,
+    }
+    return true
+end
+
+-- Thay cho "hủy tuyến rồi MoveTo(vị trí hiện tại)": ra hướng thoát dự phòng NGAY, không đứng chờ.
+-- Chỉ khi không có hướng nào khả dụng mới quay về hành vi cũ (giữ nguyên tại chỗ).
+local function rerouteOrHold(humanoid, hrp, char, enemies, now)
+    if AppState.ManualOverride then return false end
+    local position = hrp.Position
+    local inZone = getContainingObstacleZone(position) ~= nil
+
+    if inZone then
+        local target, direction = findInstantZoneEscape(position, enemies, escapeHeading)
+        if target and direction and startAutoMove(humanoid, hrp, target, direction, "ZoneEscape") then
+            return true
+        end
+    end
+
+    if inZone or #enemies > 0 then
+        local direction, goDistance = chooseImmediateEscapeDirection(
+            position, char, enemies, emergencyDirection or escapeHeading
+        )
+        if direction then
+            local step = inZone and OBSTACLE_CONFIG.ForbiddenZoneEmergencyStep or 8
+            step = math.max(2, math.min(step, goDistance or step))
+            emergencyDirection = direction
+            emergencyMoveUntil = now + OBSTACLE_CONFIG.EmergencyRefresh + 0.12
+            if issueAutoMove(humanoid, position + direction * step) then
+                return true
+            end
+        end
+    end
+
+    issueAutoMove(humanoid, position)
+    return false
+end
+
+-- Phát hiện sớm: quái đang lao về phía nhân vật và sẽ chạm trong thời gian ngắn,
+-- để thoát hiểm trước khi quái áp sát (không đợi quái dí sát người mới quay đầu).
+local function detectPredictiveThreat(position, enemies)
+    for _, enemy in ipairs(enemies) do
+        local dx = position.X - enemy.Position.X
+        local dz = position.Z - enemy.Position.Z
+        local dist = math.sqrt(dx * dx + dz * dz)
+        if dist > 0.5 and dist <= 32 then
+            local velocity = enemy.Velocity or Vector3.zero
+            local closing = (velocity.X * dx + velocity.Z * dz) / dist
+            if closing > 1.5 then
+                if dist <= OBSTACLE_CONFIG.PredictiveApproachDistance then
+                    return true
+                end
+                if (dist - 4) / closing <= OBSTACLE_CONFIG.PredictiveContactTime then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- Nếu thoát hiểm khẩn cấp mà vẫn không tiến được, ghi nhớ hướng đó là tuyến thất bại tạm thời.
+local emergencyProbePosition = nil
+local emergencyProbeTime = 0
+local function noteEmergencyProgress(position, direction, now)
+    if not emergencyProbePosition or now - emergencyProbeTime > 1.0 then
+        emergencyProbePosition = position
+        emergencyProbeTime = now
+        return
+    end
+    if now - emergencyProbeTime >= 0.45 then
+        if (position - emergencyProbePosition).Magnitude < 1.0 then
+            recordFailedRoute(position, direction)
+        end
+        emergencyProbePosition = position
+        emergencyProbeTime = now
+    end
+end
+
+addConn(RunService.Heartbeat:Connect(function()
+    local now = tick()
+    local activeLoopInterval = AppState.InForbiddenZone and OBSTACLE_CONFIG.ForbiddenZoneLoopInterval or OBSTACLE_CONFIG.MainLoopInterval
+    if AppState.UrgentThreat then
+        activeLoopInterval = math.min(activeLoopInterval, OBSTACLE_CONFIG.UrgentLoopInterval)
+    end
+    if now - (AppState.LastTick or 0) < activeLoopInterval then
+        return
+    end
+    AppState.LastTick = now
+
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+
+    if not hrp or not humanoid or humanoid.Health <= 0 then
+        activeMove = nil
+        isFleeing = false
+        latestDangerCount = 0
+        invalidatePlanner()
+        return
+    end
+
+    -- Radar địch chạy độc lập, không phải chờ Spherecast quét xong.
+    local allEnemies = EnemyDetector:ScanAll()
+
+    -- Không dùng vận tốc dự đoán của Enemy đang bay/văng bất thường.
+    -- Humanoid dùng FloorMaterial + state; NPC không Humanoid dùng tia dò mặt đất.
+    local function isEnemyGrounded(enemy)
+        local part = enemy and enemy.Part
+        if not part or not part.Parent then return false end
+        local model = getEnemyModel(part)
+        local enemyHumanoid = model and model:FindFirstChildOfClass("Humanoid")
+        if enemyHumanoid then
+            local state = enemyHumanoid:GetState()
+            local airborneState = state == Enum.HumanoidStateType.Jumping
+                or state == Enum.HumanoidStateType.Freefall
+                or state == Enum.HumanoidStateType.FallingDown
+                or state == Enum.HumanoidStateType.Physics
+            return enemyHumanoid.FloorMaterial ~= Enum.Material.Air and not airborneState
+        end
+
+        local cached = enemyGroundCache[part]
+        if cached and now - cached.Time < OBSTACLE_CONFIG.EnemyGroundCheckInterval then
+            return cached.Grounded
+        end
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.IgnoreWater = true
+        params.FilterDescendantsInstances = model and { model } or { part }
+        local origin = enemy.Position + Vector3.new(0, 1, 0)
+        local ok, groundHit = pcall(function()
+            return workspace:Raycast(
+                origin,
+                Vector3.new(0, -(OBSTACLE_CONFIG.EnemyGroundCheckDistance + 1), 0),
+                params
+            )
+        end)
+        local verticalSpeed = 0
+        pcall(function()
+            verticalSpeed = math.abs(part.AssemblyLinearVelocity.Y)
+        end)
+        local grounded = ok and groundHit ~= nil
+            and verticalSpeed <= OBSTACLE_CONFIG.EnemyAirborneVerticalLimit
+        enemyGroundCache[part] = { Grounded = grounded, Time = now }
+        return grounded
+    end
+
+    for _, enemy in ipairs(allEnemies) do
+        local part = enemy.Part
+        local previous = part and enemyMotionHistory[part]
+        local velocity = Vector3.zero
+        local grounded = isEnemyGrounded(enemy)
+        enemy.IsGrounded = grounded
+        if grounded and previous then
+            local elapsed = now - previous.Time
+            if elapsed > 0.03 and elapsed < 1 then
+                velocity = (enemy.Position - previous.Position) / elapsed
+                local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+                if flatVelocity.Magnitude > OBSTACLE_CONFIG.EnemyVelocityLimit then
+                    flatVelocity = flatVelocity.Unit * OBSTACLE_CONFIG.EnemyVelocityLimit
+                end
+                velocity = flatVelocity
+            end
+        end
+        -- Enemy đang trên không: chỉ dùng vị trí thật, không ngoại suy cú văng theo tick.
+        enemy.Velocity = velocity
+        if part then
+            enemyMotionHistory[part] = { Position = enemy.Position, Time = now }
+        end
+    end
+
+    -- Dọn lịch sử của quái đã bị xóa để tránh bảng dự đoán tăng mãi theo thời gian.
+    for part in pairs(enemyMotionHistory) do
+        if not part or not part.Parent then
+            enemyMotionHistory[part] = nil
+            enemyGroundCache[part] = nil
+        end
+    end
+
+    local closestDist = math.huge
+    local enemiesInDangerZone = {}
+
+    for _, enemy in ipairs(allEnemies) do
+        local offset = enemy.Position - hrp.Position
+        local distSquared = offset:Dot(offset)
+
+        if distSquared < closestDist * closestDist then
+            closestDist = math.sqrt(distSquared)
+        end
+
+        if distSquared <= AppState.ScanRadius * AppState.ScanRadius then
+            table.insert(enemiesInDangerZone, enemy)
+        end
+    end
+
+    latestDangerCount = #enemiesInDangerZone
+    AppState.UrgentThreat = closestDist <= 20
+
+    local radarInfo = (closestDist == math.huge)
+        and "Gần nhất: --"
+        or string.format("Gần nhất: %dđ", math.floor(closestDist))
+
+    if not AppState.IsActive then
+        AppState.InForbiddenZone = false
+        setForbiddenZoneSpeed(humanoid, false)
+        AppState.ManualOverride = false
+        AppState.UrgentThreat = false
+        manualTouchOverrideActive = false
+        nextInstantZoneAt = 0
+        zoneDwellAnchor = nil
+        recoveryIdleSince = nil
+        if isFleeing or activeMove or isPlanning then
+            stopCurrentMove(humanoid, hrp)
+        end
+        isFleeing = false
+        forceWideScan = false
+        recoveryActive = false
+        recoveryReason = nil
+        forbiddenZoneEnteredAt = nil
+        timedZoneReplanDone = false
+        timedZoneReference = nil
+        emergencyMoveUntil = 0
+        emergencyDirection = nil
+        lastEmergencyRefresh = 0
+        escapeHeading = nil
+        escapeHeadingUntil = 0
+        return
+    end
+
+    local enteredObstacleZone = getContainingObstacleZone(hrp.Position)
+    AppState.InForbiddenZone = enteredObstacleZone ~= nil
+    setForbiddenZoneSpeed(humanoid, AppState.InForbiddenZone)
+
+    -- V8: nhận biết điều khiển tay bằng nhiều nguồn + trễ; cổng lệnh issueAutoMove sẽ từ chối ra lệnh.
+    local manualTouchActive = resolveManualInputActive(humanoid, now, manualTouchOverrideActive)
+    AppState.ManualOverride = manualTouchActive
+    if manualTouchActive then
+        -- Chỉ nhường lệnh di chuyển cho joystick; không tắt Auto Evade/radar.
+        -- Hủy waypoint cũ để khi thả joystick không kéo nhân vật theo tuyến lỗi thời.
+        if not manualTouchOverrideActive then
+            activeMove = nil
+            emergencyDirection = nil
+            emergencyMoveUntil = 0
+            invalidatePlanner()
+            nextPlanTime = now + 0.05
+        end
+        manualTouchOverrideActive = true
+        -- V8: radar vẫn chạy nền; vẫn ghi nhận điểm an toàn khi người chơi tự chạy ra khỏi nguy hiểm.
+        if not enteredObstacleZone and closestDist > RECOVERY_CONFIG.SafeEnemyDistance then
+            recordLastSafePosition(hrp.Position, now)
+        end
+        StatusTxt.Text = radarInfo .. (enteredObstacleZone and " | TỰ ĐIỀU KHIỂN - ĐANG Ở VÙNG CẤM" or " | TỰ ĐIỀU KHIỂN - RADAR VẪN CHẠY")
+        StatusTxt.TextColor3 = enteredObstacleZone and Color3.fromRGB(255, 150, 70) or Color3.fromRGB(100, 190, 255)
+        return
+    elseif manualTouchOverrideActive then
+        manualTouchOverrideActive = false
+        activeMove = nil
+        nextPlanTime = now
+        forceWideScan = true
+        -- V8: thả joystick -> xóa mục tiêu MoveTo cũ và tiếp tục né ngay trong cùng nhịp.
+        escapeHeading = nil
+        escapeHeadingUntil = 0
+        nextInstantZoneAt = 0
+        issueAutoMove(humanoid, hrp.Position)
+        if enteredObstacleZone then
+            recoveryActive = true
+            recoveryReason = "Tiếp tục thoát vùng cấm sau điều khiển tay"
+        end
+    end
+
+    -- DELTA ADD-ON: nếu ở liên tục trong cùng vùng cấm quá 1 giây,
+    -- hủy tuyến cũ và bắt buộc dùng recovery planner để chọn lộ trình thoát an toàn.
+    if enteredObstacleZone then
+        if timedZoneReference ~= enteredObstacleZone then
+            timedZoneReference = enteredObstacleZone
+            forbiddenZoneEnteredAt = now
+            timedZoneReplanDone = false
+            zoneDwellAnchor = hrp.Position
+        elseif not forbiddenZoneEnteredAt then
+            forbiddenZoneEnteredAt = now
+            timedZoneReplanDone = false
+        end
+
+        if not timedZoneReplanDone
+            and now - forbiddenZoneEnteredAt >= OBSTACLE_CONFIG.ForbiddenZoneReplanDelay
+            and activeMove and zoneDwellAnchor
+            and (hrp.Position - zoneDwellAnchor).Magnitude >= 3 then
+            -- V8: đang thoát có tiến triển thật -> không hủy tuyến (tránh dừng-chạy), chỉ gia hạn kiểm tra.
+            forbiddenZoneEnteredAt = now
+            zoneDwellAnchor = hrp.Position
+        end
+
+        local zoneMoveNeedsReplan = not activeMove
+            or (activeMove.Kind ~= "ZoneEscape"
+                and now - activeMove.LastProgressCheck >= OBSTACLE_CONFIG.ProgressCheckInterval)
+        if not timedZoneReplanDone
+            and zoneMoveNeedsReplan
+            and now - forbiddenZoneEnteredAt >= OBSTACLE_CONFIG.ForbiddenZoneReplanDelay then
+            timedZoneReplanDone = true
+            if activeMove and activeMove.Kind ~= "ZoneEscape" then
+                activeMove = nil
+                escapeHeading = nil
+                escapeHeadingUntil = 0
+            end
+            -- Không hủy một lệnh ZoneEscape đang hoạt động chỉ vì timer 0.10s vừa hết.
+            nextInstantZoneAt = 0
+            invalidatePlanner()
+            forceWideScan = true
+            nextPlanTime = 0
+            recoveryActive = true
+            recoveryReason = "Cần lập lại tuyến thoát vùng cấm"
+            StatusTxt.Text = radarInfo .. " | Đang kiểm tra lại đường thoát"
+            StatusTxt.TextColor3 = Color3.fromRGB(255, 75, 65)
+            print("[SMART EVADE] Kích hoạt kiểm tra lại tuyến thoát vùng cấm.")
+        end
+    else
+        forbiddenZoneEnteredAt = nil
+        timedZoneReplanDone = false
+        timedZoneReference = nil
+    end
+
+    -- Vùng cấm phải kích hoạt thoát hiểm kể cả khi không có quái gần đó.
+    if latestDangerCount == 0 and not enteredObstacleZone and not recoveryActive then
+        if isFleeing or activeMove or isPlanning then
+            stopCurrentMove(humanoid, hrp)
+            isFleeing = false
+        end
+        StatusTxt.Text = radarInfo .. " | An toàn"
+        StatusTxt.TextColor3 = Color3.fromRGB(100, 255, 100)
+        recordLastSafePosition(hrp.Position, now)
+        escapeHeading = nil
+        escapeHeadingUntil = 0
+        return
+    end
+
+    isFleeing = true
+
+    -- DELTA ADD-ON: nếu quái áp sát hoặc đông thành bầy, lập tức bước né tạm thời.
+    -- Không gọi MoveTo(hrp.Position), vì lệnh đó khiến nhân vật đứng yên trong lúc chờ tính đường.
+    local closeEnemyCount = 0
+    for _, enemy in ipairs(enemiesInDangerZone) do
+        local delta = enemy.Position - hrp.Position
+        local distance = Vector3.new(delta.X, 0, delta.Z).Magnitude
+        if distance <= OBSTACLE_CONFIG.EmergencyCrowdDistance then
+            closeEnemyCount += 1
+        end
+    end
+    local emergencyNeeded = closestDist <= 9
+        or closeEnemyCount >= OBSTACLE_CONFIG.EmergencyCrowdCount
+        or detectPredictiveThreat(hrp.Position, enemiesInDangerZone)
+    if emergencyNeeded then
+        AppState.UrgentThreat = true
+    end
+
+    if emergencyNeeded and now - lastEmergencyRefresh >= OBSTACLE_CONFIG.EmergencyRefresh then
+        local quickDirection, quickClear = chooseImmediateEscapeDirection(
+            hrp.Position, char, enemiesInDangerZone,
+            emergencyDirection or (activeMove and activeMove.Direction) or escapeHeading
+        )
+        lastEmergencyRefresh = now
+        if quickDirection then
+            emergencyDirection = quickDirection
+            emergencyMoveUntil = now + OBSTACLE_CONFIG.EmergencyRefresh + 0.12
+            if activeMove then
+                activeMove = nil
+            end
+            -- Hủy kết quả planner đang cũ; không dừng Humanoid tại chỗ.
+            invalidatePlanner()
+            local quickStep = enteredObstacleZone and OBSTACLE_CONFIG.ForbiddenZoneEmergencyStep or 8
+            if quickClear then quickStep = math.min(quickStep, quickClear) end
+            issueAutoMove(humanoid, hrp.Position + quickDirection * math.max(quickStep, 2))
+            noteEmergencyProgress(hrp.Position, quickDirection, now)
+            StatusTxt.Text = radarInfo .. " | THOÁT HIỂM TỨC THỜI - " .. tostring(closeEnemyCount) .. " quái gần"
+            StatusTxt.TextColor3 = Color3.fromRGB(255, 65, 65)
+        end
+    end
+
+    if enteredObstacleZone then
+        recoveryActive = true
+        recoveryReason = "Vùng cấm"
+        StatusTxt.Text = radarInfo .. " | ⚠ ĐANG THOÁT VÙNG CẤM"
+        StatusTxt.TextColor3 = Color3.fromRGB(255, 75, 65)
+    elseif recoveryActive then
+        StatusTxt.Text = radarInfo .. " | ĐANG KHÔI PHỤC ĐƯỜNG ĐI"
+        StatusTxt.TextColor3 = Color3.fromRGB(255, 170, 70)
+    else
+        recordLastSafePosition(hrp.Position, now)
+    end
+
+    -- V8: chế độ phục hồi không có quái và không ở vùng cấm quá 2 giây thì tự thoát,
+    -- tránh lập đường vô hạn khi không còn gì để né.
+    if recoveryActive and not enteredObstacleZone and latestDangerCount == 0 then
+        recoveryIdleSince = recoveryIdleSince or now
+        if now - recoveryIdleSince > 2.0 and not activeMove then
+            recoveryActive = false
+            recoveryReason = nil
+            recoveryIdleSince = nil
+        end
+    else
+        recoveryIdleSince = nil
+    end
+
+    -- Chỉ hủy tuyến nếu quái áp sát ngay trước mặt; không phản ứng với quái ở xa.
+    if activeMove and isEnemyDirectlyInLane(
+        hrp.Position,
+        activeMove.Direction,
+        enemiesInDangerZone
+    ) then
+        activeMove = nil
+        escapeHeading = nil
+        escapeHeadingUntil = 0
+        invalidatePlanner()
+        nextPlanTime = 0
+        -- V8: quái chắn tuyến -> ra hướng dự phòng ngay thay vì đứng yên chờ lập đường.
+        rerouteOrHold(humanoid, hrp, char, enemiesInDangerZone, now)
+    end
+
+    -- Nếu đang ở trong vùng cấm, chỉ giữ lệnh hiện tại nếu nó thực sự đi ra ngoài.
+    if enteredObstacleZone then
+        local zoneOffset = Vector3.new(
+            hrp.Position.X - enteredObstacleZone.Position.X,
+            0,
+            hrp.Position.Z - enteredObstacleZone.Position.Z
+        )
+        -- V8: tuyến thoát do planner/thoát tức thời đã tự kiểm tra thoát hợp các vùng chồng nhau;
+        -- chỉ tuyến khác mới cần kiểm tra theo một tâm vùng như V7.1.
+        local movingOutward = activeMove
+            and (activeMove.Kind == "ZoneEscape"
+                or (not isDirectionRemembered(hrp.Position, activeMove.Direction, OBSTACLE_CONFIG.ZoneLookahead)
+                    and (zoneOffset.Magnitude <= 0.05 or zoneOffset:Dot(activeMove.Direction) > 0)))
+
+        if activeMove and not movingOutward then
+            activeMove = nil
+            escapeHeading = nil
+            escapeHeadingUntil = 0
+            invalidatePlanner()
+            nextPlanTime = 0
+            rerouteOrHold(humanoid, hrp, char, enemiesInDangerZone, now)
+        elseif not activeMove and not isPlanning then
+            forceWideScan = true
+            nextPlanTime = 0
+        end
+    end
+
+    -- V8: THOÁT VÙNG CẤM TỨC THỜI. Vào vùng cấm là ra lệnh thoát ngay trong nhịp này,
+    -- không chờ Pathfinding. Nếu không có hướng hợp lệ thì planner (Pathfinding) mới tiếp quản.
+    if enteredObstacleZone and not activeMove and not AppState.ManualOverride
+        and now >= emergencyMoveUntil and now >= nextInstantZoneAt then
+        nextInstantZoneAt = now + OBSTACLE_CONFIG.ZoneEscapeReissueInterval
+        local zoneTarget, zoneDirection, _, _, zoneLabel =
+            findInstantZoneEscape(hrp.Position, enemiesInDangerZone, escapeHeading)
+        if zoneTarget and zoneDirection
+            and startAutoMove(humanoid, hrp, zoneTarget, zoneDirection, "ZoneEscape") then
+            invalidatePlanner()
+            StatusTxt.Text = radarInfo .. " | ⚠ THOÁT VÙNG CẤM NGAY - " .. tostring(zoneLabel)
+            StatusTxt.TextColor3 = Color3.fromRGB(255, 75, 65)
+        end
+    end
+
+    -- Kiểm tra tiến triển theo đúng hướng đã ra lệnh.
+    if activeMove then
+        local totalProgress = (hrp.Position - activeMove.StartPosition):Dot(activeMove.Direction)
+        local remainingDistance = (activeMove.TargetPosition - hrp.Position).Magnitude
+
+        if totalProgress >= activeMove.StepDistance - 1.2 or remainingDistance <= 2 then
+            activeMove = nil
+            nextPlanTime = 0
+            if not getContainingObstacleZone(hrp.Position) then
+                recoveryActive = false
+                recoveryReason = nil
+                recordLastSafePosition(hrp.Position, now)
+            end
+        else
+            local elapsedSinceCheck = now - activeMove.LastProgressCheck
+
+            if elapsedSinceCheck >= OBSTACLE_CONFIG.ProgressCheckInterval then
+                local displacementSinceCheck = hrp.Position - activeMove.LastProgressPosition
+                local flatDisplacement = Vector3.new(displacementSinceCheck.X, 0, displacementSinceCheck.Z)
+                -- V8: trượt dọc tường vẫn tính là có chuyển động; bị choáng/ngồi/đóng băng không bị coi là kẹt.
+                local progressSinceCheck = math.max(
+                    displacementSinceCheck:Dot(activeMove.Direction),
+                    flatDisplacement.Magnitude * 0.5
+                )
+                local incapacitated = humanoid.WalkSpeed < 1 or humanoid.PlatformStand or humanoid.Sit
+
+                if incapacitated then
+                    activeMove.LastProgressPosition = hrp.Position
+                    activeMove.LastProgressCheck = now
+                elseif progressSinceCheck < OBSTACLE_CONFIG.MinProgress then
+                    rememberBlockedDirectionSafe(
+                        hrp.Position,
+                        activeMove.Direction,
+                        "Nhân vật không tiến triển; tạo vùng cấm tại vị trí bị chặn"
+                    )
+
+                    activeMove = nil
+                    escapeHeading = nil
+                    escapeHeadingUntil = 0
+                    forceWideScan = true
+                    recoveryActive = true
+                    recoveryReason = "Kẹt đường"
+                    nextPlanTime = 0
+                    invalidatePlanner()
+                    rerouteOrHold(humanoid, hrp, char, enemiesInDangerZone, now)
+
+                    StatusTxt.Text = radarInfo .. " | Bị kẹt - lùi về điểm an toàn"
+                    StatusTxt.TextColor3 = Color3.fromRGB(255, 90, 70)
+                else
+                    activeMove.LastProgressPosition = hrp.Position
+                    activeMove.LastProgressCheck = now
+                    escapeHeading = activeMove.Direction
+                    escapeHeadingUntil = now + OBSTACLE_CONFIG.EscapeLockSeconds
+                end
+            end
+
+            if activeMove and now - activeMove.StartedAt > activeMove.Timeout then
+                rememberBlockedDirectionSafe(
+                    hrp.Position,
+                    activeMove.Direction,
+                    "Quá thời gian di chuyển; tạo vùng cấm tại vị trí hiện tại"
+                )
+
+                activeMove = nil
+                escapeHeading = nil
+                escapeHeadingUntil = 0
+                forceWideScan = true
+                recoveryActive = true
+                recoveryReason = "Timeout"
+                nextPlanTime = 0
+                invalidatePlanner()
+                rerouteOrHold(humanoid, hrp, char, enemiesInDangerZone, now)
+
+                StatusTxt.Text = radarInfo .. " | Kẹt quá lâu - đang phục hồi"
+                StatusTxt.TextColor3 = Color3.fromRGB(255, 90, 70)
+            end
+        end
+    end
+
+    if emergencyDirection and now >= emergencyMoveUntil then
+        emergencyDirection = nil
+    end
+
+    -- Chạy lập đường trong task riêng: radar không phải chờ các lượt Spherecast coarse + fine.
+    -- V8: lập đường gối đầu. Khi chặng hiện tại đã đi được ~50% thì bắt đầu tính chặng kế tiếp,
+    -- để lệnh MoveTo mới thay thế ngay khi tới đích cũ, nhân vật không phải đứng chờ giữa hai chặng.
+    local pipelineReady = false
+    if activeMove and not isPlanning and not activeMove.PlanRequested and not enteredObstacleZone
+        and activeMove.Kind ~= "ZoneEscape" then
+        local remainingLeg = Vector3.new(
+            activeMove.TargetPosition.X - hrp.Position.X, 0, activeMove.TargetPosition.Z - hrp.Position.Z
+        ).Magnitude
+        pipelineReady = remainingLeg <= math.max(3, activeMove.StepDistance * 0.5)
+    end
+
+    if (not activeMove or pipelineReady) and not isPlanning and now >= nextPlanTime
+        and now >= emergencyMoveUntil and not AppState.ManualOverride then
+        if pipelineReady then
+            activeMove.PlanRequested = true
+        end
+        nextPlanTime = now + (enteredObstacleZone and OBSTACLE_CONFIG.ForbiddenZonePlanCooldown or OBSTACLE_CONFIG.PlanCooldown)
+        isPlanning = true
+        planVersion += 1
+
+        local myVersion = planVersion
+        local startPosition = hrp.Position
+        local planningCharacter = char
+        local planningHumanoid = humanoid
+        local planningRoot = hrp
+        local planningEnemies = {}
+        local planningZone = enteredObstacleZone
+        local planningRecovery = recoveryActive
+        local shouldForceWideScan = forceWideScan
+        forceWideScan = false
+
+        -- Snapshot vị trí và part để kết quả lập đường không phụ thuộc bảng đang thay đổi.
+        for _, enemy in ipairs(enemiesInDangerZone) do
+            table.insert(planningEnemies, {
+                Position = enemy.Position,
+                Part = enemy.Part,
+                Velocity = enemy.Velocity or Vector3.zero,
+            })
+        end
+
+        task.spawn(function()
+            local ok, targetPosition, direction, usedWideScan, clearDistance, recoveryLabel = pcall(function()
+                if planningZone or planningRecovery then
+                    return findRecoveryTarget(startPosition, planningEnemies, planningZone)
+                end
+                return findSafestFleePosition(
+                    startPosition,
+                    planningEnemies,
+                    shouldForceWideScan
+                )
+            end)
+
+            if myVersion ~= planVersion then
+                return
+            end
+
+            isPlanning = false
+
+            if not ok then
+                warn("[SMART EVADE] Lỗi lập đường:", targetPosition)
+                nextPlanTime = tick() + 0.15
+                return
+            end
+
+            -- V8: người chơi đang điều khiển tay hoặc thoát hiểm tức thời đang chạy -> không ghi đè lệnh.
+            if AppState.ManualOverride or tick() < emergencyMoveUntil then
+                return
+            end
+
+            if not AppState.IsActive
+                or not isFleeing
+                or (latestDangerCount <= 0 and not planningZone and not planningRecovery)
+                or LocalPlayer.Character ~= planningCharacter
+                or not planningHumanoid.Parent
+                or planningHumanoid.Health <= 0
+                or not planningRoot.Parent then
+                return
+            end
+
+            -- Bỏ kết quả cũ nếu nhân vật đã bị đẩy/di chuyển xa trong lúc quét.
+            local currentPosition = planningRoot.Position
+            if (currentPosition - startPosition).Magnitude > OBSTACLE_CONFIG.MaxPlanStartDrift then
+                -- V8: nhân vật vẫn đang chạy thoát nên lệch vị trí là bình thường. Thay vì bỏ cả kết quả,
+                -- kiểm tra lại đích từ vị trí hiện tại; còn hợp lệ thì dùng tiếp với hướng đã cập nhật.
+                if targetPosition and direction
+                    and revalidatePlanTarget(currentPosition, targetPosition, planningEnemies, planningZone) then
+                    direction = flatUnit(targetPosition - currentPosition)
+                else
+                    nextPlanTime = tick()
+                    return
+                end
+            end
+
+            if targetPosition and direction then
+                local stepDistance = (targetPosition - currentPosition).Magnitude
+
+                if stepDistance >= 1.5 then
+                    if not issueAutoMove(planningHumanoid, targetPosition) then
+                        return
+                    end
+
+                    local walkSpeed = math.max(planningHumanoid.WalkSpeed, 1)
+                    local timeout = math.max(
+                        OBSTACLE_CONFIG.MinMoveTimeout,
+                        (stepDistance / walkSpeed) * 1.8 + 0.2
+                    )
+
+                    escapeHeading = flatUnit(direction)
+                    escapeHeadingUntil = tick() + OBSTACLE_CONFIG.EscapeLockSeconds
+
+                    activeMove = {
+                        StartPosition = currentPosition,
+                        TargetPosition = targetPosition,
+                        Direction = flatUnit(direction),
+                        StepDistance = stepDistance,
+                        StartedAt = tick(),
+                        LastProgressPosition = currentPosition,
+                        LastProgressCheck = tick(),
+                        Timeout = timeout,
+                        Kind = planningZone and "ZoneEscape" or nil,
+                    }
+
+                    local currentRadar = "Gần nhất: " .. tostring(math.floor(closestDist)) .. "đ"
+                    if recoveryLabel then
+                        StatusTxt.Text = currentRadar .. " | " .. recoveryLabel
+                    elseif usedWideScan then
+                        StatusTxt.Text = currentRadar .. string.format(
+                            " | Hành lang: %.0f studs",
+                            clearDistance or 0
+                        )
+                    else
+                        StatusTxt.Text = currentRadar .. string.format(
+                            " | Né %d quái",
+                            latestDangerCount
+                        )
+                    end
+                    StatusTxt.TextColor3 = Color3.fromRGB(255, 150, 50)
+                else
+                    StatusTxt.Text = "Radar đang hoạt động | Điểm né quá gần"
+                    StatusTxt.TextColor3 = Color3.fromRGB(255, 90, 70)
+                    nextPlanTime = tick() + 0.1
+                end
+            else
+                if not planningRecovery and not planningZone then
+                    -- Không tìm được hướng hợp lệ: chuyển sang chế độ lùi về điểm an toàn.
+                    recoveryActive = true
+                    recoveryReason = "Không còn lối tiến an toàn"
+                end
+                StatusTxt.Text = planningZone
+                    and "⚠ Đang ở vùng cấm | tiếp tục tìm lối thoát"
+                    or "Bị ép đường | chuyển sang phục hồi"
+                StatusTxt.TextColor3 = Color3.fromRGB(255, 90, 70)
+                nextPlanTime = tick() + 0.1
+            end
+        end)
+    elseif activeMove then
+        StatusTxt.Text = radarInfo .. " | Đang di chuyển / kiểm tra đường"
+        StatusTxt.TextColor3 = Color3.fromRGB(255, 190, 90)
+    elseif isPlanning then
+        StatusTxt.Text = radarInfo .. " | Đang quét hướng"
+        StatusTxt.TextColor3 = Color3.fromRGB(100, 190, 255)
+    end
+end))
+
+print("✅ SMART EVADE V8.1 CROWD STABILITY: Adaptive Corridor Scan + Emergency Zone Escape + Permanent Delta Zone Memory")
+print("✅ Loop:", OBSTACLE_CONFIG.MainLoopInterval, "s | Progress Check:", OBSTACLE_CONFIG.ProgressCheckInterval, "s")
+print("✅ V7.1 Smart Route | Ưu tiên đường rộng, phạt khe sát quái | Escape Lock:", OBSTACLE_CONFIG.EscapeLockSeconds, "s")
+print("✅ Delta Add-on: Ở trong vùng cấm > 1 giây sẽ ép lập lại tuyến thoát an toàn")
+print("✅ Delta Add-on: Pathfinding waypoint detour để vòng góc/tường; fallback 36 hướng nếu navmesh không có đường")
+print("✅ ScanRadius:", AppState.ScanRadius, "| FleeDistance:", AppState.FleeDistance)
+print("✅ Delta JSON v3: vùng cấm bán kính 10 studs, dữ liệu schema cũ đã reset")
+print("✅ Adaptive Narrow Passage + Safe Recovery Priority + Escape Commitment chống quay đầu")
+print("✅ Corner Escape + dự đoán quái + di chuyển chặng ngắn + thống kê JSON")
+print("✅ Menu: X đóng | − ẩn | chạm 3 ngón tay 2 lần để hiện lại")
+print("✅ Quét đường chạy nền - Radar không phải chờ Spherecast | Không có Anti-Stuck Jump")
+
+print("✅ Delta Emergency: thoát hiểm tức thời không chờ Pathfinding; đánh giá toàn bộ bầy quái + vật cản")
+print("✅ Forbidden Zone MAX: xử lý 0.02s, bước thoát tối đa 96 studs, khẩn cấp 72 studs, WalkSpeed boost 40; Path refresh 0.10s")
+print("✅ Touch Manual Override: joystick nhường quyền di chuyển nhưng radar và các logic vẫn tiếp tục chạy")
+print("✅ V8.1: Emergency Direction Hysteresis + Wall Exit Endpoint Openness + Stronger Enemy Route Penalty")
+print("✅ V8: thoát vùng cấm tức thời + không tạo vùng cấm lồng + Enemy hard safety fallback + cổng MoveTo duy nhất")
+print("✅ V8: né cả đàn quái, grounded prediction filter, chống Ghosting, chọn đường rộng/thoáng và nhớ tuyến thất bại")
+print("✅ V8: lập đường gối đầu + Pathfinding đa waypoint; thả joystick -> tự tiếp tục né")
