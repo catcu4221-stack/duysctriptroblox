@@ -119,11 +119,13 @@ end
 
 -- Cac script LocalScript khac co the phat Begin/End de tam dung Auto Follow.
 local movementOverrideEvent = PlayerGui:FindFirstChild("DuySystemMovementOverride")
+local createdMovementOverrideEvent = false
 if not movementOverrideEvent or not movementOverrideEvent:IsA("BindableEvent") then
     if movementOverrideEvent then movementOverrideEvent:Destroy() end
     movementOverrideEvent = Instance.new("BindableEvent")
     movementOverrideEvent.Name = "DuySystemMovementOverride"
     movementOverrideEvent.Parent = PlayerGui
+    createdMovementOverrideEvent = true
 end
 
 
@@ -581,6 +583,48 @@ do
         return true, key
     end
 
+    function MacroStore:ValidateJSON(raw)
+        return validActionArray(raw)
+    end
+
+    function MacroStore:ImportJSONAsNew(name, raw)
+        local valid, decodedOrError = validActionArray(raw)
+        if not valid then return false, decodedOrError end
+
+        name = cleanName(name)
+        if name == "" then
+            local index = 1
+            repeat
+                name = "Macro Import " .. tostring(index)
+                index += 1
+            until not self:NameExists(name) or index > 100000
+            if self:NameExists(name) then
+                return false, "Không tìm được tên Macro Import còn trống."
+            end
+        elseif self:NameExists(name) then
+            return false, "Tên Macro đã tồn tại. Hãy chọn tên khác."
+        end
+
+        local created, keyOrError = self:CreateFile(name)
+        if not created then return false, keyOrError end
+        local imported, message = self:ImportJSON(keyOrError, raw)
+        if not imported then
+            self:DeleteFile(keyOrError)
+            return false, message
+        end
+        return true, keyOrError, message
+    end
+
+    function MacroStore:NameExists(name)
+        local normalized = string.lower(cleanName(name))
+        for _, item in pairs(db.files) do
+            if type(item) == "table" and string.lower(cleanName(item.Name)) == normalized then
+                return true
+            end
+        end
+        return false
+    end
+
     function MacroStore:ImportJSON(key, raw)
         local item = db.files[key]
         if not item then return false, "Hay tao/chon Macro file truoc." end
@@ -608,13 +652,17 @@ do
         if not item then return false, "Hay chon Macro file can Export." end
         local valid, decodedOrError = validActionArray(item.Content or "[]")
         if not valid then return false, decodedOrError end
-        if hasFileIO then
-            local ok, err = pcall(writefile, item.Path, item.Content or "[]")
-            if not ok then return false, "Không ghi được file JSON: " .. tostring(err) end
-        else
-            return false, "Executor không hỗ trợ writefile; không thể Export ra file trên thiết bị này."
+        local wroteFile = false
+        local writeError = nil
+        if type(writefile) == "function" then
+            local ok, result = pcall(writefile, item.Path, item.Content or "[]")
+            wroteFile = ok and result ~= false
+            if not wroteFile then writeError = ok and "writefile returned false" or tostring(result) end
         end
-        return true, item.Content or "[]", item.Path
+        if not wroteFile and type(setclipboard) ~= "function" then
+            return false, "Không thể Export: " .. tostring(writeError or "executor không hỗ trợ writefile hoặc clipboard.")
+        end
+        return true, item.Content or "[]", wroteFile and item.Path or "Clipboard only"
     end
 
     function MacroStore:DeleteFile(key)
@@ -981,6 +1029,10 @@ do
     local enemyConnections = setmetatable({}, { __mode = "k" })
     local worldAddedConnection
     local lightingAddedConnection
+    local contextsAddedConnection
+    local contextConnections = {}
+    local entityFolderConnections = {}
+    local boundEntityFolders = setmetatable({}, { __mode = "k" })
     local destroyed = false
 
     local function saveAndSet(instance, slot, property, value)
@@ -1123,16 +1175,101 @@ do
     end
 
     local function hideEnemyInstance(instance)
+        -- Preserve HP UI exactly: never disable BillboardGui/SurfaceGui or their contents.
+        if instance:IsA("BillboardGui") or instance:IsA("SurfaceGui") then return end
         if instance:IsA("BasePart") then
             saveAndSet(instance, "EnemyModel.LocalTransparencyModifier", "LocalTransparencyModifier", 1)
+        elseif instance:IsA("Decal") or instance:IsA("Texture") then
+            saveAndSet(instance, "EnemyModel.DecalTransparency", "Transparency", 1)
+        elseif instance:IsA("Highlight") then
+            saveAndSet(instance, "EnemyModel.HighlightEnabled", "Enabled", false)
+        elseif instance:IsA("ParticleEmitter") or instance:IsA("Trail") or instance:IsA("Beam")
+            or instance:IsA("Fire") or instance:IsA("Smoke") or instance:IsA("Sparkles")
+            or instance:IsA("PointLight") or instance:IsA("SpotLight") or instance:IsA("SurfaceLight") then
+            saveAndSet(instance, "EnemyModel.VisualEnabled", "Enabled", false)
         end
     end
 
-    local function hideEnemyModel(model)
+    -- 41 enemy identifiers collected from the GTD data reference.
+    -- The prefix rule remains enabled so newly added enemy_* identifiers are also recognized.
+    local knownEnemyIds = {}
+    for _, enemyId in ipairs({
+        "enemy_armored_ant", "enemy_blood_eye_spider", "enemy_bomb_bug",
+        "enemy_boss_ancient_kraken", "enemy_boss_dragon_fly", "enemy_boss_fantasy_rhino_beetle",
+        "enemy_boss_fantasy_tarantula", "enemy_boss_gravewing", "enemy_boss_kraken",
+        "enemy_boss_magma_cube", "enemy_boss_magma_spider", "enemy_boss_mantis_shrimp",
+        "enemy_boss_skeleton_spider", "enemy_boss_space_4leg", "enemy_boss_space_spider",
+        "enemy_boss_zombie_fly", "enemy_chameleon", "enemy_fantasy_rhino_beetle",
+        "enemy_festive_worm", "enemy_frozen_fly", "enemy_goblin", "enemy_goblin_horn_fly",
+        "enemy_goblin_pincer_beetle", "enemy_gold_plated_snail", "enemy_ice_widow_boss",
+        "enemy_king_stag_beetle", "enemy_mole", "enemy_moon_moth", "enemy_phoenix_fly",
+        "enemy_pumpkin_bug", "enemy_rhino_beetle", "enemy_rollie_pollie", "enemy_sand_worm",
+        "enemy_scarecrow_grasshopper", "enemy_sea_snake", "enemy_space_drill",
+        "enemy_space_mecha_bug", "enemy_space_molten", "enemy_space_snail",
+        "enemy_stag_beetle", "enemy_stun_fly",
+    }) do
+        knownEnemyIds[enemyId] = true
+    end
+
+    local function isEnemyIdentifier(value)
+        if type(value) ~= "string" then return false end
+        local normalized = string.lower(value)
+        return knownEnemyIds[normalized] == true or normalized:match("^enemy_[%w_]+$") ~= nil
+    end
+
+    local function isGTDEnemyModel(instance)
+        if not instance then return false end
+        -- Entity roots can be Models, Folders, or BaseParts depending on the game build.
+        if isEnemyIdentifier(instance.Name) then return true end
+        for _, attributeName in ipairs({ "EnemyId", "EnemyID", "UnitId", "UnitID", "EntityName", "UnitName", "Name" }) do
+            local ok, candidate = pcall(function() return instance:GetAttribute(attributeName) end)
+            if ok and isEnemyIdentifier(candidate) then return true end
+        end
+        return false
+    end
+
+    local hideEnemyModel
+
+    local function bindEntityFolder(entities)
+        if not entities or boundEntityFolders[entities] then return end
+        boundEntityFolders[entities] = true
+        for _, child in ipairs(entities:GetChildren()) do
+            if isGTDEnemyModel(child) then hideEnemyModel(child) end
+        end
+        local childAdded = entities.ChildAdded:Connect(function(child)
+            if options.HideEnemyModels and isGTDEnemyModel(child) then hideEnemyModel(child) end
+        end)
+        local descendantAdded = entities.DescendantAdded:Connect(function(descendant)
+            if not options.HideEnemyModels then return end
+            if isGTDEnemyModel(descendant) then hideEnemyModel(descendant) end
+        end)
+        table.insert(entityFolderConnections, childAdded)
+        table.insert(entityFolderConnections, descendantAdded)
+    end
+
+    local function bindContext(context)
+        if not context then return end
+        local entities = context:FindFirstChild("Entities")
+        if entities then bindEntityFolder(entities) end
+        local connection = context.ChildAdded:Connect(function(child)
+            if child.Name == "Entities" then bindEntityFolder(child) end
+        end)
+        table.insert(contextConnections, connection)
+    end
+
+    local function bindAllContexts()
+        local contexts = workspace:FindFirstChild("Contexts")
+        if not contexts then return end
+        for _, context in ipairs(contexts:GetChildren()) do bindContext(context) end
+        table.insert(contextConnections, contexts.ChildAdded:Connect(bindContext))
+    end
+
+    hideEnemyModel = function(model)
         if not options.HideEnemyModels or not model or not model.Parent or enemyModels[model] then
             return
         end
         enemyModels[model] = true
+        hideEnemyInstance(model)
         for _, descendant in ipairs(model:GetDescendants()) do
             hideEnemyInstance(descendant)
         end
@@ -1149,6 +1286,48 @@ do
         for _, model in ipairs(models) do
             hideEnemyModel(model)
         end
+        -- GTD's Context.Entities is the primary entity source. The generic enemy_*
+        -- naming rule also includes newly introduced enemy models without a hard-coded
+        -- incomplete identifier list. HP GUI instances are never modified.
+        local contexts = workspace:FindFirstChild("Contexts")
+        if contexts then
+            for _, context in ipairs(contexts:GetChildren()) do
+                local entities = context:FindFirstChild("Entities")
+                if entities then
+                    bindEntityFolder(entities)
+                    for _, entity in ipairs(entities:GetChildren()) do
+                        if isGTDEnemyModel(entity) then hideEnemyModel(entity) end
+                    end
+                end
+            end
+        end
+    end
+
+    local function startContextEnemyWatchers()
+        if contextsAddedConnection or #contextConnections > 0 then return end
+        local contexts = workspace:FindFirstChild("Contexts")
+        if contexts then
+            bindAllContexts()
+        else
+            contextsAddedConnection = workspace.ChildAdded:Connect(function(child)
+                if child.Name == "Contexts" then
+                    if contextsAddedConnection then contextsAddedConnection:Disconnect(); contextsAddedConnection = nil end
+                    bindAllContexts()
+                end
+            end)
+        end
+    end
+
+    local function stopContextEnemyWatchers()
+        if contextsAddedConnection then
+            pcall(function() contextsAddedConnection:Disconnect() end)
+            contextsAddedConnection = nil
+        end
+        for _, connection in ipairs(contextConnections) do pcall(function() connection:Disconnect() end) end
+        for _, connection in ipairs(entityFolderConnections) do pcall(function() connection:Disconnect() end) end
+        table.clear(contextConnections)
+        table.clear(entityFolderConnections)
+        table.clear(boundEntityFolders)
     end
 
     function PerformanceManager:SetOption(name, enabled)
@@ -1159,14 +1338,19 @@ do
 
         if name == "HideEnemyModels" then
             if options[name] then
+                startContextEnemyWatchers()
                 self:RefreshEnemyModels()
             else
+                stopContextEnemyWatchers()
                 for _, connection in pairs(enemyConnections) do
                     pcall(function() connection:Disconnect() end)
                 end
                 table.clear(enemyConnections)
                 table.clear(enemyModels)
                 restoreSlot("EnemyModel.LocalTransparencyModifier")
+                restoreSlot("EnemyModel.DecalTransparency")
+                restoreSlot("EnemyModel.VisualEnabled")
+                restoreSlot("EnemyModel.HighlightEnabled")
             end
         elseif name == "SimplifyMap" then
             if options[name] then
@@ -1223,13 +1407,18 @@ do
 
         -- Khoi phuc rieng cac tuy chon dang tat, tranh de sot hieu ung cua file cu.
         if not options.HideEnemyModels then
+            stopContextEnemyWatchers()
             for _, connection in pairs(enemyConnections) do
                 pcall(function() connection:Disconnect() end)
             end
             table.clear(enemyConnections)
             table.clear(enemyModels)
             restoreSlot("EnemyModel.LocalTransparencyModifier")
+            restoreSlot("EnemyModel.DecalTransparency")
+            restoreSlot("EnemyModel.VisualEnabled")
+            restoreSlot("EnemyModel.HighlightEnabled")
         else
+            startContextEnemyWatchers()
             self:RefreshEnemyModels()
         end
 
@@ -1296,13 +1485,15 @@ do
         destroyed = true
         if worldAddedConnection then worldAddedConnection:Disconnect() end
         if lightingAddedConnection then lightingAddedConnection:Disconnect() end
+        stopContextEnemyWatchers()
         for _, connection in pairs(enemyConnections) do
             pcall(function() connection:Disconnect() end)
         end
         table.clear(enemyConnections)
         table.clear(enemyModels)
         local slots = {
-            "EnemyModel.LocalTransparencyModifier",
+            "EnemyModel.LocalTransparencyModifier", "EnemyModel.DecalTransparency",
+            "EnemyModel.VisualEnabled", "EnemyModel.HighlightEnabled",
             "SmoothMap.Material", "SmoothMap.MaterialVariant",
             "HideTextures.Transparency", "HideTextures.ColorMap", "HideTextures.NormalMap",
             "HideTextures.RoughnessMap", "HideTextures.MetalnessMap",
@@ -1429,6 +1620,8 @@ local PlayerController = {
     _originalCollision = {},
 }
 
+local playerCharacterAddedConnection = nil
+local playerControllerClosed = false
 do
     local function rememberAndDisable(part)
         if not part:IsA("BasePart") then return end
@@ -1488,16 +1681,16 @@ do
         return self._noclip
     end
 
-    PlayerController._characterConnection = LP.CharacterAdded:Connect(function(character)
+    playerCharacterAddedConnection = LP.CharacterAdded:Connect(function(character)
+        if playerControllerClosed then return end
         task.spawn(function()
-            if PlayerController._shutdown then return end
             local humanoid = character:WaitForChild("Humanoid", 10)
-            if PlayerController._shutdown then return end
             character:WaitForChild("HumanoidRootPart", 10)
+            if playerControllerClosed then return end
             if humanoid then
                 humanoid.WalkSpeed = CONFIG.BASE_WALK_SPEED * PlayerController._speed
             end
-            if PlayerController._noclip then
+            if PlayerController._noclip and not playerControllerClosed then
                 PlayerController:SetNoclip(true)
             end
         end)
@@ -2091,7 +2284,7 @@ do
         BUTTON_HOVER = Color3.fromRGB(57, 61, 70),
         ACCENT = Color3.fromRGB(85, 175, 255),
         TEXT = Color3.fromRGB(240, 240, 245),
-        DIM = Color3.fromRGB(200, 200, 205),
+        DIM = Color3.fromRGB(205, 211, 222),
         GREEN = Color3.fromRGB(50, 200, 110),
         GREEN_DARK = Color3.fromRGB(39, 76, 59),
         RED = Color3.fromRGB(235, 65, 65),
@@ -2123,9 +2316,107 @@ do
         }, parent)
     end
 
+    local currentLanguage = "English"
+    local languagePairs = {
+        { "TÊN FILE", "FILE NAME" },
+        { "CHỌN MACRO FILE", "SELECT MACRO FILE" },
+        { "Nhập tên Macro...", "Enter Macro name..." },
+        { "Chưa có file", "No file selected" },
+        { "JSON MACRO DATA", "MACRO JSON DATA" },
+        { "Dán JSON Macro dạng [ { \"Type\": \"PlaceUnit\", ... } ] vào đây...", "Paste Macro JSON here..." },
+        { "RECORD MACRO", "RECORD MACRO" },
+        { "PLAY MACRO", "PLAY MACRO" },
+        { "CHẠY SỚM HƠN", "RUN AHEAD BY" },
+        { "MAP & SAVE MANAGER", "MAP & SAVE MANAGER" },
+        { "Spawn: chua dat", "Spawn: not set" },
+        { "Destination: chua dat", "Destination: not set" },
+        { "Route: chua record", "Route: not recorded" },
+        { "Nhap ten file ban do...", "Enter map name..." },
+        { "SAVED MAP FILES", "SAVED MAP FILES" },
+        { "Nhap ten moi de Rename...", "Enter new name..." },
+        { "MAP FILE (vi du: duy_maps/Map_A.json)", "MAP JSON FILE PATH" },
+        { "Nhap duong dan file JSON...", "Enter JSON file path..." },
+        { "TỐI ƯU HIỆU NĂNG", "PERFORMANCE" },
+        { "CHỈ HIỆN THANH HP QUÁI", "SHOW ENEMY HP ONLY" },
+        { "Ẩn mô hình 3D ở máy bạn; giữ HP, vị trí và va chạm.", "Hide enemy visuals locally; keep HP and game logic." },
+        { "SYSTEM INFORMATION", "SYSTEM INFORMATION" },
+        { "DEVICE & EXECUTOR SETTING", "SETTINGS" },
+        { "Chọn môi trường đang dùng. Hồ sơ được lưu cục bộ trên thiết bị/executor này.", "Choose your executor. The profile is stored locally when file access is available." },
+        { "CHỌN MÔI TRƯỜNG", "SELECT EXECUTOR" },
+        { "DEVICE & EXECUTOR INFORMATION", "DEVICE & EXECUTOR INFORMATION" },
+        { "Executor information is a user-selected profile, not a security verification.", "Executor information is a user-selected profile, not a security verification." },
+        { "System ready", "System ready" },
+        { "Executor:", "Executor:" },
+        { "Device:", "Device:" },
+        { "Screen size:", "Screen size:" },
+        { "Profile persistence:", "Profile persistence:" },
+        { "Trình thực thi", "Executor" },
+        { "Bạn đang sử dụng executor nào? Lựa chọn được lưu cục bộ trên thiết bị này.", "Which executor are you using? This choice is stored locally on this device." },
+        { "DELTA · MOBILE", "DELTA · MOBILE" },
+        { "XENO · PC", "XENO · PC" },
+        { "RESET DEVICE PROFILE", "RESET DEVICE PROFILE" },
+        { "REFRESH DEVICE INFO", "REFRESH DEVICE INFO" },
+        { "WEBHOOK DISCORD", "DISCORD WEBHOOK" },
+        { "Nhap webhook cua ban. URL chi giu trong bo nho script hien tai; dong script se mat URL.", "Enter your webhook URL. It is kept in memory and cleared when the script closes." },
+        { "SAVE WEBHOOK", "SAVE WEBHOOK" },
+        { "SEND TEST", "SEND TEST" },
+        { "MAIN CONTROL", "MAIN CONTROL" },
+        { "Các chức năng chung của trận đấu; phần Target Monster được tách riêng.", "General match controls; Target Monster tools are in a separate tab." },
+        { "GAME SPEED", "GAME SPEED" },
+        { "AUTOMATION", "AUTOMATION" },
+        { "DIFFICULTY LEVEL", "DIFFICULTY LEVEL" },
+        { "PLAYER CONTROL", "PLAYER CONTROL" },
+        { "BOSS MAX HP", "BOSS MAX HP" },
+        { "Boss: chua cau hinh", "Boss: not configured" },
+        { "CHỌN CHẾ ĐỘ THỦ CÔNG", "SELECT MANUAL MODE" },
+        { "Khôi phục hình ảnh gốc.", "Restore original visuals." },
+        { "Tắt bóng đổ; giữ phần lớn chi tiết.", "Disable shadows; keep most details." },
+        { "Giảm texture, vật liệu, bóng và hiệu ứng.", "Reduce textures, materials, shadows and effects." },
+        { "Giảm tối đa; có thể ẩn cả mô hình quái.", "Maximum reduction; may also hide enemy models." },
+        { "Tất cả thay đổi chỉ áp dụng hiển thị ở máy bạn; không Destroy quái hay vật thể.", "Changes affect local visuals only; enemies and world objects are never destroyed." },
+        { "Thiết bị: ", "Device: " },
+        { "Kích thước màn hình: ", "Screen size: " },
+        { "Màn hình: ", "Screen: " },
+        { "Lưu hồ sơ: ", "Profile persistence: " },
+        { "Có", "Available" },
+        { "Chỉ trong phiên", "Session only" },
+        { "Chưa chọn", "Not selected" },
+        { "CHỌN MÔI TRƯỜNG", "SELECT EXECUTOR" },
+        { "Bạn đang sử dụng executor nào? Lựa chọn được lưu cục bộ trên thiết bị này.", "Which executor are you using? This choice is stored locally on this device." },
+        { "Language and notification preferences.", "Language and notification preferences." },
+        { "POPUP NOTIFICATIONS", "POPUP NOTIFICATIONS" },
+        { "Đã lưu", "Saved" },
+        { "Đã tắt", "Disabled" },
+        { "Đã bật", "Enabled" },
+        { "Trạng thái: NOT READY", "Status: NOT READY" },
+        { "RECORDING", "RECORDING" },
+        { "SAVING", "SAVING" },
+        { "WAITING FOR NEXT MATCH", "WAITING FOR NEXT MATCH" },
+        { "Macro đã lưu", "Macro saved" },
+        { "Macro bắt đầu", "Macro started" },
+        { "Macro đã hoàn thành", "Macro completed" },
+        { "Trận đấu bắt đầu", "Match started" },
+    }
+    local toEnglish, toVietnamese = {}, {}
+    for _, pair in ipairs(languagePairs) do
+        toEnglish[pair[1]] = pair[2]
+        toVietnamese[pair[2]] = pair[1]
+    end
+    local function localizeText(value)
+        value = tostring(value or "")
+        if currentLanguage == "English" then
+            local count = value:match("^Đã lưu Macro · (%d+) thao tác$")
+            if count then return "Macro saved · " .. count .. " actions" end
+            return toEnglish[value] or value
+        end
+        local count = value:match("^Macro saved · (%d+) actions$")
+        if count then return "Đã lưu Macro · " .. count .. " thao tác" end
+        return toVietnamese[value] or value
+    end
+
     local function makeLabel(parent, text, position, size, options)
         options = options or {}
-        return newInstance("TextLabel", {
+        local label = newInstance("TextLabel", {
             BackgroundTransparency = 1,
             Position = position,
             Size = size,
@@ -2136,8 +2427,12 @@ do
             TextXAlignment = options.Align or Enum.TextXAlignment.Left,
             TextYAlignment = options.YAlign or Enum.TextYAlignment.Center,
             TextWrapped = options.Wrapped or false,
+            TextStrokeTransparency = 1,
             RichText = false,
         }, parent)
+        label:SetAttribute("ChenFuWeiSourceText", tostring(text or ""))
+        label.Text = localizeText(text or "")
+        return label
     end
 
     local function makeButton(parent, text, position, size, options)
@@ -2147,8 +2442,9 @@ do
             Size = size,
             BackgroundColor3 = options.Background or C.BUTTON,
             BorderSizePixel = 0,
-            Text = text,
+            Text = localizeText(text),
             Font = options.Font or Enum.Font.GothamSemibold,
+            TextStrokeTransparency = 1,
             TextSize = options.TextSize or 11,
             TextColor3 = options.TextColor or C.TEXT,
             AutoButtonColor = false,
@@ -2156,6 +2452,7 @@ do
             Selectable = options.Selectable ~= false,
             ZIndex = options.ZIndex or 5,
         }, parent)
+        button:SetAttribute("ChenFuWeiSourceText", tostring(text or ""))
         addCorner(button, options.Radius or 6)
         return button
     end
@@ -2166,8 +2463,9 @@ do
             Size = size,
             BackgroundColor3 = C.INPUT,
             BorderSizePixel = 0,
-            PlaceholderText = placeholder,
+            PlaceholderText = localizeText(placeholder),
             PlaceholderColor3 = C.DIM,
+            TextStrokeTransparency = 1,
             Text = "",
             TextColor3 = C.TEXT,
             TextSize = 11,
@@ -2175,6 +2473,7 @@ do
             ClearTextOnFocus = false,
             TextXAlignment = Enum.TextXAlignment.Left,
         }, parent)
+        box:SetAttribute("ChenFuWeiSourcePlaceholder", tostring(placeholder or ""))
         addCorner(box, 6)
         newInstance("UIPadding", {
             PaddingLeft = UDim.new(0, 9),
@@ -2247,7 +2546,7 @@ do
                     return
                 end
                 if GUI._notify then
-                    GUI._notify(tostring(title) .. (state and " đã bật." or " đã tắt."), state and Color3.fromRGB(50, 200, 110) or Color3.fromRGB(200, 200, 205), "ChenFuWei")
+                    GUI._notify(tostring(title) .. (state and " đã bật." or " đã tắt."), state and Color3.fromRGB(50, 200, 110) or Color3.fromRGB(200, 200, 205), "DUY SYSTEM")
                 end
             end
         end
@@ -2364,55 +2663,66 @@ do
         return setValue, function() return current end
     end
 
-    -- makeDraggable(handle, target, options)
-    --   handle/target: hành vi cũ (thanh tiêu đề, logo) giữ nguyên.
-    --   options.extraHandles: thêm vùng nền được phép kéo (sidebar/content) dùng CHUNG một trạng thái kéo.
-    --   options.canStart(input): trả false nếu điểm bấm nằm trên điều khiển (nút, TextBox, thanh cuộn...).
-    local function makeDraggable(handle, target, options)
-        local dragging = false
-        local dragStart
-        local startPosition
-        local dragType
-        options = options or {}
+    local activeDrag = nil
+    local dragDispatcherBound = false
 
-        local function beginDrag(input, gated)
-            if input.UserInputType ~= Enum.UserInputType.MouseButton1
-                and input.UserInputType ~= Enum.UserInputType.Touch then
-                return
-            end
-            if dragging then return end
-            if gated and options.canStart and not options.canStart(input) then return end
-            dragging = true
-            dragType = input.UserInputType
-            dragStart = input.Position
-            startPosition = target.Position
-        end
-
-        handle.InputBegan:Connect(function(input) beginDrag(input, false) end)
-        for _, extra in ipairs(options.extraHandles or {}) do
-            extra.InputBegan:Connect(function(input) beginDrag(input, true) end)
-        end
-
-        local moveConnection = UserInputService.InputChanged:Connect(function(input)
-            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-                or input.UserInputType == Enum.UserInputType.Touch) then
-                local delta = input.Position - dragStart
-                target.Position = UDim2.new(
-                    startPosition.X.Scale, startPosition.X.Offset + delta.X,
-                    startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
+    local function makeDraggable(handle, target, mouseOnly, clampTarget)
+        if not dragDispatcherBound then
+            dragDispatcherBound = true
+            local moveConnection = UserInputService.InputChanged:Connect(function(input)
+                local drag = activeDrag
+                if not drag then return end
+                local isMove = input.UserInputType == Enum.UserInputType.MouseMovement
+                    or (drag.InputType == Enum.UserInputType.Touch and input.UserInputType == Enum.UserInputType.Touch)
+                if not isMove then return end
+                local delta = input.Position - drag.StartPointer
+                local scaleObject = drag.Target:FindFirstChildOfClass("UIScale")
+                local scale = scaleObject and math.max(scaleObject.Scale, 0.01) or 1
+                delta = delta / scale
+                drag.Target.Position = UDim2.new(
+                    drag.StartPosition.X.Scale, drag.StartPosition.X.Offset + delta.X,
+                    drag.StartPosition.Y.Scale, drag.StartPosition.Y.Offset + delta.Y
                 )
-            end
-        end)
-        table.insert(GUI._connections, moveConnection)
+                if drag.Clamp then pcall(drag.Clamp) end
+            end)
+            table.insert(GUI._connections, moveConnection)
 
-        local endConnection = UserInputService.InputEnded:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = false
-                dragType = nil
+            local endConnection = UserInputService.InputEnded:Connect(function(input)
+                local drag = activeDrag
+                if not drag then return end
+                if (drag.InputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)
+                    or (drag.InputType == Enum.UserInputType.Touch and input.UserInputType == Enum.UserInputType.Touch) then
+                    activeDrag = nil
+                end
+            end)
+            table.insert(GUI._connections, endConnection)
+        end
+
+        local beginConnection = handle.InputBegan:Connect(function(input)
+            if activeDrag then return end
+            if mouseOnly and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            local hitOK, hitObjects = pcall(function()
+                return PlayerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+            end)
+            if hitOK and type(hitObjects) == "table" then
+                for _, hit in ipairs(hitObjects) do
+                    if hit ~= handle and hit:IsDescendantOf(handle)
+                        and (hit:IsA("GuiButton") or hit:IsA("TextBox") or hit:IsA("ScrollingFrame")) then
+                        return
+                    end
+                end
             end
+            activeDrag = {
+                Target = target,
+                InputType = input.UserInputType,
+                StartPointer = input.Position,
+                StartPosition = target.Position,
+                Clamp = clampTarget,
+            }
         end)
-        table.insert(GUI._connections, endConnection)
+        table.insert(GUI._connections, beginConnection)
     end
 
     function GUI:Build(callbacks)
@@ -2429,7 +2739,7 @@ do
 
         local window = newInstance("Frame", {
             Name = "MainWindow",
-            Size = UDim2.new(0, 690, 0, 600),
+            Size = UDim2.new(0, 620, 0, 520),
             AnchorPoint = Vector2.new(0.5, 0.5),
             Position = UDim2.fromScale(0.5, 0.5),
             BackgroundColor3 = C.BG,
@@ -2437,32 +2747,57 @@ do
         }, screen)
         addCorner(window, 11)
 
-        -- Responsive scale: giu nguyen layout 690x600, tu dong thu nho tren man hinh Delta/mobile.
+        local function clampWindowToViewport()
+            local camera = workspace.CurrentCamera
+            local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+            local topLeft = window.AbsolutePosition
+            local absoluteSize = window.AbsoluteSize
+            local minX = 0
+            local maxX = math.max(0, viewport.X - absoluteSize.X)
+            local minY = 0
+            local maxY = math.max(0, viewport.Y - absoluteSize.Y)
+            local clampedX = math.clamp(topLeft.X, minX, maxX)
+            local clampedY = math.clamp(topLeft.Y, minY, maxY)
+            if clampedX ~= topLeft.X or clampedY ~= topLeft.Y then
+                window.Position = UDim2.new(window.Position.X.Scale, window.Position.X.Offset + clampedX - topLeft.X,
+                    window.Position.Y.Scale, window.Position.Y.Offset + clampedY - topLeft.Y)
+            end
+        end
+
+        -- Responsive scale and viewport-aware window bounds.
         local responsiveScale = newInstance("UIScale", { Scale = 1 }, window)
         local cameraViewportConnection
         local sidebar, content
         local isMobileLayout = false
         local function updateResponsiveScale()
             local camera = workspace.CurrentCamera
-            local viewport = camera and camera.ViewportSize or Vector2.new(690, 600)
+            local viewport = camera and camera.ViewportSize or Vector2.new(620, 520)
             isMobileLayout = UserInputService.TouchEnabled and viewport.X < 700
             if isMobileLayout then
-                window.Size = UDim2.fromOffset(math.max(320, viewport.X - 16), math.max(420, math.min(720, viewport.Y - 70)))
                 responsiveScale.Scale = 1
+                local maxWidth = math.max(1, viewport.X - 16)
+                local maxHeight = math.max(1, viewport.Y - 20)
+                local minWidth = math.min(320, maxWidth)
+                local minHeight = math.min(400, maxHeight)
+                window.Size = UDim2.fromOffset(
+                    math.clamp(window.Size.X.Offset, minWidth, maxWidth),
+                    math.clamp(window.Size.Y.Offset, minHeight, maxHeight)
+                )
                 if sidebar then
-                    sidebar.Size = UDim2.new(0, 94, 1, -66)
-                    content.Position = UDim2.new(0, 94, 0, 42)
-                    content.Size = UDim2.new(1, -94, 1, -66)
+                    sidebar.Size = UDim2.new(0, 92, 1, -66)
+                    content.Position = UDim2.new(0, 92, 0, 42)
+                    content.Size = UDim2.new(1, -92, 1, -66)
                 end
             else
-                window.Size = UDim2.fromOffset(690, 600)
-                local widthScale = math.max(0.45, (viewport.X - 20) / 690)
-                local heightScale = math.max(0.45, (viewport.Y - 20) / 600)
+                local currentWidth = math.max(460, window.Size.X.Offset)
+                local currentHeight = math.max(420, window.Size.Y.Offset)
+                local widthScale = math.max(0.45, (viewport.X - 20) / currentWidth)
+                local heightScale = math.max(0.45, (viewport.Y - 20) / currentHeight)
                 responsiveScale.Scale = math.min(1, widthScale, heightScale)
                 if sidebar then
-                    sidebar.Size = UDim2.new(0, 126, 1, -66)
-                    content.Position = UDim2.new(0, 126, 0, 42)
-                    content.Size = UDim2.new(1, -126, 1, -66)
+                    sidebar.Size = UDim2.new(0, 112, 1, -66)
+                    content.Position = UDim2.new(0, 112, 0, 42)
+                    content.Size = UDim2.new(1, -112, 1, -66)
                 end
             end
         end
@@ -2501,55 +2836,25 @@ do
             Color = C.ACCENT,
         })
 
-        local minimizeButton = makeButton(header, "−", UDim2.new(1, -75, 0.5, -15), UDim2.new(0, 30, 0, 30), {
+        local minimizeButton = makeButton(header, "−", UDim2.new(1, -85, 0.5, -15), UDim2.new(0, 30, 0, 30), {
             TextSize = 20,
             Background = C.HEADER,
         })
-        local closeButton = makeButton(header, "×", UDim2.new(1, -39, 0.5, -15), UDim2.new(0, 30, 0, 30), {
+        local closeButton = makeButton(header, "×", UDim2.new(1, -49, 0.5, -15), UDim2.new(0, 30, 0, 30), {
             TextSize = 17,
             Background = C.HEADER,
             TextColor = C.RED,
         })
 
-        local logo = makeButton(screen, "CFW", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
-            TextSize = 14,
+        local logo = makeButton(screen, "D", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
+            TextSize = 23,
             Background = Color3.fromRGB(18, 39, 70),
             TextColor = C.ACCENT,
             Radius = 27,
         })
         logo.Visible = false
 
-        -- Chỉ cho phép kéo từ NỀN TRỐNG: bỏ qua nếu điểm bấm nằm trên nút/TextBox (kể cả Slider hitbox),
-        -- thanh cuộn, hoặc (với cảm ứng) vùng ScrollingFrame để không tranh chấp với cuộn nội dung.
-        local function isEmptyBackgroundPoint(input)
-            local point = UserInputService:GetMouseLocation()
-            local isTouch = input.UserInputType == Enum.UserInputType.Touch
-            for _, object in ipairs(window:GetDescendants()) do
-                local interactive = object:IsA("GuiButton") or object:IsA("TextBox")
-                local scroller = object:IsA("ScrollingFrame")
-                if interactive or scroller then
-                    local visible = true
-                    local node = object
-                    while node and node ~= window do
-                        if node:IsA("GuiObject") and not node.Visible then visible = false break end
-                        node = node.Parent
-                    end
-                    if visible then
-                        local pos, size = object.AbsolutePosition, object.AbsoluteSize
-                        local inside = point.X >= pos.X and point.X <= pos.X + size.X
-                            and point.Y >= pos.Y and point.Y <= pos.Y + size.Y
-                        if inside then
-                            if interactive or isTouch then return false end
-                            -- Chuột trong ScrollingFrame: chặn riêng dải thanh cuộn.
-                            local barWidth = (tonumber(object.ScrollBarThickness) or 0) + 4
-                            if point.X >= pos.X + size.X - barWidth then return false end
-                        end
-                    end
-                end
-            end
-            return true
-        end
-
+        makeDraggable(header, window, false, clampWindowToViewport)
         makeDraggable(logo, logo)
 
         local function collapseMenu()
@@ -2575,22 +2880,73 @@ do
 
         sidebar = newInstance("Frame", {
             Position = UDim2.new(0, 0, 0, 42),
-            Size = UDim2.new(0, 126, 1, -66),
+            Size = UDim2.new(0, 112, 1, -66),
             BackgroundColor3 = C.SIDEBAR,
             BorderSizePixel = 0,
         }, window)
 
         content = newInstance("Frame", {
-            Position = UDim2.new(0, 126, 0, 42),
-            Size = UDim2.new(1, -126, 1, -66),
+            Position = UDim2.new(0, 112, 0, 42),
+            Size = UDim2.new(1, -112, 1, -66),
             BackgroundTransparency = 1,
+            Active = true,
         }, window)
+        sidebar.Active = true
+        makeDraggable(content, window, true, clampWindowToViewport)
+        makeDraggable(sidebar, window, false, clampWindowToViewport)
 
-        -- sidebar/content đã tồn tại tại đây; header + hai vùng nền dùng chung một trạng thái kéo.
-        makeDraggable(header, window, {
-            extraHandles = { sidebar, content },
-            canStart = isEmptyBackgroundPoint,
-        })
+        -- Four independent corner resize handles. They only resize the window and
+        -- never reuse the menu-drag callbacks.
+        local resizeSpecs = {
+            { Name = "ResizeTopLeft", X = -1, Y = -1, Position = UDim2.new(0, 0, 0, 0), Anchor = Vector2.new(0, 0) },
+            { Name = "ResizeTopRight", X = 1, Y = -1, Position = UDim2.new(1, 0, 0, 0), Anchor = Vector2.new(1, 0) },
+            { Name = "ResizeBottomLeft", X = -1, Y = 1, Position = UDim2.new(0, 0, 1, 0), Anchor = Vector2.new(0, 1) },
+            { Name = "ResizeBottomRight", X = 1, Y = 1, Position = UDim2.new(1, 0, 1, 0), Anchor = Vector2.new(1, 1) },
+        }
+        for _, spec in ipairs(resizeSpecs) do
+            local handle = newInstance("TextButton", {
+                Name = spec.Name, AnchorPoint = spec.Anchor, Position = spec.Position,
+                Size = UDim2.fromOffset(14, 14), BackgroundColor3 = C.ACCENT,
+                BackgroundTransparency = 0.12, BorderSizePixel = 0, Text = "",
+                AutoButtonColor = false, Active = true, Selectable = false, ZIndex = 80,
+            }, window)
+            addCorner(handle, 5)
+            local resizing = false
+            local startPointer, startSize, startPosition
+            handle.InputBegan:Connect(function(input)
+                if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                    and input.UserInputType ~= Enum.UserInputType.Touch then return end
+                resizing = true
+                startPointer = input.Position
+                startSize = Vector2.new(window.Size.X.Offset, window.Size.Y.Offset)
+                startPosition = window.Position
+            end)
+            local moveConnection = UserInputService.InputChanged:Connect(function(input)
+                if not resizing or (input.UserInputType ~= Enum.UserInputType.MouseMovement
+                    and input.UserInputType ~= Enum.UserInputType.Touch) then return end
+                local delta = input.Position - startPointer
+                local scaleFactor = math.max(responsiveScale.Scale, 0.45)
+                local logicalDelta = delta / scaleFactor
+                local viewport = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1920, 1080)
+                local minWidth = isMobileLayout and math.min(320, math.max(1, viewport.X - 24)) or 460
+                local minHeight = isMobileLayout and math.min(400, math.max(1, viewport.Y - 24)) or 420
+                local maxWidth = math.max(minWidth, math.floor((viewport.X - 24) / scaleFactor))
+                local maxHeight = math.max(minHeight, math.floor((viewport.Y - 24) / scaleFactor))
+                local newWidth = math.clamp(startSize.X + logicalDelta.X * spec.X, minWidth, maxWidth)
+                local newHeight = math.clamp(startSize.Y + logicalDelta.Y * spec.Y, minHeight, maxHeight)
+                window.Size = UDim2.fromOffset(newWidth, newHeight)
+                window.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + logicalDelta.X * 0.5,
+                    startPosition.Y.Scale, startPosition.Y.Offset + logicalDelta.Y * 0.5)
+                updateResponsiveScale()
+                clampWindowToViewport()
+            end)
+            table.insert(self._connections, moveConnection)
+            local endConnection = UserInputService.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                    or input.UserInputType == Enum.UserInputType.Touch then resizing = false end
+            end)
+            table.insert(self._connections, endConnection)
+        end
 
         local statusBar = newInstance("Frame", {
             Position = UDim2.new(0, 0, 1, -24),
@@ -2598,14 +2954,67 @@ do
             BackgroundColor3 = Color3.fromRGB(35, 37, 44),
             BorderSizePixel = 0,
         }, window)
-        local statusLabel = makeLabel(statusBar, "● He thong san sang", UDim2.new(0, 11, 0, 0), UDim2.new(1, -20, 1, 0), {
+        addCorner(statusBar, 8)
+        local statusLabel = makeLabel(statusBar, "● System ready", UDim2.new(0, 11, 0, 0), UDim2.new(1, -20, 1, 0), {
             TextSize = 10,
             Color = C.DIM,
         })
+        statusLabel:SetAttribute("ChenFuWeiSourceText", nil)
+
+        local uiSettingsFile = "chenfuwei_ui_settings.json"
+        local uiSettings = { Language = "English", PopupNotifications = true }
+        if type(readfile) == "function" then
+            local readOK, rawSettings = pcall(readfile, uiSettingsFile)
+            if readOK and type(rawSettings) == "string" and rawSettings ~= "" then
+                local decodeOK, decodedSettings = pcall(function() return HttpService:JSONDecode(rawSettings) end)
+                if decodeOK and type(decodedSettings) == "table" then
+                    if decodedSettings.Language == "English" or decodedSettings.Language == "Vietnamese" then
+                        uiSettings.Language = decodedSettings.Language
+                    end
+                    if type(decodedSettings.PopupNotifications) == "boolean" then
+                        uiSettings.PopupNotifications = decodedSettings.PopupNotifications
+                    end
+                end
+            end
+        end
+        currentLanguage = uiSettings.Language or "English"
+        local popupNotificationsEnabled = uiSettings.PopupNotifications ~= false
+        local function saveUISettings()
+            if type(writefile) ~= "function" then return false end
+            local ok = pcall(function() writefile(uiSettingsFile, HttpService:JSONEncode(uiSettings)) end)
+            return ok
+        end
+        local function localizeExistingUI()
+            if not screen or not screen.Parent then return end
+            for _, descendant in ipairs(screen:GetDescendants()) do
+                local sourceText = descendant:GetAttribute("ChenFuWeiSourceText")
+                if type(sourceText) == "string" then
+                    descendant.Text = localizeText(sourceText)
+                end
+                local sourcePlaceholder = descendant:GetAttribute("ChenFuWeiSourcePlaceholder")
+                if type(sourcePlaceholder) == "string" then
+                    descendant.PlaceholderText = localizeText(sourcePlaceholder)
+                end
+            end
+        end
+        local lastStatusMessage = "System ready"
+        local lastStatusColor = C.DIM
+        local function setLanguage(language)
+            if language ~= "English" and language ~= "Vietnamese" then return false end
+            currentLanguage = language
+            uiSettings.Language = language
+            saveUISettings()
+            localizeExistingUI()
+            statusLabel.Text = "● " .. localizeText(lastStatusMessage)
+            statusLabel.TextColor3 = lastStatusColor
+            return true
+        end
 
         local function setStatus(message, color)
-            statusLabel.Text = "● " .. tostring(message)
-            statusLabel.TextColor3 = color or C.DIM
+            lastStatusMessage = tostring(message or "")
+            lastStatusColor = color or C.DIM
+            statusLabel.Text = "● " .. localizeText(lastStatusMessage)
+            statusLabel.TextColor3 = lastStatusColor
         end
 
         -- Modern Basic Toast: stack goc duoi-phai, Tween-only, tu huy sau 4 giay.
@@ -2625,6 +3034,8 @@ do
         }, toastContainer)
         local toastSequence = 0
         local function notify(message, accentColor, title)
+            if not popupNotificationsEnabled then return false end
+            if not screen or not screen.Parent then return false end
             toastSequence += 1
             local toast = newInstance("Frame", {
                 Name = "Toast_" .. tostring(toastSequence),
@@ -2653,7 +3064,7 @@ do
                 Position = UDim2.new(0, 13, 0, 6),
                 Size = UDim2.new(1, -22, 0, 19),
                 BackgroundTransparency = 1,
-                Text = tostring(title or "ChenFuWei"),
+                Text = localizeText(title or "ChenFuWei"),
                 TextColor3 = Color3.fromRGB(240, 240, 245),
                 TextTransparency = 1,
                 Font = Enum.Font.GothamBold,
@@ -2668,7 +3079,7 @@ do
                 Position = UDim2.new(0, 13, 0, 27),
                 Size = UDim2.new(1, -22, 0, 24),
                 BackgroundTransparency = 1,
-                Text = tostring(message or ""),
+                Text = localizeText(message or ""),
                 TextColor3 = Color3.fromRGB(200, 200, 205),
                 TextTransparency = 1,
                 Font = Enum.Font.GothamSemibold,
@@ -2698,27 +3109,163 @@ do
         end
         self._notify = notify
 
-        local tabNames = isMobileLayout
-            and { "MAIN", "TARGET", "MACRO", "WEBHOOK", "PERF", "INFO", "SETTING" }
-            or { "MAIN", "TARGET MONSTER", "MACRO", "WEBHOOK", "HIỆU NĂNG", "INFORMATION", "SETTING" }
+        local function showImportDialog(kind, onImported)
+            local existing = screen:FindFirstChild("ChenFuWeiImportDialog")
+            if existing then existing:Destroy() end
+            local overlay = newInstance("Frame", {
+                Name = "ChenFuWeiImportDialog", Size = UDim2.fromScale(1, 1),
+                BackgroundColor3 = Color3.fromRGB(3, 5, 10), BackgroundTransparency = 0.28,
+                BorderSizePixel = 0, ZIndex = 210,
+            }, screen)
+            local card = newInstance("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.new(0.9, 0, 0, 350), BackgroundColor3 = C.PANEL,
+                BorderSizePixel = 0, ZIndex = 211,
+            }, overlay)
+            addCorner(card, 11)
+            addStroke(card, C.ACCENT, 1)
+            makeLabel(card, kind == "Macro" and "IMPORT MACRO JSON" or "IMPORT TARGET MAP JSON",
+                UDim2.new(0, 13, 0, 10), UDim2.new(1, -26, 0, 23), {
+                    Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
+                }).ZIndex = 212
+            makeLabel(card, "Paste JSON, validate it, then choose a new file name.",
+                UDim2.new(0, 13, 0, 34), UDim2.new(1, -26, 0, 20), { TextSize = 9, Color = C.DIM }).ZIndex = 212
+            local jsonBox = newInstance("TextBox", {
+                Position = UDim2.new(0, 12, 0, 60), Size = UDim2.new(1, -24, 0, 170),
+                BackgroundColor3 = C.INPUT, BorderSizePixel = 0, Text = "",
+                PlaceholderText = "Paste complete JSON here...", PlaceholderColor3 = C.DIM,
+                TextColor3 = C.TEXT, TextSize = 9, Font = Enum.Font.Code,
+                ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left,
+                TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = false,
+                MultiLine = true, TextStrokeTransparency = 1, ZIndex = 212,
+            }, card)
+            addCorner(jsonBox, 6)
+            jsonBox:SetAttribute("ChenFuWeiSourcePlaceholder", "Paste complete JSON here...")
+            jsonBox.PlaceholderText = localizeText("Paste complete JSON here...")
+            addStroke(jsonBox, Color3.fromRGB(57, 78, 110), 1)
+            newInstance("UIPadding", { PaddingTop = UDim.new(0, 7), PaddingLeft = UDim.new(0, 7),
+                PaddingRight = UDim.new(0, 7), PaddingBottom = UDim.new(0, 7) }, jsonBox)
+            local nameBox = makeTextBox(card, "Name (optional; blank = auto name)",
+                UDim2.new(0, 12, 0, 240), UDim2.new(1, -24, 0, 28))
+            nameBox.ZIndex = 212
+            local resultLabel = makeLabel(card, "Not validated", UDim2.new(0, 14, 0, 272),
+                UDim2.new(1, -28, 0, 22), { TextSize = 9, Color = C.YELLOW })
+            resultLabel.ZIndex = 212
+            local validateButton = makeButton(card, "VALIDATE", UDim2.new(0, 12, 1, -43), UDim2.new(0.25, -6, 0, 30), {
+                Background = C.BUTTON, TextSize = 9, ZIndex = 213,
+            })
+            local importButton = makeButton(card, "IMPORT", UDim2.new(0.25, 6, 1, -43), UDim2.new(0.25, -6, 0, 30), {
+                Background = C.GREEN_DARK, TextSize = 9, ZIndex = 213,
+            })
+            local skipButton = makeButton(card, "SKIP NAME", UDim2.new(0.50, 6, 1, -43), UDim2.new(0.25, -6, 0, 30), {
+                Background = C.BUTTON, TextSize = 9, ZIndex = 213,
+            })
+            local cancelButton = makeButton(card, "CANCEL", UDim2.new(0.75, 6, 1, -43), UDim2.new(0.25, -18, 0, 30), {
+                Background = C.RED_DARK, TextSize = 9, ZIndex = 213,
+            })
+            local validated = false
+            importButton.Active = false
+            importButton.AutoButtonColor = false
+            importButton.BackgroundColor3 = C.BUTTON
+            local function validateInput()
+                local raw = jsonBox.Text
+                local valid, payloadOrError
+                if kind == "Macro" then
+                    valid, payloadOrError = MacroStore:ValidateJSON(raw)
+                elseif callbacks.onValidateMapJSON then
+                    valid, payloadOrError = callbacks.onValidateMapJSON(raw)
+                else
+                    valid, payloadOrError = false, "Map JSON validation is unavailable."
+                end
+                validated = valid == true
+                resultLabel.Text = validated and "JSON valid. Ready to import." or tostring(payloadOrError or "Invalid JSON.")
+                resultLabel.TextColor3 = validated and C.GREEN or C.RED
+                importButton.Active = validated
+                importButton.AutoButtonColor = validated
+                importButton.BackgroundColor3 = validated and C.GREEN_DARK or C.BUTTON
+                return validated
+            end
+            jsonBox:GetPropertyChangedSignal("Text"):Connect(function()
+                validated = false
+                resultLabel.Text = "Not validated"
+                resultLabel.TextColor3 = C.YELLOW
+                importButton.Active = false
+                importButton.AutoButtonColor = false
+                importButton.BackgroundColor3 = C.BUTTON
+            end)
+            local function commitImport(skipName)
+                if not validated and not validateInput() then return end
+                local raw = jsonBox.Text
+                local desiredName = skipName and "" or trim(nameBox.Text)
+                local ok, a, b
+                if kind == "Macro" then
+                    ok, a, b = MacroStore:ImportJSONAsNew(desiredName, raw)
+                elseif callbacks.onImportMapJSON then
+                    ok, a, b = callbacks.onImportMapJSON(raw, desiredName)
+                else
+                    ok, a = false, "Map import is unavailable."
+                end
+                if not ok then
+                    resultLabel.Text = tostring(a or "Import failed.")
+                    resultLabel.TextColor3 = C.RED
+                    setStatus(resultLabel.Text, C.RED)
+                    return
+                end
+                local displayMessage = kind == "Macro" and (b or a) or (a or b)
+                resultLabel.Text = tostring(displayMessage or "Import completed.")
+                resultLabel.TextColor3 = C.GREEN
+                setStatus(kind .. " Import completed: " .. tostring(displayMessage), C.GREEN)
+                if onImported then
+                    if kind == "Macro" then
+                        pcall(onImported, a, b, raw) -- Macro: key, message, raw JSON
+                    else
+                        pcall(onImported, b, a, raw) -- Map: key, message, raw JSON
+                    end
+                end
+                task.delay(0.12, function()
+                    if overlay and overlay.Parent then overlay:Destroy() end
+                end)
+            end
+            validateButton.Activated:Connect(validateInput)
+            importButton.Activated:Connect(function() commitImport(false) end)
+            skipButton.Activated:Connect(function()
+                if not validated and not validateInput() then return end
+                nameBox.Text = ""
+                commitImport(true)
+            end)
+            cancelButton.Activated:Connect(function() if overlay.Parent then overlay:Destroy() end end)
+        end
+
+        local tabNames = { "MAIN", "TARGET", "MACRO", "HOOK", "PERF", "INFO", "SET" }
         local tabButtons = {}
         local tabFrames = {}
 
         for index, tabName in ipairs(tabNames) do
             local tabButton = makeButton(sidebar, tabName,
-                UDim2.new(0, 8, 0, 13 + (index - 1) * 42),
-                UDim2.new(1, -16, 0, 34), {
+                UDim2.new(0, 6, 0, 11 + (index - 1) * 38),
+                UDim2.new(1, -12, 0, 31), {
                     Background = C.SIDEBAR,
                     TextColor = C.DIM,
-                    TextSize = isMobileLayout and 8 or 10,
+                    TextSize = isMobileLayout and 9 or 10,
                 })
             tabButtons[index] = tabButton
 
-            local frame = newInstance("Frame", {
+            local frameClass = (index == 1 or index == 2) and "ScrollingFrame" or "Frame"
+            local frameProperties = {
                 Size = UDim2.new(1, 0, 1, 0),
                 BackgroundTransparency = 1,
                 Visible = index == 1,
-            }, content)
+            }
+            if index == 1 or index == 2 then
+                frameProperties.CanvasSize = UDim2.new(0, 0, 0, index == 1 and 514 or 545)
+                frameProperties.ScrollBarThickness = 4
+                frameProperties.ScrollBarImageColor3 = C.ACCENT
+                frameProperties.ScrollingDirection = Enum.ScrollingDirection.Y
+                frameProperties.AutomaticCanvasSize = Enum.AutomaticSize.None
+                frameProperties.Active = true
+                frameProperties.ClipsDescendants = true
+            end
+            local frame = newInstance(frameClass, frameProperties, content)
             tabFrames[index] = frame
         end
 
@@ -2741,28 +3288,16 @@ do
         -- TAB MAIN MOI: CAC DIEU KHIEN CHUNG
         -- ============================================================
         local globalMain = tabFrames[1]
-        -- Vùng nội dung MAIN là ScrollingFrame: cửa sổ giữ nguyên kích thước, phần dư (Automation) cuộn dọc.
-        local mainScroll = newInstance("ScrollingFrame", {
-            Name = "MainScroll",
-            Position = UDim2.new(0, 0, 0, 0),
-            Size = UDim2.new(1, 0, 1, 0),
-            BackgroundTransparency = 1,
-            BorderSizePixel = 0,
-            ScrollBarThickness = 4,
-            ScrollBarImageColor3 = C.ACCENT,
-            ScrollingDirection = Enum.ScrollingDirection.Y,
-            CanvasSize = UDim2.new(0, 0, 0, 0),
-            AutomaticCanvasSize = Enum.AutomaticSize.None,
-            Active = true,
-            ScrollingEnabled = true,
-        }, globalMain)
         local globalPanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
-            Size = UDim2.new(1, -28, 0, 486), -- chiều cao = vị trí đáy nội dung thấp nhất (440 + 34) + đệm; rộng chừa chỗ thanh cuộn
+            Size = UDim2.new(1, -24, 0, 490),
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
-        }, mainScroll)
+        }, globalMain)
         addCorner(globalPanel, 9)
+        addStroke(globalPanel, Color3.fromRGB(57, 78, 110), 1)
+        makeDraggable(globalPanel, window, true, clampWindowToViewport)
+        globalMain.CanvasSize = UDim2.new(0, 0, 0, 514)
         makeLabel(globalPanel, "MAIN CONTROL", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
@@ -2942,21 +3477,6 @@ do
         end)
         refreshGameSpeedButtons()
 
-        -- CanvasSize theo đáy thực tế của các phần tử nằm trong globalPanel (đều dùng Y offset),
-        -- không đặt cứng một số không liên quan tới nội dung.
-        local function fitMainCanvas()
-            local bottom = 0
-            for _, child in ipairs(globalPanel:GetChildren()) do
-                if child:IsA("GuiObject") and child.Size.Y.Scale == 0 and child.Position.Y.Scale == 0 then
-                    bottom = math.max(bottom, child.Position.Y.Offset + child.Size.Y.Offset)
-                end
-            end
-            local panelHeight = math.max(bottom + 12, 120)
-            globalPanel.Size = UDim2.new(1, -28, 0, panelHeight)
-            mainScroll.CanvasSize = UDim2.new(0, 0, 0, panelHeight + 24)
-        end
-        fitMainCanvas()
-
         -- ============================================================
         -- TAB MACRO: TAO FILE / DROPDOWN / JSON / RECORD / PLAY
         -- ============================================================
@@ -2968,6 +3488,8 @@ do
             BorderSizePixel = 0,
         }, macroTab)
         addCorner(macroPanel, 9)
+        addStroke(macroPanel, Color3.fromRGB(57, 78, 110), 1)
+        makeDraggable(macroPanel, window, true, clampWindowToViewport)
         makeLabel(macroPanel, "MACRO FILE MANAGER", UDim2.new(0, 12, 0, 8), UDim2.new(1, -24, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT,
         })
@@ -3047,6 +3569,8 @@ do
             MultiLine = true,
         }, macroScroll)
         addCorner(macroJsonBox, 6)
+        macroJsonBox:SetAttribute("ChenFuWeiSourcePlaceholder", 'Dán JSON Macro dạng [ { "Type": "PlaceUnit", ... } ] vào đây...')
+        macroJsonBox.PlaceholderText = localizeText('Dán JSON Macro dạng [ { "Type": "PlaceUnit", ... } ] vào đây...')
         addStroke(macroJsonBox, Color3.fromRGB(48, 66, 96), 1)
         newInstance("UIPadding", {
             PaddingTop = UDim.new(0, 7), PaddingLeft = UDim.new(0, 7),
@@ -3060,7 +3584,12 @@ do
             Background = C.GREEN_DARK,
         })
         local macroFileStatus = makeLabel(macroScroll, "Macro file: chưa chọn | Actions: --",
-            UDim2.new(0, 6, 0, 375), UDim2.new(1, -12, 0, 18), { TextSize = 8, Color = C.DIM })
+            UDim2.new(0, 6, 0, 375), UDim2.new(1, -12, 0, 22), { TextSize = 8, Color = C.DIM })
+        macroFileStatus:SetAttribute("ChenFuWeiSourceText", nil)
+        macroFileStatus.BackgroundTransparency = 0
+        macroFileStatus.BackgroundColor3 = C.INPUT
+        addCorner(macroFileStatus, 6)
+        addStroke(macroFileStatus, Color3.fromRGB(57, 78, 110), 1)
 
         local macroRecordSetter
         macroRecordSetter = makeToggle(macroScroll, "RECORD MACRO", UDim2.new(0, 6, 0, 399), function(enabled)
@@ -3243,13 +3772,14 @@ do
             setStatus(MacroStore:HasPersistence() and "Đã tạo Macro file mới trên thiết bị." or "Đã tạo Macro tạm trong phiên; executor không hỗ trợ ghi file.", MacroStore:HasPersistence() and C.GREEN or C.YELLOW)
         end)
         importMacroButton.Activated:Connect(function()
-            if not selectedMacroKey then
-                setStatus("Hãy tạo hoặc chọn Macro file trước khi Import.", C.YELLOW)
-                return
-            end
-            local ok, message = MacroStore:ImportJSON(selectedMacroKey, macroJsonBox.Text)
-            updateMacroFileStatus()
-            setStatus(message, ok and C.GREEN or C.RED)
+            showImportDialog("Macro", function(newKey, message, raw)
+                selectedMacroKey = newKey
+                MacroStore:SelectFile(newKey)
+                macroJsonBox.Text = raw or "[]"
+                refreshMacroDropdown()
+                updateMacroFileStatus()
+                setStatus(message or "Macro imported.", C.GREEN)
+            end)
         end)
         exportMacroButton.Activated:Connect(function()
             if not selectedMacroKey then
@@ -3262,22 +3792,34 @@ do
                 return
             end
             macroJsonBox.Text = raw
+            local copied = false
             if type(setclipboard) == "function" then
-                pcall(setclipboard, raw)
+                local copyOK, copyResult = pcall(setclipboard, raw)
+                copied = copyOK and copyResult ~= false
             end
-            setStatus("Đã Export JSON: " .. tostring(path or "RAM") .. (type(setclipboard) == "function" and " (đã copy clipboard)." or "."), C.GREEN)
+            local fileSaved = path ~= "Clipboard only"
+            if not fileSaved and not copied then
+                setStatus("Export failed: file write and clipboard copy are both unavailable or failed.", C.RED)
+                return
+            end
+            local exportMessage = fileSaved and ("Exported: " .. tostring(path or "file")) or "Exported to Clipboard"
+            exportMessage ..= copied and " · copied to clipboard." or " · clipboard unavailable; file saved."
+            setStatus(exportMessage, C.GREEN)
             updateMacroFileStatus()
         end)
 
         -- TARGET MONSTER TAB (GIU NGUYEN NOI DUNG MAIN CU)
         local main = tabFrames[2]
+        main.CanvasSize = UDim2.new(0, 0, 0, 545)
         local leftPanel = newInstance("Frame", {
             Position = UDim2.new(0, 9, 0, 9),
-            Size = UDim2.new(0.51, -12, 1, -18),
+            Size = UDim2.new(0.51, -12, 0, 520),
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, main)
         addCorner(leftPanel, 9)
+        addStroke(leftPanel, Color3.fromRGB(57, 78, 110), 1)
+        makeDraggable(leftPanel, window, true, clampWindowToViewport)
         newInstance("UIPadding", {
             PaddingLeft = UDim.new(0, 10),
             PaddingRight = UDim.new(0, 10),
@@ -3303,6 +3845,7 @@ do
         local setDestinationButton = makeButton(leftPanel, "SET DEST", UDim2.new(0.52, 3, 0, 73), UDim2.new(0.48, -3, 0, 28))
         local recordButton = makeButton(leftPanel, "START RECORD", UDim2.new(0, 0, 0, 106), UDim2.new(0.48, -3, 0, 27), { Background = C.BUTTON })
         local routeStatusLabel = makeLabel(leftPanel, "Route: chua record", UDim2.new(0.52, 3, 0, 106), UDim2.new(0.48, -3, 0, 27), { TextSize = 8, Color = C.DIM, Wrapped = true })
+        routeStatusLabel:SetAttribute("ChenFuWeiSourceText", nil)
 
         local fileNameBox = makeTextBox(leftPanel, "Nhap ten file ban do...", UDim2.new(0, 0, 0, 138), UDim2.new(1, 0, 0, 27))
         local createButton = makeButton(leftPanel, "+ CREATE FILE", UDim2.new(0, 0, 0, 171), UDim2.new(1, 0, 0, 27), {
@@ -3369,16 +3912,23 @@ do
         local importMapButton = makeButton(leftPanel, "IMPORT MAP", UDim2.new(0, 0, 0, 461), UDim2.new(0.48, -3, 0, 27), { Background = C.BUTTON, TextSize = 9 })
         local exportMapButton = makeButton(leftPanel, "EXPORT MAP", UDim2.new(0.52, 3, 0, 461), UDim2.new(0.48, -3, 0, 27), { Background = C.GREEN_DARK, TextSize = 9 })
         local mapFileStatusLabel = makeLabel(leftPanel, "Current Map: -- | Route Points: 0 | Status: NOT READY",
-            UDim2.new(0, 0, 0, 491), UDim2.new(1, 0, 0, 18), { TextSize = 8, Color = C.DIM, Wrapped = true })
+            UDim2.new(0, 0, 0, 491), UDim2.new(1, 0, 0, 22), { TextSize = 8, Color = C.DIM, Wrapped = true })
+        mapFileStatusLabel:SetAttribute("ChenFuWeiSourceText", nil)
+        mapFileStatusLabel.BackgroundTransparency = 0
+        mapFileStatusLabel.BackgroundColor3 = C.INPUT
+        addCorner(mapFileStatusLabel, 6)
+        addStroke(mapFileStatusLabel, Color3.fromRGB(57, 78, 110), 1)
 
         -- MAIN TAB: RIGHT PANEL
         local rightPanel = newInstance("Frame", {
             Position = UDim2.new(0.51, 3, 0, 9),
-            Size = UDim2.new(0.49, -12, 1, -18),
+            Size = UDim2.new(0.49, -12, 0, 430),
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, main)
         addCorner(rightPanel, 9)
+        addStroke(rightPanel, Color3.fromRGB(57, 78, 110), 1)
+        makeDraggable(rightPanel, window, true, clampWindowToViewport)
 
         makeLabel(rightPanel, "PLAYER CONTROL", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 21), {
             Font = Enum.Font.GothamBold,
@@ -3403,7 +3953,11 @@ do
 
         makeLabel(rightPanel, "BOSS MAX HP", UDim2.new(0, 10, 0, 221), UDim2.new(0, 88, 0, 23), { TextSize = 9, Color = C.DIM })
         local bossHPBox = makeTextBox(rightPanel, "128.5m", UDim2.new(0, 100, 0, 220), UDim2.new(1, -110, 0, 24))
-        local bossStatusLabel = makeLabel(rightPanel, "Boss: chua cau hinh", UDim2.new(0, 10, 0, 250), UDim2.new(1, -20, 0, 18), { TextSize = 9, Color = C.DIM })
+        local bossStatusLabel = makeLabel(rightPanel, "Boss: chua cau hinh", UDim2.new(0, 10, 0, 250), UDim2.new(1, -20, 0, 22), { TextSize = 9, Color = C.DIM })
+        bossStatusLabel:SetAttribute("ChenFuWeiSourceText", nil)
+        bossStatusLabel.BackgroundTransparency = 0
+        bossStatusLabel.BackgroundColor3 = C.INPUT
+        addCorner(bossStatusLabel, 5)
 
         local scannerPanel = newInstance("Frame", {
             Position = UDim2.new(0, 10, 0, 274),
@@ -3432,6 +3986,8 @@ do
             BorderSizePixel = 0,
         }, tabFrames[4])
         addCorner(webhookPanel, 9)
+        addStroke(webhookPanel, Color3.fromRGB(57, 78, 110), 1)
+        makeDraggable(webhookPanel, window, true, clampWindowToViewport)
         makeLabel(webhookPanel, "WEBHOOK DISCORD", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
@@ -3474,6 +4030,8 @@ do
             BorderSizePixel = 0,
         }, tabFrames[5])
         addCorner(performancePanel, 9)
+        addStroke(performancePanel, Color3.fromRGB(57, 78, 110), 1)
+        makeDraggable(performancePanel, window, true, clampWindowToViewport)
         makeLabel(performancePanel, "TỐI ƯU HIỆU NĂNG", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
@@ -3779,12 +4337,32 @@ do
         end)
 
         importMapButton.Activated:Connect(function()
-            local ok, message = callbacks.onImportMap(trim(mapFileBox.Text))
-            setStatus(message, ok and C.GREEN or C.RED)
+            showImportDialog("Map", function(activeKey, message)
+                selectedKey = activeKey or selectedKey
+                refreshDropdown()
+                updateCreateButton()
+                setDropdownTitle()
+                setStatus(message or "Map imported.", C.GREEN)
+            end)
         end)
         exportMapButton.Activated:Connect(function()
-            local ok, message = callbacks.onExportMap(trim(mapFileBox.Text))
-            setStatus(message, ok and C.GREEN or C.RED)
+            local ok, message, raw = callbacks.onExportMap(trim(mapFileBox.Text))
+            if not ok then
+                setStatus(message, C.RED)
+                return
+            end
+            local copied = false
+            if type(raw) == "string" and type(setclipboard) == "function" then
+                local copyOK, copyResult = pcall(setclipboard, raw)
+                copied = copyOK and copyResult ~= false
+            end
+            local clipboardOnly = tostring(message):find("Clipboard only", 1, true) ~= nil
+                or tostring(message):find("ready for Clipboard", 1, true) ~= nil
+            if clipboardOnly and not copied then
+                setStatus("Export failed: JSON could not be copied and no file was saved.", C.RED)
+                return
+            end
+            setStatus(tostring(message) .. (copied and " · copied to clipboard." or " · file saved."), C.GREEN)
         end)
 
         scanNowButton.Activated:Connect(function()
@@ -3805,6 +4383,7 @@ do
             return reversed:gsub("^,", "")
         end
 
+        local popupSetter
         self._api = {
             setStatus = setStatus,
             notify = notify,
@@ -3891,8 +4470,12 @@ do
                 updateMacroFileStatus()
                 return true
             end,
-            setMacroRecordUI = function(enabled, silent) macroRecordSetter(enabled == true, silent == true) end,
-            setMacroPlayUI = function(enabled, silent) macroPlaySetter(enabled == true, silent == true) end,
+            setMacroRecordUI = function(enabled, silent)
+                if macroRecordSetter and macroScroll and macroScroll.Parent then macroRecordSetter(enabled == true, silent == true) end
+            end,
+            setMacroPlayUI = function(enabled, silent)
+                if macroPlaySetter and macroScroll and macroScroll.Parent then macroPlaySetter(enabled == true, silent == true) end
+            end,
             getActiveMacro = function()
                 local key, data = MacroStore:GetActiveFile()
                 if not data then return nil end
@@ -3908,8 +4491,17 @@ do
                 }
             end,
             setMacroStatus = function(message, ok)
-                macroFileStatus.Text = "Macro: " .. tostring(message)
+                if not macroFileStatus or not macroFileStatus.Parent then return end
+                macroFileStatus.Text = localizeText(tostring(message))
                 macroFileStatus.TextColor3 = ok and C.GREEN or C.YELLOW
+            end,
+            setLanguage = setLanguage,
+            getLanguage = function() return currentLanguage end,
+            setPopupNotifications = function(enabled)
+                popupNotificationsEnabled = enabled == true
+                uiSettings.PopupNotifications = popupNotificationsEnabled
+                saveUISettings()
+                if popupSetter then popupSetter(popupNotificationsEnabled, true) end
             end,
             setSelectedKey = function(key)
                 selectedKey = key
@@ -3921,7 +4513,7 @@ do
                     MapManager:IsReady() and "READY" or "NOT READY")
             end,
             setRouteStatus = function(message)
-                routeStatusLabel.Text = "Route: " .. tostring(message)
+                routeStatusLabel.Text = "Route: " .. localizeText(tostring(message))
                 local _, active = SaveManager:GetActiveFile()
                 local routeCount = #(MapManager:GetRoute() or {})
                 mapFileStatusLabel.Text = string.format("Current Map: %s | Route Points: %d | Status: %s",
@@ -3939,15 +4531,22 @@ do
             BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
         }, infoTab)
         addCorner(infoPanel, 9)
-        makeLabel(infoPanel, "SYSTEM INFORMATION", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
+        addStroke(infoPanel, Color3.fromRGB(57, 78, 110), 1)
+        makeDraggable(infoPanel, window, true, clampWindowToViewport)
+        makeLabel(infoPanel, "DEVICE & EXECUTOR INFORMATION", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
-        local infoText = makeLabel(infoPanel, "Đang đọc thông tin thiết bị...", UDim2.new(0, 14, 0, 48), UDim2.new(1, -28, 0, 190), {
+        local infoText = makeLabel(infoPanel, "Reading device information...", UDim2.new(0, 14, 0, 48), UDim2.new(1, -28, 0, 105), {
             TextSize = 10, Color = C.TEXT, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
         })
-        makeLabel(infoPanel, "Thông tin executor là lựa chọn của người dùng, không phải xác minh bảo mật.",
-            UDim2.new(0, 14, 0, 250), UDim2.new(1, -28, 0, 42), {
-                TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
+        infoText:SetAttribute("ChenFuWeiSourceText", nil)
+        infoText.BackgroundTransparency = 0
+        infoText.BackgroundColor3 = C.INPUT
+        addCorner(infoText, 7)
+        addStroke(infoText, Color3.fromRGB(57, 78, 110), 1)
+        local infoDisclaimer = makeLabel(infoPanel, "Executor information is a user-selected profile, not a security verification.",
+            UDim2.new(0, 14, 0, 290), UDim2.new(1, -28, 0, 32), {
+                TextSize = 8, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
             })
 
         local settingTab = tabFrames[7]
@@ -3956,11 +4555,13 @@ do
             BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
         }, settingTab)
         addCorner(settingPanel, 9)
-        makeLabel(settingPanel, "DEVICE & EXECUTOR SETTING", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
-            Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT,
+        addStroke(settingPanel, Color3.fromRGB(57, 78, 110), 1)
+        makeDraggable(settingPanel, window, true, clampWindowToViewport)
+        makeLabel(settingPanel, "SETTINGS", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
+            Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
-        makeLabel(settingPanel, "Chọn môi trường đang dùng. Hồ sơ được lưu cục bộ trên thiết bị/executor này.",
-            UDim2.new(0, 14, 0, 40), UDim2.new(1, -28, 0, 36), {
+        makeLabel(settingPanel, "Language and notification preferences.",
+            UDim2.new(0, 14, 0, 40), UDim2.new(1, -28, 0, 24), {
                 TextSize = 9, Color = C.DIM, Wrapped = true,
             })
         local profileFile = "duy_device_profile.json"
@@ -3990,12 +4591,15 @@ do
                     and not deltaTextBoosted[instance] then
                     deltaTextBoosted[instance] = true
                     local currentSize = tonumber(instance.TextSize) or 0
-                    if currentSize > 0 and currentSize < 14 then
-                        instance.TextSize = math.min(14, math.max(currentSize, math.floor(currentSize * 1.2 + 0.5)))
+                    if currentSize > 0 and currentSize < 11 then
+                        -- Keep compact layouts readable without forcing 14px into narrow controls.
+                        instance.TextSize = 11
                     end
                     instance.TextTransparency = 0
-                    instance.TextStrokeColor3 = Color3.fromRGB(3, 5, 10)
-                    instance.TextStrokeTransparency = 0.92
+                    instance.TextStrokeTransparency = 1
+                    if instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox") then
+                        instance.Font = Enum.Font.GothamSemibold
+                    end
                 end
             end
             for _, descendant in ipairs(screen:GetDescendants()) do improveDeltaText(descendant) end
@@ -4021,6 +4625,23 @@ do
         end
         local executorLabel = makeLabel(settingPanel, "Executor: " .. tostring(deviceProfile.Executor or "Chưa chọn"),
             UDim2.new(0, 14, 0, 88), UDim2.new(1, -28, 0, 20), { TextSize = 10, Color = C.TEXT })
+        executorLabel:SetAttribute("ChenFuWeiSourceText", nil)
+        local function refreshDeviceInfoText()
+            local device, viewport = getDeviceInfo()
+            local executor = tostring(deviceProfile.Executor or (currentLanguage == "English" and "Unknown" or "Chưa chọn"))
+            if executor == "Chưa chọn" and currentLanguage == "English" then executor = "Not selected" end
+            local persistence = type(writefile) == "function"
+                and (currentLanguage == "English" and "Available" or "Có")
+                or (currentLanguage == "English" and "Session only" or "Chỉ trong phiên")
+            if currentLanguage == "English" then
+                infoText.Text = string.format("Executor: %s\nDevice: %s\nScreen size: %d × %d\nProfile persistence: %s",
+                    executor, device, viewport.X, viewport.Y, persistence)
+            else
+                infoText.Text = string.format("Executor: %s\nThiết bị: %s\nKích thước màn hình: %d × %d\nLưu hồ sơ: %s",
+                    executor, device, viewport.X, viewport.Y, persistence)
+            end
+            executorLabel.Text = "Executor: " .. executor
+        end
         local deltaButton = makeButton(settingPanel, "DELTA", UDim2.new(0, 14, 0, 118), UDim2.new(0.46, -6, 0, 34), { Background = C.BUTTON })
         local xenoButton = makeButton(settingPanel, "XENO", UDim2.new(0.54, 0, 0, 118), UDim2.new(0.46, -14, 0, 34), { Background = C.BUTTON })
         local function chooseExecutor(name)
@@ -4029,12 +4650,9 @@ do
             deviceProfile.Device = device
             deviceProfile.ProfileVersion = 1
             saveDeviceProfile()
-            executorLabel.Text = "Executor: " .. name
+            refreshDeviceInfoText()
             notify("Đã lưu cấu hình " .. name .. " / " .. device .. ".", C.GREEN)
             if tostring(name):lower() == "delta" then applyDeltaTextReadability() end
-            infoText.Text = string.format("Executor: %s\nThiết bị: %s\nKích thước màn hình: %s\nLưu hồ sơ: %s",
-                name, device, tostring((workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or "N/A"),
-                type(writefile) == "function" and "Có" or "Chỉ trong phiên")
         end
         deltaButton.Activated:Connect(function() chooseExecutor("Delta") end)
         xenoButton.Activated:Connect(function() chooseExecutor("Xeno") end)
@@ -4044,28 +4662,73 @@ do
         resetProfileButton.Activated:Connect(function()
             deviceProfile = { Executor = "Chưa chọn", Device = "Unknown" }
             if type(delfile) == "function" then pcall(delfile, profileFile) end
-            executorLabel.Text = "Executor: Chưa chọn"
+            refreshDeviceInfoText()
             notify("Đã đặt lại hồ sơ. Hãy chọn Delta hoặc Xeno.", C.YELLOW)
         end)
         local refreshInfoButton = makeButton(settingPanel, "REFRESH DEVICE INFO", UDim2.new(0, 14, 0, 210), UDim2.new(1, -28, 0, 30), {
             Background = C.BUTTON, TextSize = 9,
         })
         refreshInfoButton.Activated:Connect(function()
-            local device, viewport = getDeviceInfo()
-            infoText.Text = string.format("Executor: %s\nThiết bị: %s\nMàn hình: %d x %d\nLưu hồ sơ: %s",
-                tostring(deviceProfile.Executor or "Chưa chọn"), device, viewport.X, viewport.Y,
-                type(writefile) == "function" and "Có" or "Chỉ trong phiên")
+            refreshDeviceInfoText()
             notify("Đã cập nhật thông tin thiết bị.", C.ACCENT)
         end)
-        do
-            local device, viewport = getDeviceInfo()
-            infoText.Text = string.format("Executor: %s\nThiết bị: %s\nMàn hình: %d x %d\nLưu hồ sơ: %s",
-                tostring(deviceProfile.Executor or "Chưa chọn"), device, viewport.X, viewport.Y,
-                type(writefile) == "function" and "Có" or "Chỉ trong phiên")
-        end
-        executorLabel.Text = "Executor: " .. tostring(deviceProfile.Executor or "Chưa chọn")
+        refreshDeviceInfoText()
 
-        -- Lan dau chay tren moi bo luu tru cuc bo: hoi chon executor truoc khi thao tac.
+        -- Device and executor controls belong to INFO, not SETTINGS.
+        executorLabel.Parent = infoPanel
+        executorLabel.BackgroundTransparency = 0
+        executorLabel.BackgroundColor3 = C.INPUT
+        addCorner(executorLabel, 6)
+        addStroke(executorLabel, Color3.fromRGB(57, 78, 110), 1)
+        executorLabel.Position = UDim2.new(0, 14, 0, 165)
+        executorLabel.Size = UDim2.new(1, -28, 0, 20)
+        deltaButton.Parent = infoPanel
+        deltaButton.Position = UDim2.new(0, 14, 0, 192)
+        deltaButton.Size = UDim2.new(0.46, -6, 0, 32)
+        xenoButton.Parent = infoPanel
+        xenoButton.Position = UDim2.new(0.54, 0, 0, 192)
+        xenoButton.Size = UDim2.new(0.46, -14, 0, 32)
+        resetProfileButton.Parent = infoPanel
+        resetProfileButton.Position = UDim2.new(0, 14, 0, 232)
+        resetProfileButton.Size = UDim2.new(0.46, -6, 0, 29)
+        refreshInfoButton.Parent = infoPanel
+        refreshInfoButton.Position = UDim2.new(0.54, 0, 0, 232)
+        refreshInfoButton.Size = UDim2.new(0.46, -14, 0, 29)
+
+        makeLabel(settingPanel, "LANGUAGE", UDim2.new(0, 14, 0, 82), UDim2.new(1, -28, 0, 18), {
+            Font = Enum.Font.GothamBold, TextSize = 10, Color = C.ACCENT,
+        })
+        local englishButton = makeButton(settingPanel, "ENGLISH", UDim2.new(0, 14, 0, 108), UDim2.new(0.46, -6, 0, 34), {
+            Background = C.BUTTON,
+        })
+        local vietnameseButton = makeButton(settingPanel, "TIẾNG VIỆT", UDim2.new(0.54, 0, 0, 108), UDim2.new(0.46, -14, 0, 34), {
+            Background = C.BUTTON,
+        })
+        local function refreshLanguageButtons()
+            englishButton.BackgroundColor3 = currentLanguage == "English" and C.GREEN_DARK or C.BUTTON
+            vietnameseButton.BackgroundColor3 = currentLanguage == "Vietnamese" and C.GREEN_DARK or C.BUTTON
+        end
+        englishButton.Activated:Connect(function()
+            setLanguage("English")
+            refreshDeviceInfoText()
+            refreshLanguageButtons()
+        end)
+        vietnameseButton.Activated:Connect(function()
+            setLanguage("Vietnamese")
+            refreshDeviceInfoText()
+            refreshLanguageButtons()
+        end)
+        popupSetter = makeToggle(settingPanel, "POPUP NOTIFICATIONS", UDim2.new(0, 14, 0, 158), function(enabled)
+            popupNotificationsEnabled = enabled == true
+            uiSettings.PopupNotifications = popupNotificationsEnabled
+            saveUISettings()
+            setStatus(popupNotificationsEnabled and "Popup notifications enabled." or "Popup notifications disabled.", C.GREEN)
+            return true
+        end)
+        popupSetter(popupNotificationsEnabled, true)
+        refreshLanguageButtons()
+
+        -- First run defaults to English; executor selection is independent from language setup.
         if not deviceProfile.Executor or deviceProfile.Executor == "Chưa chọn" then
             local setupOverlay = newInstance("Frame", {
                 Name = "FirstRunSetup", Size = UDim2.fromScale(1, 1),
@@ -4118,6 +4781,8 @@ do
             pcall(function() connection:Disconnect() end)
         end
         table.clear(self._connections)
+        activeDrag = nil
+        dragDispatcherBound = false
         if self._screen then
             self._screen:Destroy()
             self._screen = nil
@@ -7088,6 +7753,9 @@ function MacroEngine:_saveRecord(reason)
         api.setMacroStatus(statusMessage, ok and MacroStore:HasPersistence()
             and unresolvedPlaces == 0 and incompletePayloads == 0
             and bananaWithoutTopLevelPathMetadata == 0)
+        if ok and api.notify then
+            api.notify("Macro saved · " .. tostring(#cleanActions) .. " actions", Color3.fromRGB(50, 200, 110), "ChenFuWei")
+        end
     end
     return ok, message or "Đã lưu Macro."
 end
@@ -8934,6 +9602,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
         api.setMacroPlayUI(true, true)
         api.setMacroStatus(string.format("Macro đã bắt đầu · %d Action · chạy sớm %.1fs (TickSpeed %.1fx) · FIFO.",
             #actions, leadSeconds, tickSpeed), true)
+        if api.notify then api.notify("Macro started", Color3.fromRGB(50, 200, 110), "ChenFuWei") end
     end
 
     task.spawn(function()
@@ -9016,7 +9685,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
             if actionOK then
                 completedCount += 1
                 if api then
-                    api.setMacroStatus(string.format("Replay %d/%d · JSON %.2fs → due %.2fs · actual %.2fs · trễ %.2fs · %s",
+                    api.setMacroStatus(string.format("Action %d/%d · JSON %.2fs → due %.2fs · actual %.2fs · delay %.2fs · %s",
                         index, #actions, recordedTargetTime, targetTime, actualFinish, delayNow, tostring(message)), true)
                 end
             else
@@ -9046,6 +9715,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
             if api then
                 api.setMacroPlayUI(true, true)
                 api.setMacroStatus(string.format("Macro đã xử lý %d/%d Action. Đang chờ trận kết thúc...", attempted, #actions), true)
+                if api.notify then api.notify("Macro completed", Color3.fromRGB(50, 200, 110), "ChenFuWei") end
             end
         end
     end)
@@ -9681,63 +10351,43 @@ callbacks.onAutoSkipChanged = function(enabled)
 end
 
 callbacks.onClose = function()
-    -- Bước 1: đánh dấu Shutdown (chỉ chạy một lần); mọi callback/task kiểm tra `destroyed` sẽ tự thoát.
     if destroyed then return end
     destroyed = true
+    playerControllerClosed = true
 
-    -- Mỗi bước được bọc pcall riêng để một thành phần lỗi không chặn các thành phần còn lại.
-    local function step(fn) pcall(fn) end
+    -- MacroEngine khóa scheduler + chuyển hook thành pass-through trước khi GUI bị hủy.
+    pcall(function() if MacroEngine then MacroEngine:Destroy() end end)
 
-    -- Bước 2: Macro. Destroy() khóa scheduler/token Replay, Auto Repeat, Waiting Next Match, Game Clock,
-    -- watcher vòng đời, chuyển Hook thành pass-through và lưu Record (một lần) theo quy trình sẵn có.
-    step(function() if MacroEngine then MacroEngine:Destroy() end end)
-
-    -- Bước 3: Automation. Tắt cờ trước để callback đã lên lịch (resume Auto Follow, scanner...) tự thoát.
+    antiAfkEnabled = false
     autoFollowEnabled = false
     autoPlayScannerEnabled = false
-    antiAfkEnabled = false
-    step(function() AutoAbilityController:SetEnabled(false) end)
-    step(function()
-        if antiAfkConnection then antiAfkConnection:Disconnect() end
+    if antiAfkConnection then
+        pcall(function() antiAfkConnection:Disconnect() end)
         antiAfkConnection = nil
-    end)
-    step(function()
-        if RouteRecorder then
-            RouteRecorder.Recording = false
-            if RouteRecorder._connection then
-                RouteRecorder._connection:Disconnect()
-                RouteRecorder._connection = nil
-            end
-        end
-    end)
-    step(function() MovementController:Stop() end) -- Stop() cũng đặt SetSpeed(1)
-    step(function() MatchScanner:Stop() end)
-
-    -- Bước 4: Player Control: trả va chạm + WalkSpeed về mặc định rồi gỡ listener respawn của script.
-    step(function() PlayerController:SetNoclip(false) end)
-    step(function() PlayerController:SetSpeed(1) end)
-    PlayerController._shutdown = true
-    step(function()
-        if PlayerController._characterConnection then PlayerController._characterConnection:Disconnect() end
-        PlayerController._characterConnection = nil
-    end)
-
-    -- Bước 5: Runtime (Workspace/Lighting của Performance, Workspace của Enemy Detector, RunService,
-    -- UserInputService, movementOverride...).
-    step(function() PerformanceManager:Destroy() end)
-    step(function() EnemyDetector:Destroy() end)
+    end
+    if RouteRecorder and RouteRecorder._connection then
+        RouteRecorder.Recording = false
+        pcall(function() RouteRecorder._connection:Disconnect() end)
+        RouteRecorder._connection = nil
+    end
+    pcall(function() MovementController:Stop() end)
+    pcall(function() MatchScanner:Stop() end)
+    pcall(function() PlayerController:SetNoclip(false) end)
+    pcall(function() PlayerController:SetSpeed(1) end)
+    if playerCharacterAddedConnection then
+        pcall(function() playerCharacterAddedConnection:Disconnect() end)
+        playerCharacterAddedConnection = nil
+    end
+    pcall(function() PerformanceManager:Destroy() end)
+    pcall(function() EnemyDetector:Destroy() end)
     for _, connection in ipairs(runtimeConnections) do
-        step(function() connection:Disconnect() end)
+        pcall(function() connection:Disconnect() end)
     end
     table.clear(runtimeConnections)
-
-    -- Bước 6-7: GUI connections + ScreenGui (logo thu nhỏ là con của ScreenGui nên bị xóa cùng).
-    step(function() GUI:Destroy() end)
-    -- Chỉ dọn đúng ScreenGui do script tạo nếu còn sót (không đụng GUI khác).
-    step(function()
-        local leftover = PlayerGui:FindFirstChild("DuySystem")
-        if leftover then leftover:Destroy() end
-    end)
+    if createdMovementOverrideEvent and movementOverrideEvent and movementOverrideEvent.Parent then
+        pcall(function() movementOverrideEvent:Destroy() end)
+    end
+    pcall(function() GUI:Destroy() end)
 end
 
 callbacks.onSetSpawn = function()
@@ -9787,8 +10437,9 @@ local function validateMapData(data)
     for index, point in ipairs(data.RoutePoints) do
         if not validPoint(point) then return false, "RoutePoints loi tai diem " .. tostring(index) end
     end
-    if type(data.Name) ~= "string" or trim(data.Name) == "" then
-        return false, "Name khong hop le."
+    -- Name is optional: the Import dialog assigns a new library name separately.
+    if data.Name ~= nil and type(data.Name) ~= "string" then
+        return false, "Name must be a string when provided."
     end
     return true
 end
@@ -9798,7 +10449,6 @@ callbacks.onExportMap = function(path)
     if not active then return false, "Hay tao/chon Map truoc." end
     local filePath = cleanMapFileName(path)
     if not filePath then return false, "Duong dan file khong hop le." end
-    if type(writefile) ~= "function" then return false, "Moi truong khong ho tro writefile." end
     local mapData = {
         Version = "2.7",
         Name = tostring(active.MapName or "Map"),
@@ -9808,15 +10458,25 @@ callbacks.onExportMap = function(path)
     }
     local valid, reason = validateMapData(mapData)
     if not valid then return false, "Khong the Export: " .. reason end
-    local ok, err = pcall(function()
+    local encodeOK, raw = pcall(function() return HttpService:JSONEncode(mapData) end)
+    if not encodeOK then return false, "Khong the ma hoa JSON: " .. tostring(raw) end
+    if type(writefile) ~= "function" then
+        if type(setclipboard) ~= "function" then return false, "Executor khong ho tro ghi file hoac Clipboard." end
+        return true, "Export JSON ready (Clipboard only).", raw
+    end
+    local ok, writeResult = pcall(function()
         local folder = filePath:match("^(.*)/[^/]+$")
         if folder and folder ~= "" and type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(folder) then
             makefolder(folder)
         end
-        writefile(filePath, HttpService:JSONEncode(mapData))
+        return writefile(filePath, raw)
     end)
-    if not ok then return false, "Export loi: " .. tostring(err) end
-    return true, "Export thanh cong: " .. filePath
+    if not ok or writeResult == false then
+        local err = ok and "writefile returned false" or writeResult
+        if type(setclipboard) == "function" then return true, "File write failed; JSON ready for Clipboard: " .. tostring(err), raw end
+        return false, "Export loi: " .. tostring(err)
+    end
+    return true, "Export thanh cong: " .. filePath, raw
 end
 
 callbacks.onImportMap = function(path)
@@ -9834,8 +10494,17 @@ callbacks.onImportMap = function(path)
     if not valid then return false, "Import bi tu choi: " .. reason end
     -- Prepare all values first. A valid import becomes a new SaveManager map file,
     -- so the currently selected map is never overwritten accidentally.
+    local importedName = trim(imported.Name)
+    if importedName == "" then
+        local index = 1
+        repeat
+            importedName = "Map" .. tostring(index)
+            index += 1
+        until not SaveManager:NameExists(importedName) or index > 100000
+        if SaveManager:NameExists(importedName) then return false, "Không tìm được tên Map còn trống." end
+    end
     local staged = {
-        MapName = imported.Name,
+        MapName = importedName,
         SpawnPoint = { X = tonumber(imported.SpawnPoint.X), Y = tonumber(imported.SpawnPoint.Y), Z = tonumber(imported.SpawnPoint.Z) },
         DestinationPoint = { X = tonumber(imported.DestinationPoint.X), Y = tonumber(imported.DestinationPoint.Y), Z = tonumber(imported.DestinationPoint.Z) },
         RoutePoints = {},
@@ -9869,6 +10538,67 @@ callbacks.onImportMap = function(path)
         api.setSelectedKey(activeKey)
     end
     return true, "Import thanh cong: " .. staged.MapName
+end
+
+callbacks.onValidateMapJSON = function(raw)
+    if type(raw) ~= "string" or trim(raw) == "" then return false, "JSON is empty." end
+    local decodeOK, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not decodeOK then return false, "JSON syntax is invalid." end
+    local valid, reason = validateMapData(decoded)
+    if not valid then return false, reason end
+    return true, decoded
+end
+
+callbacks.onImportMapJSON = function(raw, requestedName)
+    local valid, importedOrError = callbacks.onValidateMapJSON(raw)
+    if not valid then return false, importedOrError end
+    local imported = importedOrError
+    local desiredName = trim(requestedName)
+    if desiredName == "" then
+        local index = 1
+        repeat
+            desiredName = "Map" .. tostring(index)
+            index += 1
+        until not SaveManager:NameExists(desiredName) or index > 100000
+        if SaveManager:NameExists(desiredName) then return false, "Không tìm được tên Map còn trống." end
+    elseif SaveManager:NameExists(desiredName) then
+        return false, "Tên Map đã tồn tại. Hãy chọn tên khác."
+    end
+
+    local staged = {
+        MapName = desiredName,
+        SpawnPoint = { X = tonumber(imported.SpawnPoint.X), Y = tonumber(imported.SpawnPoint.Y), Z = tonumber(imported.SpawnPoint.Z) },
+        DestinationPoint = { X = tonumber(imported.DestinationPoint.X), Y = tonumber(imported.DestinationPoint.Y), Z = tonumber(imported.DestinationPoint.Z) },
+        RoutePoints = {},
+    }
+    for _, point in ipairs(imported.RoutePoints) do
+        table.insert(staged.RoutePoints, { X = tonumber(point.X), Y = tonumber(point.Y), Z = tonumber(point.Z) })
+    end
+    local created, activeKey = SaveManager:CreateFile(desiredName)
+    if not created then return false, "Không tạo được Map mới: " .. tostring(activeKey) end
+    local _, active = SaveManager:GetActiveFile()
+    if not active then
+        SaveManager:DeleteFile(activeKey)
+        return false, "Không kích hoạt được Map vừa Import."
+    end
+    active.MapName = staged.MapName
+    active.SpawnPoint = staged.SpawnPoint
+    active.DestinationPoint = staged.DestinationPoint
+    active.RoutePoints = staged.RoutePoints
+    SaveManager:UpdateActivePoints(Vector3.new(staged.SpawnPoint.X, staged.SpawnPoint.Y, staged.SpawnPoint.Z), Vector3.new(staged.DestinationPoint.X, staged.DestinationPoint.Y, staged.DestinationPoint.Z))
+    local routeVectors = {}
+    for _, point in ipairs(staged.RoutePoints) do
+        table.insert(routeVectors, Vector3.new(point.X, point.Y, point.Z))
+    end
+    SaveManager:UpdateActiveRoute(routeVectors)
+    MapManager:LoadFromFile(active)
+    if api then
+        api.setSpawnLabel(MapManager:GetSpawn())
+        api.setDestinationLabel(MapManager:GetDestination())
+        api.setRouteStatus(tostring(#MapManager:GetRoute()) .. " điểm - IMPORTED")
+        api.setSelectedKey(activeKey)
+    end
+    return true, "Map imported: " .. desiredName, activeKey
 end
 
 callbacks.onCreateFile = function(name)
@@ -10001,7 +10731,7 @@ matchWatchConnection = RunService.Heartbeat:Connect(function(dt)
     if ctx ~= matchWatchContext or startStamp ~= matchWatchStart then
         matchWatchContext, matchWatchStart, matchWatchEnded = ctx, startStamp, false
         if startStamp > 0 and endStamp <= 0 and api and api.notify then
-            api.notify("TRẬN ĐẤU ĐÃ BẮT ĐẦU", Color3.fromRGB(91, 169, 255))
+            api.notify("Match started", Color3.fromRGB(91, 169, 255), "ChenFuWei")
         end
     end
     if startStamp > 0 and endStamp > 0 and not matchWatchEnded then
@@ -10376,6 +11106,6 @@ local heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
 end)
 table.insert(runtimeConnections, heartbeatConnection)
 
-print("[DUY SYSTEM] V2.19 da khoi dong - Hybrid Macro Recorder (Hook nhieu duong + Observer du phong).")
-print("[DUY SYSTEM] Record route: bat dau tai Spawn, di theo tuyen, Stop gan Destination.")
+print("[ChenFuWei] Hybrid Macro Recorder da khoi dong (Hook + Observer fallback).")
+print("[ChenFuWei] Route Recorder: bat dau tai Spawn va dung gan Destination.")
 print("[DUY SYSTEM] External movement pause API: PlayerGui.DuySystemMovementOverride:Fire(true/false)")
