@@ -61,6 +61,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local TextService = game:GetService("TextService")
 local PathfindingService = game:GetService("PathfindingService")
 local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -243,6 +244,13 @@ do
 
     function SaveManager:HasPersistence()
         return HAS_FILE_IO
+    end
+
+    function SaveManager:Persist()
+        if not HAS_FILE_IO then
+            return false, "readfile/writefile unavailable; data is session-only."
+        end
+        return saveDB()
     end
 
     function SaveManager:NameExists(name, exceptKey)
@@ -471,13 +479,51 @@ do
         if not ok or type(decoded) ~= "table" then
             return false, "JSON khong hop le."
         end
+        local allowedTypes = {
+            PlaceUnit = true, UpgradeUnit = true, UpgradeAll = true,
+            SellUnit = true, SellAll = true, LockUnit = true,
+            ToggleAutoUpgrade = true, ActivateUnitAbility = true,
+        }
+        local count, maxIndex = 0, 0
         for key, action in pairs(decoded) do
             if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
-                return false, "JSON phai chua danh sach Action, khong phai object."
+                return false, "JSON must be an Action array, not an object."
             end
+            count += 1
+            maxIndex = math.max(maxIndex, key)
             if type(action) ~= "table" or type(action.Type) ~= "string" then
-                return false, "Moi Action phai la object va co truong Type."
+                return false, "Every Action must be an object with a Type field."
             end
+            if not allowedTypes[action.Type] then
+                return false, "Unsupported Action type at index " .. tostring(key) .. ": " .. tostring(action.Type)
+            end
+            local eventTime = tonumber(action.Time)
+            if not eventTime or eventTime ~= eventTime or eventTime < 0 or eventTime == math.huge then
+                return false, "Invalid or missing Time at Action " .. tostring(key) .. "."
+            end
+            local needsId = action.Type == "PlaceUnit" or action.Type == "UpgradeUnit"
+                or action.Type == "SellUnit" or action.Type == "LockUnit"
+                or action.Type == "ToggleAutoUpgrade" or action.Type == "ActivateUnitAbility"
+            if needsId then
+                local actionId = tonumber(action.ID)
+                if not actionId or actionId <= 0 or actionId ~= actionId or actionId == math.huge then
+                    return false, "Missing or invalid ID at Action " .. tostring(key) .. "."
+                end
+            end
+            if action.Type == "PlaceUnit" then
+                if type(action.Unit) ~= "string" or trim(action.Unit) == "" then
+                    return false, "PlaceUnit is missing Unit at Action " .. tostring(key) .. "."
+                end
+                if action.Position == nil and action.CF == nil and action.PlacementParams == nil and action.RemoteArgs == nil then
+                    return false, "PlaceUnit is missing position/payload data at Action " .. tostring(key) .. "."
+                end
+            end
+        end
+        if count == 0 then
+            return false, "Macro JSON contains no actions. Record a macro or import a non-empty Action array."
+        end
+        if count ~= maxIndex then
+            return false, "Action list contains empty indexes; please export a continuous array."
         end
         return true, decoded
     end
@@ -564,7 +610,7 @@ do
         table.insert(db.fileList, key)
         self._activeKey = key
         db.lastKey = key
-        if hasFileIO then
+        if type(writefile) == "function" then
             local writeOK, writeErr = pcall(writefile, path, "[]")
             if not writeOK then
                 db.files[key] = nil
@@ -573,12 +619,46 @@ do
                 db.lastKey = nil
                 return false, "Không tạo được file Macro: " .. tostring(writeErr)
             end
-            local indexOK, indexErr = persistIndex()
-            if not indexOK then
-                warn("[DUY MacroStore] File Macro đã tạo nhưng Index chưa lưu:", indexErr)
+            if hasFileIO then
+                local indexOK, indexErr = persistIndex()
+                if not indexOK then
+                    warn("[DUY MacroStore] File Macro đã tạo nhưng Index chưa lưu:", indexErr)
+                end
             end
         end
         return true, key
+    end
+
+    function MacroStore:ValidateJSON(raw)
+        return validActionArray(raw)
+    end
+
+    function MacroStore:ImportJSONAsNew(name, raw)
+        local valid, decodedOrError = validActionArray(raw)
+        if not valid then return false, decodedOrError end
+
+        name = cleanName(name)
+        if name == "" then
+            local suffix = 1
+            repeat
+                name = "Macro Import " .. tostring(suffix)
+                suffix += 1
+                local exists = false
+                for _, item in pairs(db.files) do
+                    if string.lower(item.Name) == string.lower(name) then exists = true break end
+                end
+                if not exists then break end
+            until suffix > 10000
+        end
+
+        local created, keyOrError = self:CreateFile(name)
+        if not created then return false, keyOrError end
+        local imported, message = self:ImportJSON(keyOrError, raw)
+        if not imported then
+            self:DeleteFile(keyOrError)
+            return false, message
+        end
+        return true, keyOrError, message
     end
 
     function MacroStore:ImportJSON(key, raw)
@@ -588,15 +668,22 @@ do
         if not valid then return false, decodedOrError end
         local previousContent = item.Content
         item.Content = raw
-        if hasFileIO then
+        if type(writefile) == "function" then
             local ok, err = pcall(writefile, item.Path, raw)
             if not ok then
                 item.Content = previousContent
                 return false, "Không ghi được file JSON: " .. tostring(err)
             end
-            local indexOK, indexErr = persistIndex()
-            if not indexOK then
-                warn("[DUY MacroStore] Không cập nhật được Index:", indexErr)
+            if hasFileIO then
+                local indexOK, indexErr = persistIndex()
+                if not indexOK then
+                    warn("[DUY MacroStore] Không cập nhật được Index:", indexErr)
+                    return true, "Đã ghi JSON nhưng Index chưa lưu được: " .. tostring(indexErr)
+                        .. " · " .. tostring(#decodedOrError) .. " Action."
+                end
+            else
+                return true, "Đã ghi JSON ra file; executor thiếu readfile nên không thể tự nạp lại Index ở lần chạy sau. "
+                    .. tostring(#decodedOrError) .. " Action."
             end
             return true, "Đã lưu file: " .. tostring(#decodedOrError) .. " Action."
         end
@@ -605,16 +692,23 @@ do
 
     function MacroStore:ExportJSON(key)
         local item = db.files[key]
-        if not item then return false, "Hay chon Macro file can Export." end
+        if not item then return false, "Select a Macro file before exporting." end
         local valid, decodedOrError = validActionArray(item.Content or "[]")
         if not valid then return false, decodedOrError end
-        if hasFileIO then
+        if type(writefile) == "function" then
             local ok, err = pcall(writefile, item.Path, item.Content or "[]")
-            if not ok then return false, "Không ghi được file JSON: " .. tostring(err) end
-        else
-            return false, "Executor không hỗ trợ writefile; không thể Export ra file trên thiết bị này."
+            if not ok then
+                if type(setclipboard) == "function" then
+                    return true, item.Content or "[]", "Clipboard only (file write failed: " .. tostring(err) .. ")"
+                end
+                return false, "Could not write JSON file: " .. tostring(err)
+            end
+            return true, item.Content or "[]", item.Path
         end
-        return true, item.Content or "[]", item.Path
+        if type(setclipboard) == "function" then
+            return true, item.Content or "[]", "Clipboard only (writefile unavailable)"
+        end
+        return false, "This executor supports neither file export nor clipboard copy."
     end
 
     function MacroStore:DeleteFile(key)
@@ -1077,6 +1171,56 @@ do
 
     local worldScanToken = 0
     local lightingScanToken = 0
+    local enemyScanToken = 0
+
+    -- garden.zip / garden/tools/放置追蹤器.lua xác nhận GTD đặt cả Tower và Enemy
+    -- trong Context.Entities; entity quái dùng định danh enemy_*. Bảng dưới lấy từ
+    -- garden/page/塔效果翻譯表.lua, đồng thời cho phép enemy_ mới theo cùng schema.
+    local knownEnemyIds = {}
+    for _, enemyId in ipairs({
+        "enemy_armored_ant", "enemy_blood_eye_spider", "enemy_bomb_bug",
+        "enemy_boss_ancient_kraken", "enemy_boss_dragon_fly", "enemy_boss_fantasy_rhino_beetle",
+        "enemy_boss_fantasy_tarantula", "enemy_boss_gravewing", "enemy_boss_kraken",
+        "enemy_boss_magma_cube", "enemy_boss_magma_spider", "enemy_boss_mantis_shrimp",
+        "enemy_boss_skeleton_spider", "enemy_boss_space_4leg", "enemy_boss_space_spider",
+        "enemy_boss_zombie_fly", "enemy_chameleon", "enemy_fantasy_rhino_beetle",
+        "enemy_festive_worm", "enemy_frozen_fly", "enemy_goblin", "enemy_goblin_horn_fly",
+        "enemy_goblin_pincer_beetle", "enemy_gold_plated_snail", "enemy_ice_widow_boss",
+        "enemy_king_stag_beetle", "enemy_mole", "enemy_moon_moth", "enemy_phoenix_fly",
+        "enemy_pumpkin_bug", "enemy_rhino_beetle", "enemy_rollie_pollie", "enemy_sand_worm",
+        "enemy_scarecrow_grasshopper", "enemy_sea_snake", "enemy_space_drill",
+        "enemy_space_mecha_bug", "enemy_space_molten", "enemy_space_snail",
+        "enemy_stag_beetle", "enemy_stun_fly",
+    }) do
+        knownEnemyIds[enemyId] = true
+    end
+
+    local function isKnownEnemyIdentifier(value)
+        if type(value) ~= "string" then return false end
+        local normalized = string.lower(value)
+        return knownEnemyIds[normalized] == true or normalized:match("^enemy_[%w_]+$") ~= nil
+    end
+
+    local function getEnemyContainerRoots()
+        local roots, seen = {}, {}
+        local function add(root)
+            if root and not seen[root] then
+                seen[root] = true
+                table.insert(roots, root)
+            end
+        end
+        local contexts = workspace:FindFirstChild("Contexts")
+        if contexts then
+            for _, context in ipairs(contexts:GetChildren()) do
+                add(context:FindFirstChild("Entities"))
+                local map = context:FindFirstChild("Map")
+                add(map and map:FindFirstChild("Entities"))
+            end
+        end
+        local legacyMap = workspace:FindFirstChild("Map")
+        add(legacyMap and legacyMap:FindFirstChild("Entities"))
+        return roots
+    end
 
     -- Duyệt cây theo từng lô nhỏ, tránh tạo một mảng GetDescendants() rất lớn
     -- khiến khựng hình khi map có nhiều particle/model/hiệu ứng.
@@ -1123,8 +1267,18 @@ do
     end
 
     local function hideEnemyInstance(instance)
+        -- Giữ nguyên BillboardGui/SurfaceGui để thanh HP và UI của quái vẫn hiển thị.
+        if instance:IsA("BillboardGui") or instance:IsA("SurfaceGui") then return end
         if instance:IsA("BasePart") then
             saveAndSet(instance, "EnemyModel.LocalTransparencyModifier", "LocalTransparencyModifier", 1)
+        elseif instance:IsA("Decal") or instance:IsA("Texture") then
+            saveAndSet(instance, "EnemyModel.DecalTransparency", "Transparency", 1)
+        elseif instance:IsA("Highlight") then
+            saveAndSet(instance, "EnemyModel.HighlightEnabled", "Enabled", false)
+        elseif instance:IsA("ParticleEmitter") or instance:IsA("Trail") or instance:IsA("Beam")
+            or instance:IsA("Fire") or instance:IsA("Smoke") or instance:IsA("Sparkles")
+            or instance:IsA("PointLight") or instance:IsA("SpotLight") or instance:IsA("SurfaceLight") then
+            saveAndSet(instance, "EnemyModel.VisualEnabled", "Enabled", false)
         end
     end
 
@@ -1133,6 +1287,9 @@ do
             return
         end
         enemyModels[model] = true
+        -- The tracker source confirms that live enemies are direct children of Context.Entities
+        -- and their entity names use enemy_*. Hide the root itself when it is a BasePart too.
+        hideEnemyInstance(model)
         for _, descendant in ipairs(model:GetDescendants()) do
             hideEnemyInstance(descendant)
         end
@@ -1143,12 +1300,68 @@ do
         end)
     end
 
+    local function findEnemyEntityFrom(instance)
+        local node = instance
+        while node and node ~= workspace do
+            -- Entity root itself may be a Model, Folder, or another container type.
+            if isKnownEnemyIdentifier(node.Name) then return node end
+            if node:IsA("Model") or node:IsA("Folder") then
+                for _, attributeName in ipairs({ "EnemyId", "EnemyID", "UnitId", "UnitID", "EntityName", "UnitName" }) do
+                    local attributeValue = node:GetAttribute(attributeName)
+                    if isKnownEnemyIdentifier(attributeValue) then return node end
+                end
+                for _, child in ipairs(node:GetChildren()) do
+                    if child:IsA("StringValue") then
+                        local childName = string.lower(child.Name)
+                        if (childName == "enemyid" or childName == "enemyname" or childName == "unitid"
+                            or childName == "unitname" or childName == "entityname")
+                            and isKnownEnemyIdentifier(child.Value) then
+                            return node
+                        end
+                    end
+                end
+            end
+            node = node.Parent
+        end
+        return nil
+    end
+
+    local function scanEnemyEntityRoots()
+        enemyScanToken += 1
+        local token = enemyScanToken
+        task.spawn(function()
+            local roots = getEnemyContainerRoots()
+            for _, root in ipairs(roots) do
+                if token ~= enemyScanToken or destroyed then return end
+                -- Directly inspect the exact Context.Entities children first. This catches every
+                -- enemy_ entity even when its internal visual hierarchy is not a Model/Folder.
+                for _, entity in ipairs(root:GetChildren()) do
+                    if token ~= enemyScanToken or destroyed then return end
+                    if options.HideEnemyModels then
+                        local enemyEntity = findEnemyEntityFrom(entity)
+                        if enemyEntity then hideEnemyModel(enemyEntity) end
+                    end
+                end
+                scanTreeIncremental(root, function(instance)
+                    if options.HideEnemyModels then
+                        local enemyEntity = findEnemyEntityFrom(instance)
+                        if enemyEntity then hideEnemyModel(enemyEntity) end
+                    end
+                end, 60, function()
+                    return token == enemyScanToken and options.HideEnemyModels
+                end)
+            end
+        end)
+    end
+
     function PerformanceManager:RefreshEnemyModels(models)
         if not options.HideEnemyModels then return end
         models = models or EnemyDetector:GetTrackedModels()
         for _, model in ipairs(models) do
             hideEnemyModel(model)
         end
+        -- Enemy entity tree is scanned on enable; newly spawned descendants are handled
+        -- by workspace.DescendantAdded. Do not restart the full scan on every UI refresh.
     end
 
     function PerformanceManager:SetOption(name, enabled)
@@ -1160,6 +1373,7 @@ do
         if name == "HideEnemyModels" then
             if options[name] then
                 self:RefreshEnemyModels()
+                scanEnemyEntityRoots()
             else
                 for _, connection in pairs(enemyConnections) do
                     pcall(function() connection:Disconnect() end)
@@ -1167,6 +1381,9 @@ do
                 table.clear(enemyConnections)
                 table.clear(enemyModels)
                 restoreSlot("EnemyModel.LocalTransparencyModifier")
+                restoreSlot("EnemyModel.DecalTransparency")
+                restoreSlot("EnemyModel.VisualEnabled")
+                restoreSlot("EnemyModel.HighlightEnabled")
             end
         elseif name == "SimplifyMap" then
             if options[name] then
@@ -1229,8 +1446,12 @@ do
             table.clear(enemyConnections)
             table.clear(enemyModels)
             restoreSlot("EnemyModel.LocalTransparencyModifier")
+            restoreSlot("EnemyModel.DecalTransparency")
+            restoreSlot("EnemyModel.VisualEnabled")
+            restoreSlot("EnemyModel.HighlightEnabled")
         else
             self:RefreshEnemyModels()
+            scanEnemyEntityRoots()
         end
 
         if not options.SimplifyMap then
@@ -1286,6 +1507,10 @@ do
 
     worldAddedConnection = workspace.DescendantAdded:Connect(function(instance)
         applyWorldInstance(instance)
+        if options.HideEnemyModels then
+            local enemyModel = findEnemyEntityFrom(instance)
+            if enemyModel then hideEnemyModel(enemyModel) end
+        end
     end)
     lightingAddedConnection = Lighting.DescendantAdded:Connect(function(instance)
         applyLightingInstance(instance)
@@ -1302,7 +1527,8 @@ do
         table.clear(enemyConnections)
         table.clear(enemyModels)
         local slots = {
-            "EnemyModel.LocalTransparencyModifier",
+            "EnemyModel.LocalTransparencyModifier", "EnemyModel.DecalTransparency",
+            "EnemyModel.VisualEnabled", "EnemyModel.HighlightEnabled",
             "SmoothMap.Material", "SmoothMap.MaterialVariant",
             "HideTextures.Transparency", "HideTextures.ColorMap", "HideTextures.NormalMap",
             "HideTextures.RoughnessMap", "HideTextures.MetalnessMap",
@@ -2079,17 +2305,203 @@ local GUI = {
 }
 
 do
+    local uiLanguage = "EN" -- default is full English
+    local notificationsEnabled = true
+    local localizationApplying = setmetatable({}, { __mode = "k" })
+    local languagePairs = {
+        {"ChenFuWei", "ChenFuWei"},
+        {"● He thong san sang", "● System ready"},
+        {"Các chức năng chung của trận đấu; phần Target Monster được tách riêng.", "General match controls. Target and route tools are in a separate tab."},
+        {"* Yêu cầu Gamepass để sử dụng X3", "* X3 requires a Gamepass."},
+        {"Auto Play Again gọi RestartGame khi trận kết thúc. Play Macro tự lặp Macro qua các trận; Auto Play Again chỉ cần bật nếu muốn tự yêu cầu trận mới.", "Auto Play Again calls RestartGame after a match. Play Macro repeats the macro across matches; enable Auto Play Again only when you also want the game to request the next match."},
+        {"TÊN FILE", "FILE NAME"},
+        {"CHỌN MACRO FILE", "SELECT MACRO FILE"},
+        {"JSON MACRO DATA", "MACRO JSON DATA"},
+        {"Macro file: chưa chọn | Actions: --", "Macro file: none selected | Actions: --"},
+        {"CHẠY SỚM HƠN", "RUN AHEAD BY"},
+        {"MAP & SAVE MANAGER", "MAP & SAVE MANAGER"},
+        {"Spawn: chua dat", "Spawn: not set"},
+        {"Destination: chua dat", "Destination: not set"},
+        {"Route: chua record", "Route: not recorded"},
+        {"SAVED MAP FILES", "SAVED MAP FILES"},
+        {"MAP FILE (vi du: duy_maps/Map_A.json)", "MAP FILE (auto-saved under duy_maps/)"},
+        {"Current Map: -- | Route Points: 0 | Status: NOT READY", "Current map: -- | Route points: 0 | Status: NOT READY"},
+        {"Target: --  |  HP: --
+Route progress: --", "Target: --  |  HP: --
+Route progress: --"},
+        {"Boss: chua cau hinh", "Boss: not configured"},
+        {"Boss monitor: chua cau hinh
+Theo doi theo Max HP", "Boss monitor: not configured
+Tracking by maximum HP"},
+        {"Nhap webhook cua ban. URL chi giu trong bo nho script hien tai; dong script se mat URL.", "Enter your Discord webhook. The URL stays in memory only and is cleared when the script closes."},
+        {"Webhook: chua cau hinh", "Webhook: not configured"},
+        {"Bao cao ket qua tran va Boss khi duoc xac nhan bi ha.", "Reports match results and confirmed boss defeats."},
+        {"TỐI ƯU HIỆU NĂNG", "PERFORMANCE"},
+        {"Tất cả thay đổi chỉ áp dụng hiển thị ở máy bạn; không Destroy quái hay vật thể.", "Visual changes are local to your client. Enemy models and world objects are never destroyed."},
+        {"CHỌN CHẾ ĐỘ THỦ CÔNG", "PERFORMANCE PRESETS"},
+        {"Tùy chỉnh riêng (bật/tắt từng mục sẽ chuyển sang CUSTOM):", "Custom options (changing any option switches the preset to CUSTOM):"},
+        {"CHỈ HIỆN THANH HP QUÁI", "SHOW ENEMY HP BARS ONLY"},
+        {"Ẩn mô hình 3D ở máy bạn; giữ HP, vị trí và va chạm.", "Hide enemy 3D models locally while keeping HP bars, positions, and collision."},
+        {"Đổi vật liệu Part sang SmoothPlastic; không xóa hình học.", "Change part materials to SmoothPlastic without removing geometry."},
+        {"Ẩn ảnh dán và bản đồ PBR; có thể mất một số chi tiết.", "Hide decals and PBR maps; some visual details may disappear."},
+        {"Tắt GlobalShadows và CastShadow.", "Disable GlobalShadows and CastShadow."},
+        {"Tắt Particle, Trail, Beam, đèn và hiệu ứng hậu kỳ.", "Disable particles, trails, beams, lights, and post-processing effects."},
+        {"Giảm Fog và Atmosphere để nhìn bản đồ rõ hơn.", "Reduce fog and atmosphere for clearer visibility."},
+        {"ANTI-AFK (CHỐNG TỰ NGẮT KHI IDLE)", "ANTI-AFK (PREVENT IDLE DISCONNECT)"},
+        {"Chỉ phản hồi sự kiện Idled; không tự di chuyển nhân vật.", "Only handles the Idled event; it does not move your character."},
+        {"SYSTEM INFORMATION", "SYSTEM INFORMATION"},
+        {"Đang đọc thông tin thiết bị...", "Reading device information..."},
+        {"Thông tin executor là lựa chọn của người dùng, không phải xác minh bảo mật.", "Executor information is user-selected and is not a security verification."},
+        {"DEVICE & EXECUTOR SETTING", "INFO & DEVICE SETTINGS"},
+        {"Chọn môi trường đang dùng. Hồ sơ được lưu cục bộ trên thiết bị/executor này.", "Choose your executor. This profile is saved locally on this device/executor."},
+        {"CHỌN MÔI TRƯỜNG", "SELECT EXECUTOR"},
+        {"Bạn đang sử dụng executor nào? Lựa chọn được lưu cục bộ trên thiết bị này.", "Which executor are you using? Your choice is saved locally on this device."},
+        {"Chưa có file                                      ▼", "No file selected                                      ▼"},
+        {"Chưa có file                         ▼", "No file selected                         ▼"},
+        {"Nhập tên Macro...", "Enter macro name..."},
+        {"Nhap ten file ban do...", "Enter map name..."},
+        {"Nhap ten moi de Rename...", "Enter the new name..."},
+        {"Nhap duong dan file JSON...", "JSON file path is generated automatically"},
+        {"chua co file                         ▼", "No file selected                         ▼"},
+        {"Chưa chọn", "Not selected"},
+        {"chua SAVE WEBHOOK", "Webhook not saved"},
+        {"Không", "No"},
+        {"Có", "Yes"},
+        {"NGÔN NGỮ", "LANGUAGE"},
+        {"NGÔN NGỮ: TIẾNG ANH", "LANGUAGE: ENGLISH"},
+        {"NGÔN NGỮ: TIẾNG VIỆT", "LANGUAGE: VIETNAMESE"},
+        {"THÔNG BÁO POP-UP", "TOAST NOTIFICATIONS"},
+        {"QUẢN LÝ MACRO", "MACRO FILE MANAGER"},
+        {"FILE MACRO: CHƯA CHỌN · SỐ ACTION: --", "MACRO FILE: NONE · ACTIONS: --"},
+        {"TRẠNG THÁI: SẴN SÀNG", "STATUS: READY"},
+        {"NHẬP JSON", "IMPORT JSON"},
+        {"XUẤT JSON", "EXPORT JSON"},
+        {"NHẬP MAP", "IMPORT MAP"},
+        {"XUẤT MAP", "EXPORT MAP"},
+        {"MAP JSON · DÁN ĐỂ NHẬP / XUẤT FILE", "MAP JSON · IMPORT PASTE / EXPORT FILE"},
+        {"CHỌN FILE MACRO", "SELECT MACRO FILE"},
+        {"GHI MACRO", "RECORD MACRO"},
+        {"CHẠY MACRO", "PLAY MACRO"},
+        {"XÓA FILE ĐÃ CHỌN", "DELETE SELECTED FILE"},
+        {"RUN AHEAD BY", "CHẠY SỚM HƠN"},
+        {"All changes affect local visuals only; enemies and world objects are not destroyed.", "Tất cả thay đổi chỉ áp dụng hiển thị ở máy bạn; không xóa quái hay vật thể."},
+        {"Custom options (changing any option switches the preset to CUSTOM):", "Tùy chỉnh riêng (bật/tắt từng mục sẽ chuyển sang CUSTOM):"},
+        {"ENGLISH", "TIẾNG ANH"},
+        {"SECONDS", "GIÂY"},
+        {"SECONDS", "GIÂY"},
+        {"WAITING FOR NEXT MATCH", "ĐANG CHỜ TRẬN TIẾP THEO"},
+        {"MACRO COMPLETED", "MACRO ĐÃ HOÀN THÀNH"},
+        {"IMPORT MACRO JSON", "NHẬP JSON MACRO"},
+        {"IMPORT TARGET MAP JSON", "NHẬP JSON MAP TARGET"},
+        {"Paste the complete JSON content below. The current file will not be overwritten.", "Dán toàn bộ JSON bên dưới. File hiện tại sẽ không bị ghi đè."},
+        {"Paste JSON here...", "Dán JSON tại đây..."},
+        {"JSON is valid. Enter a name for the imported item, or use Skip for an automatic name.", "JSON hợp lệ. Nhập tên hoặc chọn bỏ qua để đặt tên tự động."},
+        {"MACRO NAME", "TÊN MACRO"},
+        {"MAP NAME", "TÊN MAP"},
+        {"VALIDATE JSON", "KIỂM TRA JSON"},
+        {"SKIP NAME", "BỎ QUA TÊN"},
+        {"IMPORT", "NHẬP"},
+        {"CANCEL", "HỦY"},
+        {"EXPORT MACRO", "XUẤT MACRO"},
+        {"EXPORT MAP", "XUẤT MAP"},
+        {"RUN AHEAD BY", "CHẠY SỚM HƠN"},
+        {"Các chức năng chung của trận đấu; phần Target Monster được tách riêng.", "General match controls. Target and route tools are in a separate tab."},
+        {"* Yêu cầu Gamepass để sử dụng X3", "* X3 requires a Gamepass."},
+        {"TÊN FILE", "FILE NAME"},
+        {"TỐI ƯU HIỆU NĂNG", "PERFORMANCE"},
+        {"Tất cả thay đổi chỉ áp dụng hiển thị ở máy bạn; không Destroy quái hay vật thể.", "All changes are local visuals only. Enemies and world objects are never destroyed."},
+        {"CHỌN CHẾ ĐỘ THỦ CÔNG", "PERFORMANCE PRESETS"},
+        {"Khôi phục hình ảnh gốc.", "Restore original visuals."},
+        {"Tắt bóng đổ; giữ phần lớn chi tiết.", "Disable shadows while keeping most details."},
+        {"Giảm texture, vật liệu, bóng và hiệu ứng.", "Reduce textures, materials, shadows, and effects."},
+        {"Giảm tối đa; có thể ẩn cả mô hình quái.", "Maximum reduction; enemy models can also be hidden."},
+        {"Tùy chỉnh riêng (bật/tắt từng mục sẽ chuyển sang CUSTOM):", "Custom options (changing any option switches the preset to CUSTOM):"},
+        {"Ẩn mô hình 3D ở máy bạn; giữ HP, vị trí và va chạm.", "Hide enemy 3D models locally while keeping HP bars, positions, and collision."},
+        {"Đổi vật liệu Part sang SmoothPlastic; không xóa hình học.", "Change part materials to SmoothPlastic without removing geometry."},
+        {"Ẩn ảnh dán và bản đồ PBR; có thể mất một số chi tiết.", "Hide decals and PBR maps; some visual details may disappear."},
+        {"Tắt GlobalShadows và CastShadow.", "Disable GlobalShadows and CastShadow."},
+        {"Tắt Particle, Trail, Beam, đèn và hiệu ứng hậu kỳ.", "Disable particles, trails, beams, lights, and post-processing effects."},
+        {"Giảm Fog và Atmosphere để nhìn bản đồ rõ hơn.", "Reduce fog and atmosphere for clearer visibility."},
+        {"Chỉ phản hồi sự kiện Idled; không tự di chuyển nhân vật.", "Only handles the Idled event; it does not move your character."},
+        {"Thông tin executor là lựa chọn của người dùng, không phải xác minh bảo mật.", "Executor information is user-selected and is not a security verification."},
+        {"Chọn môi trường đang dùng. Hồ sơ được lưu cục bộ trên thiết bị/executor này.", "Choose your executor. This profile is saved locally on this device/executor."},
+        {"CHỌN MÔI TRƯỜNG", "SELECT EXECUTOR"},
+        {"Bạn đang sử dụng executor nào? Lựa chọn được lưu cục bộ trên thiết bị này.", "Which executor are you using? Your choice is saved locally on this device."},
+        {"Nhap ten file ban do...", "Enter map name..."},
+        {"Nhap ten moi de Rename...", "Enter a new name..."},
+        {"LANGUAGE: VIETNAMESE", "NGÔN NGỮ: TIẾNG VIỆT"},
+        {"SPEED MODE: THEO TỐC ĐỘ QUÁI", "SPEED MODE: MATCH ENEMY"},
+        {"SPEED MODE: BÌNH THƯỜNG", "SPEED MODE: NORMAL"},
+    }
+    local textMaps = { EN = {}, VI = {} }
+    for _, pair in ipairs(languagePairs) do
+        textMaps.EN[pair[1]] = pair[2]
+        textMaps.VI[pair[2]] = pair[1]
+    end
+    local function localizeText(value, language)
+        local text = tostring(value or "")
+        local map = textMaps[language or uiLanguage] or textMaps.EN
+        return map[text] or text
+    end
+    local function localizeTextObject(object)
+        if not object or not object.Parent then return end
+        if object:GetAttribute("ChenFuWeiNoLocalize") then return end
+        local isText = object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")
+        if not isText then return end
+        local base = object:GetAttribute("ChenFuWeiBaseText")
+        if base == nil then
+            base = object.Text
+            pcall(function() object:SetAttribute("ChenFuWeiBaseText", base) end)
+            object:GetPropertyChangedSignal("Text"):Connect(function()
+                if localizationApplying[object] or not object.Parent then return end
+                local current = object.Text
+                pcall(function() object:SetAttribute("ChenFuWeiBaseText", current) end)
+                localizationApplying[object] = true
+                object.Text = localizeText(current, uiLanguage)
+                localizationApplying[object] = nil
+            end)
+        end
+        localizationApplying[object] = true
+        object.Text = localizeText(base, uiLanguage)
+        localizationApplying[object] = nil
+        if object:IsA("TextBox") then
+            local placeholderBase = object:GetAttribute("ChenFuWeiBasePlaceholder")
+            if placeholderBase == nil then
+                placeholderBase = object.PlaceholderText
+                pcall(function() object:SetAttribute("ChenFuWeiBasePlaceholder", placeholderBase) end)
+                object:GetPropertyChangedSignal("PlaceholderText"):Connect(function()
+                    if localizationApplying[object] or not object.Parent then return end
+                    local current = object.PlaceholderText
+                    pcall(function() object:SetAttribute("ChenFuWeiBasePlaceholder", current) end)
+                    localizationApplying[object] = true
+                    object.PlaceholderText = localizeText(current, uiLanguage)
+                    localizationApplying[object] = nil
+                end)
+            end
+            localizationApplying[object] = true
+            object.PlaceholderText = localizeText(placeholderBase, uiLanguage)
+            localizationApplying[object] = nil
+        end
+    end
+    local function applyUILanguage(language, root)
+        uiLanguage = language == "VI" and "VI" or "EN"
+        if root then
+            localizeTextObject(root)
+            for _, descendant in ipairs(root:GetDescendants()) do localizeTextObject(descendant) end
+        end
+    end
+
     local C = {
         BG = Color3.fromRGB(26, 28, 34),
-        PANEL = Color3.fromRGB(32, 34, 41),
+        PANEL = Color3.fromRGB(24, 29, 39),
         SIDEBAR = Color3.fromRGB(29, 31, 37),
         HEADER = Color3.fromRGB(26, 28, 34),
-        INPUT = Color3.fromRGB(39, 42, 49),
+        INPUT = Color3.fromRGB(31, 36, 46),
         BUTTON = Color3.fromRGB(45, 48, 56),
         BUTTON_HOVER = Color3.fromRGB(57, 61, 70),
         ACCENT = Color3.fromRGB(85, 175, 255),
         TEXT = Color3.fromRGB(240, 240, 245),
-        DIM = Color3.fromRGB(200, 200, 205),
+        DIM = Color3.fromRGB(218, 222, 230),
         GREEN = Color3.fromRGB(50, 200, 110),
         GREEN_DARK = Color3.fromRGB(39, 76, 59),
         RED = Color3.fromRGB(235, 65, 65),
@@ -2105,6 +2517,9 @@ do
             object[key] = value
         end
         if parent then object.Parent = parent end
+        if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+            localizeTextObject(object)
+        end
         return object
     end
 
@@ -2147,7 +2562,7 @@ do
             BorderSizePixel = 0,
             Text = text,
             Font = options.Font or Enum.Font.GothamSemibold,
-            TextSize = options.TextSize or 11,
+            TextSize = options.TextSize or 12,
             TextColor3 = options.TextColor or C.TEXT,
             AutoButtonColor = false,
             Active = options.Active ~= false,
@@ -2168,12 +2583,12 @@ do
             PlaceholderColor3 = C.DIM,
             Text = "",
             TextColor3 = C.TEXT,
-            TextSize = 11,
+            TextSize = 12,
             Font = Enum.Font.GothamMedium,
             ClearTextOnFocus = false,
             TextXAlignment = Enum.TextXAlignment.Left,
         }, parent)
-        addCorner(box, 6)
+        addCorner(box, 8)
         newInstance("UIPadding", {
             PaddingLeft = UDim.new(0, 9),
             PaddingRight = UDim.new(0, 7),
@@ -2239,13 +2654,13 @@ do
                     end
                     state = not state
                     renderState()
-                    if GUI._notify then
-                        GUI._notify(tostring(resultMessage or (callOK and "Không thể thay đổi trạng thái." or resultOK)), Color3.fromRGB(235, 65, 65), "KHÔNG THÀNH CÔNG")
+                    if GUI._notify and notificationsEnabled then
+                        GUI._notify(tostring(resultMessage or (callOK and "State change failed." or resultOK)), Color3.fromRGB(235, 65, 65), "ACTION FAILED")
                     end
                     return
                 end
-                if GUI._notify then
-                    GUI._notify(tostring(title) .. (state and " đã bật." or " đã tắt."), state and Color3.fromRGB(50, 200, 110) or Color3.fromRGB(200, 200, 205), "DUY SYSTEM")
+                if GUI._notify and notificationsEnabled then
+                    GUI._notify(tostring(title) .. (state and " ENABLED" or " DISABLED"), state and Color3.fromRGB(50, 200, 110) or Color3.fromRGB(200, 200, 205), "ChenFuWei")
                 end
             end
         end
@@ -2398,11 +2813,11 @@ do
     end
 
     function GUI:Build(callbacks)
-        local old = PlayerGui:FindFirstChild("DuySystem")
+        local old = PlayerGui:FindFirstChild("ChenFuWei") or PlayerGui:FindFirstChild("DuySystem")
         if old then old:Destroy() end
 
         local screen = newInstance("ScreenGui", {
-            Name = "DuySystem",
+            Name = "ChenFuWei",
             ResetOnSpawn = false,
             ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
             IgnoreGuiInset = true,
@@ -2411,41 +2826,48 @@ do
 
         local window = newInstance("Frame", {
             Name = "MainWindow",
-            Size = UDim2.new(0, 690, 0, 600),
+            Size = UDim2.new(0, 600, 0, 545),
             AnchorPoint = Vector2.new(0.5, 0.5),
             Position = UDim2.fromScale(0.5, 0.5),
             BackgroundColor3 = C.BG,
             BorderSizePixel = 0,
         }, screen)
         addCorner(window, 11)
+        addStroke(window, Color3.fromRGB(55, 82, 122), 1)
 
-        -- Responsive scale: giu nguyen layout 690x600, tu dong thu nho tren man hinh Delta/mobile.
+        -- Native pixel sizing: avoid fractional UIScale blur. Start compact; all four corners resize the window.
         local responsiveScale = newInstance("UIScale", { Scale = 1 }, window)
         local cameraViewportConnection
         local sidebar, content
         local isMobileLayout = false
+        local currentSidebarWidth = 98
+        local userResizedWindow = false
         local function updateResponsiveScale()
             local camera = workspace.CurrentCamera
-            local viewport = camera and camera.ViewportSize or Vector2.new(690, 600)
-            isMobileLayout = UserInputService.TouchEnabled and viewport.X < 700
-            if isMobileLayout then
-                window.Size = UDim2.fromOffset(math.max(320, viewport.X - 16), math.max(420, math.min(720, viewport.Y - 70)))
-                responsiveScale.Scale = 1
-                if sidebar then
-                    sidebar.Size = UDim2.new(0, 94, 1, -66)
-                    content.Position = UDim2.new(0, 94, 0, 42)
-                    content.Size = UDim2.new(1, -94, 1, -66)
-                end
+            local viewport = camera and camera.ViewportSize or Vector2.new(900, 700)
+            isMobileLayout = viewport.X < 700
+            currentSidebarWidth = isMobileLayout and 78 or 98
+            responsiveScale.Scale = 1 -- no fractional UIScale: keep text and strokes crisp in Delta
+            if not userResizedWindow then
+                local minWidth = isMobileLayout and 286 or 360
+                local minHeight = isMobileLayout and 340 or 360
+                local width = isMobileLayout and math.min(350, viewport.X - 18) or math.min(450, viewport.X - 24)
+                local height = isMobileLayout and math.min(440, viewport.Y - 28) or math.min(460, viewport.Y - 24)
+                window.Size = UDim2.fromOffset(math.max(minWidth, width), math.max(minHeight, height))
+                window.Position = UDim2.fromScale(0.5, 0.5)
             else
-                window.Size = UDim2.fromOffset(690, 600)
-                local widthScale = math.max(0.45, (viewport.X - 20) / 690)
-                local heightScale = math.max(0.45, (viewport.Y - 20) / 600)
-                responsiveScale.Scale = math.min(1, widthScale, heightScale)
-                if sidebar then
-                    sidebar.Size = UDim2.new(0, 126, 1, -66)
-                    content.Position = UDim2.new(0, 126, 0, 42)
-                    content.Size = UDim2.new(1, -126, 1, -66)
-                end
+                local minWidth = isMobileLayout and 286 or 360
+                local minHeight = isMobileLayout and 340 or 360
+                local maxWidth = math.max(minWidth, viewport.X - 24)
+                local maxHeight = math.max(minHeight, viewport.Y - 24)
+                local currentWidth = math.clamp(window.Size.X.Offset, minWidth, maxWidth)
+                local currentHeight = math.clamp(window.Size.Y.Offset, minHeight, maxHeight)
+                window.Size = UDim2.fromOffset(currentWidth, currentHeight)
+            end
+            if sidebar then
+                sidebar.Size = UDim2.new(0, currentSidebarWidth, 1, -66)
+                content.Position = UDim2.new(0, currentSidebarWidth, 0, 42)
+                content.Size = UDim2.new(1, -currentSidebarWidth, 1, -66)
             end
         end
         local function bindViewportCamera()
@@ -2477,24 +2899,24 @@ do
             BorderSizePixel = 0,
         }, header)
 
-        makeLabel(header, "DUY TARGET FIRST  |  V2.19", UDim2.new(0, 15, 0, 0), UDim2.new(1, -120, 1, 0), {
+        makeLabel(header, "ChenFuWei", UDim2.new(0, 32, 0, 0), UDim2.new(1, -173, 1, 0), {
             Font = Enum.Font.GothamBold,
             TextSize = 14,
             Color = C.ACCENT,
         })
 
-        local minimizeButton = makeButton(header, "−", UDim2.new(1, -75, 0.5, -15), UDim2.new(0, 30, 0, 30), {
+        local minimizeButton = makeButton(header, "−", UDim2.new(1, -105, 0.5, -15), UDim2.new(0, 30, 0, 30), {
             TextSize = 20,
             Background = C.HEADER,
         })
-        local closeButton = makeButton(header, "×", UDim2.new(1, -39, 0.5, -15), UDim2.new(0, 30, 0, 30), {
+        local closeButton = makeButton(header, "×", UDim2.new(1, -69, 0.5, -15), UDim2.new(0, 30, 0, 30), {
             TextSize = 17,
             Background = C.HEADER,
             TextColor = C.RED,
         })
 
-        local logo = makeButton(screen, "D", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
-            TextSize = 23,
+        local logo = makeButton(screen, "CFW", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
+            TextSize = 14,
             Background = Color3.fromRGB(18, 39, 70),
             TextColor = C.ACCENT,
             Radius = 27,
@@ -2503,6 +2925,67 @@ do
 
         makeDraggable(header, window)
         makeDraggable(logo, logo)
+
+        local resizeCorners = {
+            { name = "TopLeft", sx = -1, sy = -1, anchor = Vector2.new(0, 0), position = UDim2.new(0, 3, 0, 3), glyph = "◤" },
+            { name = "TopRight", sx = 1, sy = -1, anchor = Vector2.new(1, 0), position = UDim2.new(1, -3, 0, 3), glyph = "◥" },
+            { name = "BottomLeft", sx = -1, sy = 1, anchor = Vector2.new(0, 1), position = UDim2.new(0, 3, 1, -3), glyph = "◣" },
+            { name = "BottomRight", sx = 1, sy = 1, anchor = Vector2.new(1, 1), position = UDim2.new(1, -3, 1, -3), glyph = "◢" },
+        }
+        local resizeActive, resizeInput, resizeStart, resizeStartSize, resizeStartPosition, resizeStartAbs, resizeCorner
+        for _, corner in ipairs(resizeCorners) do
+            local handle = newInstance("TextButton", {
+                Name = "Resize" .. corner.name, AnchorPoint = corner.anchor,
+                Position = corner.position, Size = UDim2.fromOffset(20, 20),
+                BackgroundColor3 = Color3.fromRGB(39, 54, 74), BorderSizePixel = 0,
+                Text = corner.glyph, Font = Enum.Font.GothamBold, TextSize = 13,
+                TextColor3 = C.ACCENT, AutoButtonColor = false, Active = true,
+                ZIndex = 80,
+            }, window)
+            addCorner(handle, 5)
+            addStroke(handle, Color3.fromRGB(77, 110, 151), 1)
+            handle.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                    resizeActive = true
+                    resizeInput = input
+                    resizeCorner = corner
+                    resizeStart = input.Position
+                    resizeStartSize = window.AbsoluteSize
+                    resizeStartPosition = window.Position
+                    resizeStartAbs = window.AbsolutePosition
+                end
+            end)
+        end
+        local resizeMoveConnection = UserInputService.InputChanged:Connect(function(input)
+            if not resizeActive or not resizeCorner then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            local delta = input.Position - resizeStart
+            local camera = workspace.CurrentCamera
+            local viewport = camera and camera.ViewportSize or Vector2.new(900, 700)
+            local minWidth = isMobileLayout and 286 or 360
+            local minHeight = isMobileLayout and 340 or 360
+            local fixedX = resizeCorner.sx > 0 and resizeStartAbs.X or (resizeStartAbs.X + resizeStartSize.X)
+            local fixedY = resizeCorner.sy > 0 and resizeStartAbs.Y or (resizeStartAbs.Y + resizeStartSize.Y)
+            local maxWidth = math.max(minWidth, resizeCorner.sx > 0 and (viewport.X - fixedX - 8) or (fixedX - 8))
+            local maxHeight = math.max(minHeight, resizeCorner.sy > 0 and (viewport.Y - fixedY - 8) or (fixedY - 8))
+            local newWidth = math.clamp(resizeStartSize.X + resizeCorner.sx * delta.X, minWidth, maxWidth)
+            local newHeight = math.clamp(resizeStartSize.Y + resizeCorner.sy * delta.Y, minHeight, maxHeight)
+            local appliedX, appliedY = newWidth - resizeStartSize.X, newHeight - resizeStartSize.Y
+            window.Size = UDim2.fromOffset(newWidth, newHeight)
+            window.Position = UDim2.new(resizeStartPosition.X.Scale,
+                resizeStartPosition.X.Offset + resizeCorner.sx * appliedX / 2,
+                resizeStartPosition.Y.Scale,
+                resizeStartPosition.Y.Offset + resizeCorner.sy * appliedY / 2)
+            userResizedWindow = true
+        end)
+        table.insert(self._connections, resizeMoveConnection)
+        local resizeEndConnection = UserInputService.InputEnded:Connect(function(input)
+            if resizeActive and (input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch) then
+                resizeActive, resizeInput, resizeCorner = false, nil, nil
+            end
+        end)
+        table.insert(self._connections, resizeEndConnection)
 
         local function collapseMenu()
             window.Visible = false
@@ -2527,14 +3010,14 @@ do
 
         sidebar = newInstance("Frame", {
             Position = UDim2.new(0, 0, 0, 42),
-            Size = UDim2.new(0, 126, 1, -66),
+            Size = UDim2.new(0, currentSidebarWidth, 1, -66),
             BackgroundColor3 = C.SIDEBAR,
             BorderSizePixel = 0,
         }, window)
 
         content = newInstance("Frame", {
-            Position = UDim2.new(0, 126, 0, 42),
-            Size = UDim2.new(1, -126, 1, -66),
+            Position = UDim2.new(0, currentSidebarWidth, 0, 42),
+            Size = UDim2.new(1, -currentSidebarWidth, 1, -66),
             BackgroundTransparency = 1,
         }, window)
 
@@ -2550,7 +3033,7 @@ do
         })
 
         local function setStatus(message, color)
-            statusLabel.Text = "● " .. tostring(message)
+            statusLabel.Text = "● " .. localizeText(tostring(message), uiLanguage)
             statusLabel.TextColor3 = color or C.DIM
         end
 
@@ -2571,6 +3054,9 @@ do
         }, toastContainer)
         local toastSequence = 0
         local function notify(message, accentColor, title)
+            if not notificationsEnabled then return false end
+            message = localizeText(tostring(message or ""), uiLanguage)
+            title = localizeText(tostring(title or "ChenFuWei"), uiLanguage)
             toastSequence += 1
             local toast = newInstance("Frame", {
                 Name = "Toast_" .. tostring(toastSequence),
@@ -2599,7 +3085,7 @@ do
                 Position = UDim2.new(0, 13, 0, 6),
                 Size = UDim2.new(1, -22, 0, 19),
                 BackgroundTransparency = 1,
-                Text = tostring(title or "DUY SYSTEM"),
+                Text = tostring(title or "ChenFuWei"),
                 TextColor3 = Color3.fromRGB(240, 240, 245),
                 TextTransparency = 1,
                 Font = Enum.Font.GothamBold,
@@ -2642,29 +3128,199 @@ do
                 if toast.Parent then toast:Destroy() end
             end)
         end
+        local function clearToasts()
+            for _, child in ipairs(toastContainer:GetChildren()) do
+                if child:IsA("Frame") and child.Name:match("^Toast_") then
+                    child:Destroy()
+                end
+            end
+        end
         self._notify = notify
+        self._clearToasts = clearToasts
+
+        local activeImportDialog
+        local function showPasteImportDialog(kind)
+            if activeImportDialog and activeImportDialog.Parent then activeImportDialog:Destroy() end
+            local isMacro = kind == "MACRO"
+            local titleText = isMacro and "IMPORT MACRO JSON" or "IMPORT TARGET MAP JSON"
+            local overlay = newInstance("Frame", {
+                Name = "ChenFuWeiImportDialog",
+                Size = UDim2.fromScale(1, 1),
+                BackgroundColor3 = Color3.fromRGB(3, 5, 10),
+                BackgroundTransparency = 0.20,
+                BorderSizePixel = 0,
+                ZIndex = 220,
+            }, screen)
+            activeImportDialog = overlay
+            local dialogWidth = isMobileLayout and 0.92 or 0.72
+            local card = newInstance("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.new(dialogWidth, 0, 0, 330),
+                BackgroundColor3 = C.PANEL,
+                BorderSizePixel = 0,
+                ZIndex = 221,
+            }, overlay)
+            addCorner(card, 12)
+            addStroke(card, C.ACCENT, 1)
+            local title = makeLabel(card, titleText, UDim2.new(0, 16, 0, 12), UDim2.new(1, -52, 0, 25), {
+                Font = Enum.Font.GothamBold, TextSize = 14, Color = C.ACCENT,
+            })
+            title.ZIndex = 222
+            local closeButton = makeButton(card, "X", UDim2.new(1, -40, 0, 10), UDim2.new(0, 28, 0, 27), {
+                Background = C.RED_DARK, TextSize = 12, ZIndex = 223,
+            })
+            closeButton.Activated:Connect(function() overlay:Destroy() end)
+            local instructions = makeLabel(card, "Paste the complete JSON content below. The current file will not be overwritten.",
+                UDim2.new(0, 16, 0, 43), UDim2.new(1, -32, 0, 32), {
+                    TextSize = 10, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
+                })
+            instructions.ZIndex = 222
+            local jsonBox = makeTextBox(card, "Paste JSON here...", UDim2.new(0, 16, 0, 80), UDim2.new(1, -32, 0, 170))
+            jsonBox:SetAttribute("ChenFuWeiNoLocalize", true)
+            jsonBox.ZIndex = 222
+            jsonBox.MultiLine = true
+            jsonBox.ClearTextOnFocus = false
+            jsonBox.TextXAlignment = Enum.TextXAlignment.Left
+            jsonBox.TextYAlignment = Enum.TextYAlignment.Top
+            jsonBox.TextWrapped = false
+            jsonBox.Font = Enum.Font.Code
+            jsonBox.TextSize = 12
+            newInstance("UIPadding", {
+                PaddingTop = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8),
+                PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+            }, jsonBox)
+            local status = makeLabel(card, "", UDim2.new(0, 16, 0, 254), UDim2.new(1, -32, 0, 22), {
+                TextSize = 10, Color = C.YELLOW, Wrapped = true,
+            })
+            status.ZIndex = 222
+            local cancelButton = makeButton(card, "CANCEL", UDim2.new(0, 16, 0, 282), UDim2.new(0.30, -5, 0, 30), {
+                Background = C.BUTTON, TextSize = 10, ZIndex = 223,
+            })
+            local continueButton = makeButton(card, "VALIDATE JSON", UDim2.new(0.32, 0, 0, 282), UDim2.new(0.68, -16, 0, 30), {
+                Background = C.GREEN_DARK, TextSize = 10, ZIndex = 223,
+            })
+            cancelButton.Activated:Connect(function() overlay:Destroy() end)
+
+            local importStep = "JSON"
+            local function showNameStep(raw)
+                importStep = "NAME"
+                instructions.Text = "JSON is valid. Enter a name for the imported item, or use Skip for an automatic name."
+                jsonBox.Visible = false
+                status.Position = UDim2.new(0, 16, 0, 151)
+                status.Size = UDim2.new(1, -32, 0, 36)
+                local nameLabel = makeLabel(card, isMacro and "MACRO NAME" or "MAP NAME",
+                    UDim2.new(0, 16, 0, 91), UDim2.new(1, -32, 0, 18), {
+                        TextSize = 10, Color = C.DIM,
+                    })
+                nameLabel.ZIndex = 222
+                local nameBox = makeTextBox(card, isMacro and "Macro Import 1" or "Map1",
+                    UDim2.new(0, 16, 0, 114), UDim2.new(1, -32, 0, 32))
+                nameBox:SetAttribute("ChenFuWeiNoLocalize", true)
+                nameBox.ZIndex = 222
+                continueButton.Text = "IMPORT"
+                continueButton.Position = UDim2.new(0.52, 0, 0, 282)
+                continueButton.Size = UDim2.new(0.48, -16, 0, 30)
+                cancelButton.Position = UDim2.new(0, 16, 0, 282)
+                cancelButton.Size = UDim2.new(0.30, -5, 0, 30)
+                cancelButton.Text = "CANCEL"
+                local skipButton = makeButton(card, "SKIP NAME", UDim2.new(0.32, 0, 0, 282), UDim2.new(0.18, -3, 0, 30), {
+                    Background = C.BUTTON, TextSize = 9, ZIndex = 223,
+                })
+                local committing = false
+                local function commit(skipName)
+                    if committing then return end
+                    committing = true
+                    local requestedName = skipName and "" or trim(nameBox.Text)
+                    local ok, result, message
+                    if isMacro then
+                        if callbacks.onImportMacroData then
+                            ok, result, message = callbacks.onImportMacroData(raw, requestedName)
+                        else
+                            ok, result = false, "Macro import callback is unavailable."
+                        end
+                    else
+                        if callbacks.onImportMapData then
+                            ok, result, message = callbacks.onImportMapData(raw, requestedName)
+                        else
+                            ok, result = false, "Map import callback is unavailable."
+                        end
+                    end
+                    if ok then
+                        status.TextColor3 = C.GREEN
+                        status.Text = tostring(message or result or "Import completed.")
+                        if callbacks.onImportFinished then callbacks.onImportFinished(kind, result) end
+                        task.delay(0.75, function() if overlay.Parent then overlay:Destroy() end end)
+                    else
+                        committing = false
+                        status.TextColor3 = C.RED
+                        status.Text = tostring(result or message or "Import failed.")
+                    end
+                end
+                continueButton.Activated:Connect(function() commit(false) end)
+                skipButton.Activated:Connect(function() commit(true) end)
+                nameBox:CaptureFocus()
+            end
+
+            continueButton.Activated:Connect(function()
+                if importStep ~= "JSON" then return end
+                local raw = jsonBox.Text
+                local valid, message
+                if isMacro then
+                    if callbacks.onValidateMacroImport then
+                        valid, message = callbacks.onValidateMacroImport(raw)
+                    else
+                        valid, message = false, "Macro validation is unavailable."
+                    end
+                else
+                    if callbacks.onValidateMapImport then
+                        valid, message = callbacks.onValidateMapImport(raw)
+                    else
+                        valid, message = false, "Map validation is unavailable."
+                    end
+                end
+                if not valid then
+                    status.TextColor3 = C.RED
+                    status.Text = tostring(message or "Invalid JSON.")
+                    return
+                end
+                status.TextColor3 = C.GREEN
+                status.Text = "JSON validated successfully."
+                showNameStep(raw)
+            end)
+        end
 
         local tabNames = isMobileLayout
-            and { "MAIN", "TARGET", "MACRO", "WEBHOOK", "PERF", "INFO", "SETTING" }
-            or { "MAIN", "TARGET MONSTER", "MACRO", "WEBHOOK", "HIỆU NĂNG", "INFORMATION", "SETTING" }
+            and { "MAIN", "TARGET", "MACRO", "WEBHOOK", "PERF", "INFO" }
+            or { "MAIN", "TARGET", "MACRO", "WEBHOOK", "PERF", "INFO" }
         local tabButtons = {}
         local tabFrames = {}
 
         for index, tabName in ipairs(tabNames) do
             local tabButton = makeButton(sidebar, tabName,
-                UDim2.new(0, 8, 0, 13 + (index - 1) * 42),
-                UDim2.new(1, -16, 0, 34), {
+                UDim2.new(0, 6, 0, 12 + (index - 1) * 39),
+                UDim2.new(1, -12, 0, 33), {
                     Background = C.SIDEBAR,
                     TextColor = C.DIM,
-                    TextSize = isMobileLayout and 8 or 10,
+                    TextSize = isMobileLayout and 10 or 11,
                 })
             tabButtons[index] = tabButton
 
-            local frame = newInstance("Frame", {
+            local frameClass = index == 2 and "ScrollingFrame" or "Frame"
+            local frameProperties = {
                 Size = UDim2.new(1, 0, 1, 0),
                 BackgroundTransparency = 1,
                 Visible = index == 1,
-            }, content)
+            }
+            if index == 2 then
+                frameProperties.CanvasSize = UDim2.new(0, 0, 0, 540)
+                frameProperties.ScrollBarThickness = 4
+                frameProperties.ScrollBarImageColor3 = C.ACCENT
+                frameProperties.ScrollingDirection = Enum.ScrollingDirection.Y
+                frameProperties.Active = true
+                frameProperties.ClipsDescendants = true
+            end
+            local frame = newInstance(frameClass, frameProperties, content)
             tabFrames[index] = frame
         end
 
@@ -2693,7 +3349,8 @@ do
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, globalMain)
-        addCorner(globalPanel, 9)
+        addCorner(globalPanel, 11)
+        addStroke(globalPanel, Color3.fromRGB(57, 78, 110), 1)
         makeLabel(globalPanel, "MAIN CONTROL", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
@@ -2708,7 +3365,8 @@ do
             BackgroundColor3 = C.INPUT,
             BorderSizePixel = 0,
         }, globalPanel)
-        addCorner(speedPanel, 7)
+        addCorner(speedPanel, 9)
+        addStroke(speedPanel, Color3.fromRGB(52, 70, 98), 1)
         makeLabel(speedPanel, "GAME SPEED", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 10, Color = C.ACCENT,
         })
@@ -2729,7 +3387,8 @@ do
             BackgroundColor3 = C.INPUT,
             BorderSizePixel = 0,
         }, globalPanel)
-        addCorner(automationPanel, 7)
+        addCorner(automationPanel, 9)
+        addStroke(automationPanel, Color3.fromRGB(52, 70, 98), 1)
         makeLabel(automationPanel, "AUTOMATION", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 10, Color = C.ACCENT,
         })
@@ -2782,7 +3441,9 @@ do
                 selectedDifficultyLevel = level
                 difficultyButton.Text = difficultyNames[level] .. "   ▼"
                 difficultyList.Visible = false
-                setStatus("Đã chọn cấu hình Difficulty Level " .. tostring(level) .. ". Chưa gửi lệnh chọn độ khó.", C.YELLOW)
+                setStatus(uiLanguage == "VI"
+            and ("Đã chọn cấu hình Difficulty Level " .. tostring(level) .. ". Chưa gửi lệnh chọn độ khó.")
+            or ("Selected Difficulty Level " .. tostring(level) .. ". The vote has not been sent."), C.YELLOW)
             end)
         end
         difficultyButton.Activated:Connect(function()
@@ -2792,8 +3453,10 @@ do
         local autoDifficultySetter, getAutoDifficulty
         autoDifficultySetter, getAutoDifficulty = makeToggle(automationPanel, "AUTO DIFFICULTY", UDim2.new(0, 10, 0, 205), function(enabled)
             local ok, message = true, enabled
-                and ("Auto Difficulty đã bật: sẽ chọn Level " .. tostring(selectedDifficultyLevel) .. " khi màn Choose level xuất hiện.")
-                or "Đã tắt Auto Difficulty."
+                and (uiLanguage == "VI"
+                    and ("Auto Difficulty đã bật: sẽ chọn Level " .. tostring(selectedDifficultyLevel) .. " khi màn Choose level xuất hiện.")
+                    or ("Auto Difficulty enabled: Level " .. tostring(selectedDifficultyLevel) .. " will be selected when the level screen appears."))
+                or (uiLanguage == "VI" and "Đã tắt Auto Difficulty." or "Auto Difficulty disabled.")
             if callbacks.onAutoDifficultyChanged then
                 ok, message = callbacks.onAutoDifficultyChanged(enabled)
             end
@@ -2802,7 +3465,7 @@ do
         end)
         local autoPlayAgainSetter, getAutoPlayAgain
         autoPlayAgainSetter, getAutoPlayAgain = makeToggle(automationPanel, "AUTO PLAY AGAIN", UDim2.new(0, 10, 0, 239), function(enabled)
-            local ok, message = false, "Auto Play Again chưa sẵn sàng."
+            local ok, message = false, uiLanguage == "VI" and "Auto Play Again chưa sẵn sàng." or "Auto Play Again is not ready."
             if callbacks.onAutoPlayAgainChanged then
                 ok, message = callbacks.onAutoPlayAgainChanged(enabled)
             end
@@ -2815,7 +3478,7 @@ do
             if callbacks.onAutoSkipChanged then
                 ok, message = callbacks.onAutoSkipChanged(enabled)
             else
-                ok, message = false, "Auto Skip Remote chưa được nối."
+                ok, message = false, uiLanguage == "VI" and "Auto Skip Remote chưa được nối." or "Auto Skip Remote is not connected."
             end
             setStatus(message, ok and C.GREEN or C.YELLOW)
             return ok, message
@@ -2824,8 +3487,11 @@ do
         local autoAbilitySetter, getAutoAbility
         autoAbilitySetter, getAutoAbility = makeToggle(automationPanel, "AUTO ABILITY", UDim2.new(0, 10, 0, 307), function(enabled)
             local ok, message = true, enabled
-                and "Auto Ability đã bật: Ability sẽ tự kích hoạt khi hồi xong; bỏ qua Ability theo Time trong JSON."
-                or "Auto Ability đã tắt: Macro Ability sẽ chạy theo Time trong JSON."
+                and (uiLanguage == "VI"
+                    and "Auto Ability đã bật: Ability sẽ tự kích hoạt khi hồi xong; bỏ qua Ability theo Time trong JSON."
+                    or "Auto Ability enabled: abilities trigger when cooldown ends; timed ability actions in JSON are skipped.")
+                or (uiLanguage == "VI" and "Auto Ability đã tắt: Macro Ability sẽ chạy theo Time trong JSON."
+                    or "Auto Ability disabled: ability actions follow their JSON timestamps.")
             if callbacks.onAutoAbilityChanged then
                 ok, message = callbacks.onAutoAbilityChanged(enabled)
             end
@@ -2883,7 +3549,8 @@ do
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, macroTab)
-        addCorner(macroPanel, 9)
+        addCorner(macroPanel, 11)
+        addStroke(macroPanel, Color3.fromRGB(57, 78, 110), 1)
         makeLabel(macroPanel, "MACRO FILE MANAGER", UDim2.new(0, 12, 0, 8), UDim2.new(1, -24, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT,
         })
@@ -2942,44 +3609,26 @@ do
             PaddingRight = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3),
         }, macroDropdownList)
 
-        makeLabel(macroScroll, "JSON MACRO DATA", UDim2.new(0, 6, 0, 143), UDim2.new(1, -12, 0, 15), {
-            TextSize = 9, Color = C.DIM,
-        })
-        local macroJsonBox = newInstance("TextBox", {
-            Position = UDim2.new(0, 6, 0, 162),
-            Size = UDim2.new(1, -12, 0, 174),
-            BackgroundColor3 = C.INPUT,
-            BorderSizePixel = 0,
-            PlaceholderText = 'Dán JSON Macro dạng [ { "Type": "PlaceUnit", ... } ] vào đây...',
-            PlaceholderColor3 = C.DIM,
-            Text = "",
-            TextColor3 = C.TEXT,
-            TextSize = 9,
-            Font = Enum.Font.Code,
-            ClearTextOnFocus = false,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextYAlignment = Enum.TextYAlignment.Top,
-            TextWrapped = false,
-            MultiLine = true,
+        local macroStatusCard = newInstance("Frame", {
+            Position = UDim2.new(0, 6, 0, 145), Size = UDim2.new(1, -12, 0, 68),
+            BackgroundColor3 = C.INPUT, BorderSizePixel = 0,
         }, macroScroll)
-        addCorner(macroJsonBox, 6)
-        addStroke(macroJsonBox, Color3.fromRGB(48, 66, 96), 1)
-        newInstance("UIPadding", {
-            PaddingTop = UDim.new(0, 7), PaddingLeft = UDim.new(0, 7),
-            PaddingRight = UDim.new(0, 7), PaddingBottom = UDim.new(0, 7),
-        }, macroJsonBox)
+        addCorner(macroStatusCard, 8)
+        addStroke(macroStatusCard, Color3.fromRGB(48, 66, 96), 1)
+        local macroFileStatus = makeLabel(macroStatusCard, "MACRO FILE: NONE · ACTIONS: --",
+            UDim2.new(0, 10, 0, 6), UDim2.new(1, -20, 0, 18), { TextSize = 11, Color = C.ACCENT })
+        local macroProgressStatus = makeLabel(macroStatusCard, "STATUS: READY",
+            UDim2.new(0, 10, 0, 28), UDim2.new(1, -20, 0, 34), { TextSize = 11, Color = C.DIM, Wrapped = true })
 
-        local importMacroButton = makeButton(macroScroll, "IMPORT JSON", UDim2.new(0, 6, 0, 343), UDim2.new(0.5, -9, 0, 29), {
-            Background = C.BUTTON,
+        local importMacroButton = makeButton(macroScroll, "IMPORT JSON", UDim2.new(0, 6, 0, 322), UDim2.new(0.5, -9, 0, 30), {
+            Background = C.BUTTON, TextSize = 10,
         })
-        local exportMacroButton = makeButton(macroScroll, "EXPORT JSON", UDim2.new(0.5, 3, 0, 343), UDim2.new(0.5, -9, 0, 29), {
-            Background = C.GREEN_DARK,
+        local exportMacroButton = makeButton(macroScroll, "EXPORT JSON", UDim2.new(0.5, 3, 0, 322), UDim2.new(0.5, -9, 0, 30), {
+            Background = C.GREEN_DARK, TextSize = 10,
         })
-        local macroFileStatus = makeLabel(macroScroll, "Macro file: chưa chọn | Actions: --",
-            UDim2.new(0, 6, 0, 375), UDim2.new(1, -12, 0, 18), { TextSize = 8, Color = C.DIM })
 
         local macroRecordSetter
-        macroRecordSetter = makeToggle(macroScroll, "RECORD MACRO", UDim2.new(0, 6, 0, 399), function(enabled)
+        macroRecordSetter = makeToggle(macroScroll, "RECORD MACRO", UDim2.new(0, 6, 0, 221), function(enabled)
             local ok, message = false, "Recorder Engine chưa sẵn sàng."
             if callbacks.onMacroRecordChanged then
                 ok, message = callbacks.onMacroRecordChanged(enabled)
@@ -2988,7 +3637,7 @@ do
             setStatus(message, ok and C.GREEN or C.YELLOW)
         end)
         local macroPlaySetter
-        macroPlaySetter = makeToggle(macroScroll, "PLAY MACRO", UDim2.new(0, 6, 0, 433), function(enabled)
+        macroPlaySetter = makeToggle(macroScroll, "PLAY MACRO", UDim2.new(0, 6, 0, 255), function(enabled)
             local ok, message = false, "Replay Engine chưa sẵn sàng."
             if callbacks.onMacroPlayChanged then
                 ok, message = callbacks.onMacroPlayChanged(enabled)
@@ -3000,10 +3649,10 @@ do
         -- Bù độ trễ phát hiện trận / khởi động Replay: trừ khỏi deadline của từng Action.
         -- Đây là offset lịch chạy, không sửa Time trong JSON.
         local macroLeadSeconds = 0
-        makeLabel(macroScroll, "CHẠY SỚM HƠN", UDim2.new(0, 6, 0, 468), UDim2.new(0.58, -6, 0, 28), {
+        makeLabel(macroScroll, "CHẠY SỚM HƠN", UDim2.new(0, 6, 0, 289), UDim2.new(0.58, -6, 0, 28), {
             TextSize = 10, Color = C.TEXT,
         })
-        local macroLeadButton = makeButton(macroScroll, "0 GIÂY  ▼", UDim2.new(0.62, 0, 0, 468), UDim2.new(0.38, -6, 0, 28), {
+        local macroLeadButton = makeButton(macroScroll, "0 GIÂY  ▼", UDim2.new(0.62, 0, 0, 289), UDim2.new(0.38, -6, 0, 28), {
             Background = C.INPUT, TextSize = 10,
         })
         macroLeadButton.Activated:Connect(function()
@@ -3020,7 +3669,7 @@ do
         end)
 
         -- Không sửa Time trong JSON; Replay chỉ điều chỉnh deadline khi chạy.
-        macroScroll.CanvasSize = UDim2.new(0, 0, 0, 510)
+        macroScroll.CanvasSize = UDim2.new(0, 0, 0, 364)
 
         local selectedMacroKey = nil
         local macroDeleteConfirmKey = nil
@@ -3035,12 +3684,12 @@ do
         local function updateMacroFileStatus()
             local data = selectedMacroKey and MacroStore:GetFile(selectedMacroKey)
             if not data then
-                macroFileStatus.Text = "Macro file: chưa chọn | Actions: --"
+                macroFileStatus.Text = "MACRO FILE: NONE · ACTIONS: --"
                 return
             end
             local decodedOK, decoded = pcall(function() return HttpService:JSONDecode(data.Content or "[]") end)
             local count = decodedOK and type(decoded) == "table" and #decoded or 0
-            macroFileStatus.Text = string.format("Macro file: %s | Actions: %d", data.Name, count)
+            macroFileStatus.Text = string.format("MACRO FILE: %s · ACTIONS: %d", data.Name, count)
         end
         local function refreshMacroDropdown()
             for _, child in ipairs(macroDropdownList:GetChildren()) do
@@ -3052,7 +3701,6 @@ do
                 resetMacroDeleteConfirm()
                 macroDropdownList.Visible = false
                 macroDropdownButton.Text = "Chưa có file                                      ▼"
-                macroJsonBox.Text = ""
                 updateMacroFileStatus()
                 return
             end
@@ -3068,10 +3716,6 @@ do
                 MacroStore:SelectFile(selectedMacroKey)
             end
             setMacroDropdownTitle()
-            local activeMacroData = MacroStore:GetFile(selectedMacroKey)
-            if activeMacroData then
-                macroJsonBox.Text = activeMacroData.Content or "[]"
-            end
             for index, key in ipairs(keys) do
                 local data = MacroStore:GetFile(key)
                 local active = key == selectedMacroKey
@@ -3088,7 +3732,6 @@ do
                         selectedMacroKey = key
                         resetMacroDeleteConfirm()
                         local selected = MacroStore:GetFile(key)
-                        macroJsonBox.Text = selected and selected.Content or "[]"
                         macroDropdownList.Visible = false
                         setMacroDropdownTitle()
                         refreshMacroDropdown()
@@ -3132,7 +3775,6 @@ do
             selectedMacroKey = nextKey
             if selectedMacroKey then MacroStore:SelectFile(selectedMacroKey) end
             local selected = selectedMacroKey and MacroStore:GetFile(selectedMacroKey)
-            macroJsonBox.Text = selected and selected.Content or ""
             refreshMacroDropdown()
             setStatus(message or "Đã xóa Macro file.", C.GREEN)
         end)
@@ -3154,18 +3796,16 @@ do
             resetMacroDeleteConfirm()
             macroNameBox.Text = ""
             local data = MacroStore:GetFile(result)
-            macroJsonBox.Text = data and data.Content or "[]"
             refreshMacroDropdown()
-            setStatus(MacroStore:HasPersistence() and "Đã tạo Macro file mới trên thiết bị." or "Đã tạo Macro tạm trong phiên; executor không hỗ trợ ghi file.", MacroStore:HasPersistence() and C.GREEN or C.YELLOW)
+            local createStatus = MacroStore:HasPersistence()
+                and "Đã tạo Macro file mới; thư viện sẽ được nạp lại ở lần chạy sau."
+                or (type(writefile) == "function"
+                    and "Đã tạo file JSON; executor thiếu readfile nên danh sách chỉ được giữ trong phiên hiện tại."
+                    or "Đã tạo Macro tạm trong phiên; executor không hỗ trợ ghi file.")
+            setStatus(createStatus, MacroStore:HasPersistence() or type(writefile) == "function" and C.GREEN or C.YELLOW)
         end)
         importMacroButton.Activated:Connect(function()
-            if not selectedMacroKey then
-                setStatus("Hãy tạo hoặc chọn Macro file trước khi Import.", C.YELLOW)
-                return
-            end
-            local ok, message = MacroStore:ImportJSON(selectedMacroKey, macroJsonBox.Text)
-            updateMacroFileStatus()
-            setStatus(message, ok and C.GREEN or C.RED)
+            showPasteImportDialog("MACRO")
         end)
         exportMacroButton.Activated:Connect(function()
             if not selectedMacroKey then
@@ -3177,23 +3817,36 @@ do
                 setStatus(raw, C.RED)
                 return
             end
-            macroJsonBox.Text = raw
+            local clipboardOK, clipboardError = false, nil
             if type(setclipboard) == "function" then
-                pcall(setclipboard, raw)
+                local callOK, callResult = pcall(setclipboard, raw)
+                clipboardOK = callOK and callResult ~= false
+                if not callOK then clipboardError = callResult end
             end
-            setStatus("Đã Export JSON: " .. tostring(path or "RAM") .. (type(setclipboard) == "function" and " (đã copy clipboard)." or "."), C.GREEN)
+            local fileWasWritten = type(path) == "string" and not path:match("^Clipboard only")
+            if not fileWasWritten and not clipboardOK then
+                setStatus("Export did not complete: clipboard copy failed. " .. tostring(clipboardError or "Clipboard API unavailable."), C.RED)
+                return
+            end
+            local exportMessage = "Export complete: " .. tostring(path or "RAM")
+                .. (clipboardOK and " · copied to clipboard." or " · file saved.")
+            setStatus(exportMessage, C.GREEN)
+            macroProgressStatus.Text = "STATUS: " .. localizeText(exportMessage, uiLanguage)
+            macroProgressStatus.TextColor3 = C.GREEN
             updateMacroFileStatus()
         end)
 
         -- TARGET MONSTER TAB (GIU NGUYEN NOI DUNG MAIN CU)
         local main = tabFrames[2]
+        local targetStackLayout = isMobileLayout or (window.AbsoluteSize.X - currentSidebarWidth) < 560
         local leftPanel = newInstance("Frame", {
             Position = UDim2.new(0, 9, 0, 9),
-            Size = UDim2.new(0.51, -12, 1, -18),
+            Size = targetStackLayout and UDim2.new(1, -18, 0, 520) or UDim2.new(0.51, -12, 0, 520),
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, main)
-        addCorner(leftPanel, 9)
+        addCorner(leftPanel, 10)
+        addStroke(leftPanel, Color3.fromRGB(57, 78, 110), 1)
         newInstance("UIPadding", {
             PaddingLeft = UDim.new(0, 10),
             PaddingRight = UDim.new(0, 10),
@@ -3279,22 +3932,33 @@ do
         local deleteButton = makeButton(leftPanel, "DELETE", UDim2.new(0.52, 3, 0, 380), UDim2.new(0.48, -3, 0, 27), {
             Background = C.RED_DARK,
         })
-        makeLabel(leftPanel, "MAP FILE (vi du: duy_maps/Map_A.json)", UDim2.new(0, 0, 0, 413), UDim2.new(1, 0, 0, 15), { TextSize = 8, Color = C.DIM })
-        local mapFileBox = makeTextBox(leftPanel, "Nhap duong dan file JSON...", UDim2.new(0, 0, 0, 430), UDim2.new(1, 0, 0, 25))
-        mapFileBox.Text = "Map_A.json"
-        local importMapButton = makeButton(leftPanel, "IMPORT MAP", UDim2.new(0, 0, 0, 461), UDim2.new(0.48, -3, 0, 27), { Background = C.BUTTON, TextSize = 9 })
-        local exportMapButton = makeButton(leftPanel, "EXPORT MAP", UDim2.new(0.52, 3, 0, 461), UDim2.new(0.48, -3, 0, 27), { Background = C.GREEN_DARK, TextSize = 9 })
-        local mapFileStatusLabel = makeLabel(leftPanel, "Current Map: -- | Route Points: 0 | Status: NOT READY",
-            UDim2.new(0, 0, 0, 491), UDim2.new(1, 0, 0, 18), { TextSize = 8, Color = C.DIM, Wrapped = true })
+        local importMapButton = makeButton(leftPanel, "IMPORT MAP", UDim2.new(0, 0, 0, 414), UDim2.new(0.48, -3, 0, 30), { Background = C.BUTTON, TextSize = 10 })
+        local exportMapButton = makeButton(leftPanel, "EXPORT MAP", UDim2.new(0.52, 3, 0, 414), UDim2.new(0.48, -3, 0, 30), { Background = C.GREEN_DARK, TextSize = 10 })
+        local mapFileStatusCard = newInstance("Frame", {
+            Position = UDim2.new(0, 0, 0, 450), Size = UDim2.new(1, 0, 0, 54),
+            BackgroundColor3 = C.INPUT, BorderSizePixel = 0,
+        }, leftPanel)
+        addCorner(mapFileStatusCard, 8)
+        addStroke(mapFileStatusCard, Color3.fromRGB(48, 66, 96), 1)
+        local mapFileStatusLabel = makeLabel(mapFileStatusCard, "CURRENT MAP: -- · ROUTE: 0 · NOT READY",
+            UDim2.new(0, 8, 0, 4), UDim2.new(1, -16, 0, 18), { TextSize = 10, Color = C.DIM, Wrapped = true })
+        local mapOperationStatusLabel = makeLabel(mapFileStatusCard, "STATUS: READY",
+            UDim2.new(0, 8, 0, 27), UDim2.new(1, -16, 0, 20), { TextSize = 10, Color = C.ACCENT, Wrapped = true })
 
         -- MAIN TAB: RIGHT PANEL
         local rightPanel = newInstance("Frame", {
-            Position = UDim2.new(0.51, 3, 0, 9),
-            Size = UDim2.new(0.49, -12, 1, -18),
+            Position = targetStackLayout and UDim2.new(0, 9, 0, 540) or UDim2.new(0.51, 3, 0, 9),
+            Size = targetStackLayout and UDim2.new(1, -18, 0, 410) or UDim2.new(0.49, -12, 0, 520),
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, main)
-        addCorner(rightPanel, 9)
+        addCorner(rightPanel, 10)
+        addStroke(rightPanel, Color3.fromRGB(57, 78, 110), 1)
+        if targetStackLayout then
+            main.CanvasSize = UDim2.new(0, 0, 0, 965)
+            main.ScrollingEnabled = true
+            main.Active = true
+        end
 
         makeLabel(rightPanel, "PLAYER CONTROL", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 21), {
             Font = Enum.Font.GothamBold,
@@ -3389,11 +4053,12 @@ do
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, tabFrames[5])
-        addCorner(performancePanel, 9)
+        addCorner(performancePanel, 11)
+        addStroke(performancePanel, Color3.fromRGB(57, 78, 110), 1)
         makeLabel(performancePanel, "TỐI ƯU HIỆU NĂNG", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
-        makeLabel(performancePanel, "Tất cả thay đổi chỉ áp dụng hiển thị ở máy bạn; không Destroy quái hay vật thể.",
+        makeLabel(performancePanel, "All changes affect local visuals only; enemies and world objects are not destroyed.",
             UDim2.new(0, 14, 0, 34), UDim2.new(1, -28, 0, 28), {
                 TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
             })
@@ -3444,7 +4109,7 @@ do
             end)
         end
         refreshPerformanceModeButtons("NORMAL")
-        makeLabel(performanceScroll, "Tùy chỉnh riêng (bật/tắt từng mục sẽ chuyển sang CUSTOM):",
+        makeLabel(performanceScroll, "Custom options (changing any option switches the preset to CUSTOM):",
             UDim2.new(0, 10, 0, 103), UDim2.new(1, -20, 0, 25),
             { TextSize = 8, Color = C.DIM, Wrapped = true })
         local performanceRows = {
@@ -3695,12 +4360,13 @@ do
         end)
 
         importMapButton.Activated:Connect(function()
-            local ok, message = callbacks.onImportMap(trim(mapFileBox.Text))
-            setStatus(message, ok and C.GREEN or C.RED)
+            showPasteImportDialog("MAP")
         end)
         exportMapButton.Activated:Connect(function()
-            local ok, message = callbacks.onExportMap(trim(mapFileBox.Text))
+            local ok, message = callbacks.onExportMap(nil)
             setStatus(message, ok and C.GREEN or C.RED)
+            mapOperationStatusLabel.Text = "STATUS: " .. localizeText(tostring(message or ""), uiLanguage)
+            mapOperationStatusLabel.TextColor3 = ok and C.GREEN or C.RED
         end)
 
         scanNowButton.Activated:Connect(function()
@@ -3724,6 +4390,8 @@ do
         self._api = {
             setStatus = setStatus,
             notify = notify,
+            clearToasts = clearToasts,
+            getLanguage = function() return uiLanguage end,
             refreshDropdown = refreshDropdown,
             updateCreateButton = updateCreateButton,
             setSpawnLabel = function(position)
@@ -3754,9 +4422,15 @@ do
                 end
             end,
             setScannerInfo = function(snapshot)
-                scannerLabel.Text = "Match scanner: " .. (snapshot.ScannerActive and "ACTIVE" or "READY")
-                    .. "\nKet qua: " .. tostring(snapshot.Result or "IN PROGRESS")
-                    .. "\nBoss monitor: theo Max HP da nhap"
+                if uiLanguage == "VI" then
+                    scannerLabel.Text = "Bộ quét trận: " .. (snapshot.ScannerActive and "ĐANG CHẠY" or "SẴN SÀNG")
+                        .. "\nKết quả: " .. tostring(snapshot.Result or "ĐANG DIỄN RA")
+                        .. "\nTheo dõi Boss: theo Max HP đã nhập"
+                else
+                    scannerLabel.Text = "Match scanner: " .. (snapshot.ScannerActive and "ACTIVE" or "READY")
+                        .. "\nResult: " .. tostring(snapshot.Result or "IN PROGRESS")
+                        .. "\nBoss monitor: configured Max HP"
+                end
             end,
             setPerformanceUI = function(values, silent)
                 for name, setter in pairs(performanceSetters) do
@@ -3774,7 +4448,11 @@ do
             setFollowUI = setFollowUI,
             setScannerUI = setScannerUI,
             setSpeedModeUI = function(mode)
-                speedModeButton.Text = mode == "MATCH_ENEMY" and "SPEED MODE: THEO TỐC ĐỘ QUÁI" or "SPEED MODE: BÌNH THƯỜNG"
+                if mode == "MATCH_ENEMY" then
+                    speedModeButton.Text = uiLanguage == "VI" and "SPEED MODE: THEO TỐC ĐỘ QUÁI" or "SPEED MODE: MATCH ENEMY"
+                else
+                    speedModeButton.Text = uiLanguage == "VI" and "SPEED MODE: BÌNH THƯỜNG" or "SPEED MODE: NORMAL"
+                end
             end,
             setBossInfo = function(text)
                 bossStatusLabel.Text = "Boss: " .. tostring(text)
@@ -3785,18 +4463,15 @@ do
             end,
             refreshMacroDropdown = refreshMacroDropdown,
             setMacroJson = function(key, raw)
-                if selectedMacroKey == key then
-                    macroJsonBox.Text = tostring(raw or "[]")
-                    updateMacroFileStatus()
-                end
+                if selectedMacroKey == key then updateMacroFileStatus() end
             end,
             setMacroRecordPreview = function(key, raw, actionCount)
                 if selectedMacroKey == key then
-                    macroJsonBox.Text = tostring(raw or "[]")
                     local data = MacroStore:GetFile(key)
                     local name = data and data.Name or "Macro"
-                    macroFileStatus.Text = string.format("Macro file: %s | Actions: %d (RECORDING · chưa lưu file)",
-                        tostring(name), tonumber(actionCount) or 0)
+                    macroProgressStatus.Text = string.format("RECORDING · %d ACTIONS · NOT SAVED YET", tonumber(actionCount) or 0)
+                    macroProgressStatus.TextColor3 = C.YELLOW
+                    macroFileStatus.Text = string.format("MACRO FILE: %s · ACTIONS: %d", tostring(name), tonumber(actionCount) or 0)
                 end
             end,
             selectMacroFile = function(key)
@@ -3824,8 +4499,12 @@ do
                 }
             end,
             setMacroStatus = function(message, ok)
-                macroFileStatus.Text = "Macro: " .. tostring(message)
-                macroFileStatus.TextColor3 = ok and C.GREEN or C.YELLOW
+                macroProgressStatus.Text = "STATUS: " .. localizeText(tostring(message), uiLanguage)
+                macroProgressStatus.TextColor3 = ok and C.GREEN or C.YELLOW
+            end,
+            setMapOperationStatus = function(message, ok)
+                mapOperationStatusLabel.Text = "STATUS: " .. localizeText(tostring(message or ""), uiLanguage)
+                mapOperationStatusLabel.TextColor3 = ok == false and C.RED or C.ACCENT
             end,
             setSelectedKey = function(key)
                 selectedKey = key
@@ -3850,37 +4529,49 @@ do
         -- TAB INFORMATION + SETTING / DEVICE PROFILE
         -- ============================================================
         local infoTab = tabFrames[6]
-        local infoPanel = newInstance("Frame", {
-            Position = UDim2.new(0, 12, 0, 12), Size = UDim2.new(1, -24, 1, -24),
-            BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
+        local compactInfoLayout = isMobileLayout or (window.AbsoluteSize.X - currentSidebarWidth) < 560
+        local infoScroll = newInstance("ScrollingFrame", {
+            Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+            ScrollBarThickness = 4, ScrollBarImageColor3 = C.ACCENT,
+            Active = compactInfoLayout, ScrollingEnabled = compactInfoLayout,
+            CanvasSize = compactInfoLayout and UDim2.new(0, 0, 0, 545) or UDim2.new(0, 0, 1, 0),
         }, infoTab)
-        addCorner(infoPanel, 9)
+        local infoPanel = newInstance("Frame", {
+            Position = compactInfoLayout and UDim2.new(0, 10, 0, 10) or UDim2.new(0, 10, 0, 12),
+            Size = compactInfoLayout and UDim2.new(1, -20, 0, 150) or UDim2.new(0.43, -16, 1, -24),
+            BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
+        }, infoScroll)
+        addCorner(infoPanel, 11)
+        addStroke(infoPanel, Color3.fromRGB(56, 76, 106), 1)
         makeLabel(infoPanel, "SYSTEM INFORMATION", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
-        local infoText = makeLabel(infoPanel, "Đang đọc thông tin thiết bị...", UDim2.new(0, 14, 0, 48), UDim2.new(1, -28, 0, 190), {
+        local infoText = makeLabel(infoPanel, "Reading device information...", UDim2.new(0, 14, 0, 48),
+            UDim2.new(1, -28, 0, compactInfoLayout and 70 or 190), {
             TextSize = 10, Color = C.TEXT, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
         })
-        makeLabel(infoPanel, "Thông tin executor là lựa chọn của người dùng, không phải xác minh bảo mật.",
-            UDim2.new(0, 14, 0, 250), UDim2.new(1, -28, 0, 42), {
+        local infoDisclaimer = makeLabel(infoPanel, "Executor information is user-selected and is not a security verification.",
+            UDim2.new(0, 14, 0, compactInfoLayout and 120 or 250), UDim2.new(1, -28, 0, compactInfoLayout and 24 or 42), {
                 TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
             })
 
-        local settingTab = tabFrames[7]
+        local settingTab = infoTab
         local settingPanel = newInstance("Frame", {
-            Position = UDim2.new(0, 12, 0, 12), Size = UDim2.new(1, -24, 1, -24),
+            Position = compactInfoLayout and UDim2.new(0, 10, 0, 170) or UDim2.new(0.44, 2, 0, 12),
+            Size = compactInfoLayout and UDim2.new(1, -20, 0, 360) or UDim2.new(0.56, -14, 1, -24),
             BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
-        }, settingTab)
-        addCorner(settingPanel, 9)
+        }, infoScroll)
+        addCorner(settingPanel, 11)
+        addStroke(settingPanel, Color3.fromRGB(56, 76, 106), 1)
         makeLabel(settingPanel, "DEVICE & EXECUTOR SETTING", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT,
         })
-        makeLabel(settingPanel, "Chọn môi trường đang dùng. Hồ sơ được lưu cục bộ trên thiết bị/executor này.",
+        makeLabel(settingPanel, "Choose your executor. This profile is saved locally on this device/executor.",
             UDim2.new(0, 14, 0, 40), UDim2.new(1, -28, 0, 36), {
                 TextSize = 9, Color = C.DIM, Wrapped = true,
             })
         local profileFile = "duy_device_profile.json"
-        local deviceProfile = { Executor = "Chưa chọn", Device = "Unknown" }
+        local deviceProfile = { Executor = "Not selected", Device = "Unknown", Language = "EN" }
         local function loadDeviceProfile()
             if type(readfile) ~= "function" then return end
             local ok, raw = pcall(readfile, profileFile)
@@ -3898,34 +4589,73 @@ do
             return ok
         end
         loadDeviceProfile()
+        uiLanguage = deviceProfile.Language == "VI" and "VI" or "EN"
+        notificationsEnabled = deviceProfile.Notifications ~= false
+        applyUILanguage(uiLanguage, screen)
         local deltaTextBoosted = setmetatable({}, { __mode = "k" })
+        local deltaTextConnections = setmetatable({}, { __mode = "k" })
         local deltaTextConnection
-        local function applyDeltaTextReadability()
-            local function improveDeltaText(instance)
-                if (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox"))
-                    and not deltaTextBoosted[instance] then
-                    deltaTextBoosted[instance] = true
-                    local currentSize = tonumber(instance.TextSize) or 0
-                    if currentSize > 0 and currentSize < 14 then
-                        instance.TextSize = math.min(14, math.max(currentSize, math.floor(currentSize * 1.2 + 0.5)))
-                    end
-                    instance.TextTransparency = 0
-                    instance.TextStrokeColor3 = Color3.fromRGB(3, 5, 10)
-                    instance.TextStrokeTransparency = 0.92
-                end
+        local function fitDeltaText(instance)
+            if not instance or not instance.Parent then return end
+            if not (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")) then return end
+            if instance:IsA("TextButton") then
+                instance.Font = Enum.Font.GothamBold
+            elseif instance:IsA("TextBox") and instance.Font ~= Enum.Font.Code then
+                instance.Font = Enum.Font.GothamMedium
+            elseif instance:IsA("TextLabel") then
+                instance.Font = Enum.Font.GothamSemibold
             end
-            for _, descendant in ipairs(screen:GetDescendants()) do improveDeltaText(descendant) end
+            local width = math.max(48, instance.AbsoluteSize.X - 12)
+            local height = math.max(14, instance.AbsoluteSize.Y - 3)
+            local desired = instance:IsA("TextBox") and (instance.Font == Enum.Font.Code and 12 or 13)
+                or (instance:IsA("TextButton") and 13 or 13)
+            local minimum = instance.AbsoluteSize.Y >= 24 and 11 or 10
+            local candidate = desired
+            local measuredText = tostring(instance.Text or "")
+            if measuredText == "" and instance:IsA("TextBox") then
+                measuredText = tostring(instance.PlaceholderText or "")
+            end
+            local wrapped = instance:IsA("TextLabel") and instance.TextWrapped == true
+            while candidate > minimum do
+                local ok, bounds = pcall(function()
+                    return TextService:GetTextSize(measuredText, candidate, instance.Font,
+                        Vector2.new(width, height))
+                end)
+                if ok and bounds and bounds.Y <= height + 1 and (wrapped or bounds.X <= width + 1) then break end
+                candidate -= 1
+            end
+            instance.TextSize = math.max(minimum, candidate)
+            instance.TextTransparency = 0
+            instance.TextStrokeColor3 = Color3.fromRGB(5, 8, 14)
+            instance.TextStrokeTransparency = 1 -- avoid dark halo that makes Delta text look blurred
+            instance.TextScaled = false
+            pcall(function() instance.TextTruncate = Enum.TextTruncate.None end)
+        end
+        local function registerDeltaText(instance)
+            if not instance or not instance.Parent then return end
+            if not (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")) then return end
+            fitDeltaText(instance)
+            if deltaTextBoosted[instance] then return end
+            deltaTextBoosted[instance] = true
+            local connections = {}
+            table.insert(connections, instance:GetPropertyChangedSignal("Text"):Connect(function()
+                task.defer(function() fitDeltaText(instance) end)
+            end))
+            table.insert(connections, instance:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+                task.defer(function() fitDeltaText(instance) end)
+            end))
+            deltaTextConnections[instance] = connections
+        end
+        local function applyDeltaTextReadability()
+            for _, descendant in ipairs(screen:GetDescendants()) do
+                registerDeltaText(descendant)
+            end
             if not deltaTextConnection then
                 deltaTextConnection = screen.DescendantAdded:Connect(function(descendant)
-                    task.defer(function()
-                        if descendant and descendant.Parent then improveDeltaText(descendant) end
-                    end)
+                    task.defer(function() registerDeltaText(descendant) end)
                 end)
                 table.insert(self._connections, deltaTextConnection)
             end
-        end
-        if tostring(deviceProfile.Executor or ""):lower() == "delta" then
-            applyDeltaTextReadability()
         end
         local function getDeviceInfo()
             local camera = workspace.CurrentCamera
@@ -3935,54 +4665,153 @@ do
             local device = (touch and not keyboard) and "Mobile" or ((keyboard and not touch) and "PC" or "Hybrid/Unknown")
             return device, viewport
         end
-        local executorLabel = makeLabel(settingPanel, "Executor: " .. tostring(deviceProfile.Executor or "Chưa chọn"),
-            UDim2.new(0, 14, 0, 88), UDim2.new(1, -28, 0, 20), { TextSize = 10, Color = C.TEXT })
-        local deltaButton = makeButton(settingPanel, "DELTA", UDim2.new(0, 14, 0, 118), UDim2.new(0.46, -6, 0, 34), { Background = C.BUTTON })
-        local xenoButton = makeButton(settingPanel, "XENO", UDim2.new(0.54, 0, 0, 118), UDim2.new(0.46, -14, 0, 34), { Background = C.BUTTON })
+        local executorLabel = makeLabel(settingPanel, "Executor: " .. tostring(deviceProfile.Executor or "Not selected"),
+            UDim2.new(0, 14, 0, 126), UDim2.new(1, -28, 0, 20), { TextSize = 10, Color = C.TEXT })
+        local deltaButton = makeButton(settingPanel, "DELTA", UDim2.new(0, 14, 0, 151), UDim2.new(0.46, -6, 0, 34), { Background = C.BUTTON })
+        local xenoButton = makeButton(settingPanel, "XENO", UDim2.new(0.54, 0, 0, 151), UDim2.new(0.46, -14, 0, 34), { Background = C.BUTTON })
+        local function refreshSystemInfo()
+            local device, viewport = getDeviceInfo()
+            local executor = deviceProfile.Executor
+            if not executor or executor == "Chưa chọn" or executor == "Not selected" then
+                executor = uiLanguage == "VI" and "Chưa chọn" or "Not selected"
+            end
+            local storage = type(writefile) == "function" and (uiLanguage == "VI" and "Có" or "Available")
+                or (uiLanguage == "VI" and "Chỉ trong phiên" or "Session only")
+            if uiLanguage == "VI" then
+                infoText.Text = string.format("Executor: %s\nThiết bị: %s\nMàn hình: %d x %d\nLưu hồ sơ: %s",
+                    tostring(executor), device, viewport.X, viewport.Y, storage)
+            else
+                infoText.Text = string.format("Executor: %s\nDevice: %s\nScreen: %d x %d\nProfile storage: %s",
+                    tostring(executor), device, viewport.X, viewport.Y, storage)
+            end
+            executorLabel.Text = "Executor: " .. tostring(executor)
+        end
         local function chooseExecutor(name)
             deviceProfile.Executor = name
             local device = getDeviceInfo()
             deviceProfile.Device = device
             deviceProfile.ProfileVersion = 1
             saveDeviceProfile()
-            executorLabel.Text = "Executor: " .. name
-            notify("Đã lưu cấu hình " .. name .. " / " .. device .. ".", C.GREEN)
+            notify(uiLanguage == "VI" and ("Đã lưu cấu hình " .. name .. " / " .. device .. ".")
+                or ("Saved " .. name .. " profile for " .. device .. "."), C.GREEN)
             if tostring(name):lower() == "delta" then applyDeltaTextReadability() end
-            infoText.Text = string.format("Executor: %s\nThiết bị: %s\nKích thước màn hình: %s\nLưu hồ sơ: %s",
-                name, device, tostring((workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or "N/A"),
-                type(writefile) == "function" and "Có" or "Chỉ trong phiên")
+            refreshSystemInfo()
         end
         deltaButton.Activated:Connect(function() chooseExecutor("Delta") end)
         xenoButton.Activated:Connect(function() chooseExecutor("Xeno") end)
-        local resetProfileButton = makeButton(settingPanel, "RESET DEVICE PROFILE", UDim2.new(0, 14, 0, 166), UDim2.new(1, -28, 0, 32), {
+        local resetProfileButton = makeButton(settingPanel, "RESET DEVICE PROFILE", UDim2.new(0, 14, 0, 192), UDim2.new(1, -28, 0, 30), {
             Background = C.RED_DARK, TextSize = 9,
         })
         resetProfileButton.Activated:Connect(function()
-            deviceProfile = { Executor = "Chưa chọn", Device = "Unknown" }
+            deviceProfile = { Executor = "Not selected", Device = "Unknown", Language = uiLanguage or "EN" }
             if type(delfile) == "function" then pcall(delfile, profileFile) end
-            executorLabel.Text = "Executor: Chưa chọn"
-            notify("Đã đặt lại hồ sơ. Hãy chọn Delta hoặc Xeno.", C.YELLOW)
+            refreshSystemInfo()
+            notify(uiLanguage == "VI" and "Đã đặt lại hồ sơ. Hãy chọn Delta hoặc Xeno."
+                or "Device profile reset. Select Delta or Xeno.", C.YELLOW)
         end)
-        local refreshInfoButton = makeButton(settingPanel, "REFRESH DEVICE INFO", UDim2.new(0, 14, 0, 210), UDim2.new(1, -28, 0, 30), {
+        local refreshInfoButton = makeButton(settingPanel, "REFRESH DEVICE INFO", UDim2.new(0, 14, 0, 230), UDim2.new(1, -28, 0, 28), {
             Background = C.BUTTON, TextSize = 9,
         })
         refreshInfoButton.Activated:Connect(function()
-            local device, viewport = getDeviceInfo()
-            infoText.Text = string.format("Executor: %s\nThiết bị: %s\nMàn hình: %d x %d\nLưu hồ sơ: %s",
-                tostring(deviceProfile.Executor or "Chưa chọn"), device, viewport.X, viewport.Y,
-                type(writefile) == "function" and "Có" or "Chỉ trong phiên")
-            notify("Đã cập nhật thông tin thiết bị.", C.ACCENT)
+            refreshSystemInfo()
+            notify(uiLanguage == "VI" and "Đã cập nhật thông tin thiết bị." or "Device information refreshed.", C.ACCENT)
         end)
-        do
-            local device, viewport = getDeviceInfo()
-            infoText.Text = string.format("Executor: %s\nThiết bị: %s\nMàn hình: %d x %d\nLưu hồ sơ: %s",
-                tostring(deviceProfile.Executor or "Chưa chọn"), device, viewport.X, viewport.Y,
-                type(writefile) == "function" and "Có" or "Chỉ trong phiên")
+        local languageCard = newInstance("Frame", {
+            Position = UDim2.new(0, 10, 0, 80), Size = UDim2.new(1, -20, 0, 38),
+            BackgroundColor3 = C.INPUT, BorderSizePixel = 0,
+        }, settingPanel)
+        addCorner(languageCard, 9)
+        addStroke(languageCard, Color3.fromRGB(59, 78, 108), 1)
+        makeLabel(languageCard, "LANGUAGE", UDim2.new(0, 9, 0, 0), UDim2.new(0.26, -8, 1, 0), {
+            TextSize = 10, Color = C.TEXT,
+        })
+        local englishButton = makeButton(languageCard, "ENGLISH", UDim2.new(0.30, 0, 0, 5), UDim2.new(0.31, -3, 0, 28), {
+            Background = uiLanguage == "EN" and C.ACTIVE_FILE or C.BUTTON, TextSize = 10,
+        })
+        local vietnameseButton = makeButton(languageCard, "TIẾNG VIỆT", UDim2.new(0.64, 0, 0, 5), UDim2.new(0.34, -8, 0, 28), {
+            Background = uiLanguage == "VI" and C.ACTIVE_FILE or C.BUTTON, TextSize = 9,
+        })
+        local function setLanguage(language)
+            uiLanguage = language == "VI" and "VI" or "EN"
+            deviceProfile.Language = uiLanguage
+            saveDeviceProfile()
+            applyUILanguage(uiLanguage, screen)
+            englishButton.BackgroundColor3 = uiLanguage == "EN" and C.ACTIVE_FILE or C.BUTTON
+            vietnameseButton.BackgroundColor3 = uiLanguage == "VI" and C.ACTIVE_FILE or C.BUTTON
+            refreshSystemInfo()
+            notify(uiLanguage == "EN" and "Language set to English." or "Đã chuyển sang Tiếng Việt.", C.ACCENT)
         end
-        executorLabel.Text = "Executor: " .. tostring(deviceProfile.Executor or "Chưa chọn")
+        englishButton.Activated:Connect(function() setLanguage("EN") end)
+        vietnameseButton.Activated:Connect(function() setLanguage("VI") end)
+
+        local notificationsCard = newInstance("Frame", {
+            Position = UDim2.new(0, 10, 0, 272), Size = UDim2.new(1, -20, 0, 38),
+            BackgroundColor3 = C.INPUT, BorderSizePixel = 0,
+        }, settingPanel)
+        addCorner(notificationsCard, 9)
+        addStroke(notificationsCard, Color3.fromRGB(59, 78, 108), 1)
+        local notificationsSetter = makeToggle(notificationsCard, "TOAST NOTIFICATIONS", UDim2.new(0, 10, 0, 4), function(enabled)
+            notificationsEnabled = enabled == true
+            deviceProfile.Notifications = notificationsEnabled
+            saveDeviceProfile()
+            if not notificationsEnabled then clearToasts() end
+            return true, "Toast notifications " .. (notificationsEnabled and "enabled." or "disabled.")
+        end)
+        notificationsSetter(notificationsEnabled, true)
+        refreshSystemInfo()
+
+        local function refreshAdaptivePanelLayout()
+            if not window or not window.Parent then return end
+            local innerWidth = window.AbsoluteSize.X - currentSidebarWidth
+            local narrow = isMobileLayout or innerWidth < 560
+            targetStackLayout = narrow
+            if narrow then
+                leftPanel.Position = UDim2.new(0, 9, 0, 9)
+                leftPanel.Size = UDim2.new(1, -18, 0, 520)
+                rightPanel.Position = UDim2.new(0, 9, 0, 540)
+                rightPanel.Size = UDim2.new(1, -18, 0, 410)
+                main.CanvasSize = UDim2.new(0, 0, 0, 965)
+                main.ScrollingEnabled, main.Active = true, true
+            else
+                leftPanel.Position = UDim2.new(0, 9, 0, 9)
+                leftPanel.Size = UDim2.new(0.51, -12, 0, 520)
+                rightPanel.Position = UDim2.new(0.51, 3, 0, 9)
+                rightPanel.Size = UDim2.new(0.49, -12, 0, 520)
+                main.CanvasSize = UDim2.new(0, 0, 0, 540)
+                main.ScrollingEnabled, main.Active = true, true
+            end
+
+            compactInfoLayout = narrow
+            if narrow then
+                infoScroll.CanvasSize = UDim2.new(0, 0, 0, 545)
+                infoScroll.ScrollingEnabled, infoScroll.Active = true, true
+                infoPanel.Position = UDim2.new(0, 10, 0, 10)
+                infoPanel.Size = UDim2.new(1, -20, 0, 150)
+                infoText.Size = UDim2.new(1, -28, 0, 70)
+                infoDisclaimer.Position = UDim2.new(0, 14, 0, 120)
+                infoDisclaimer.Size = UDim2.new(1, -28, 0, 24)
+                settingPanel.Position = UDim2.new(0, 10, 0, 170)
+                settingPanel.Size = UDim2.new(1, -20, 0, 360)
+            else
+                infoScroll.CanvasSize = UDim2.new(0, 0, 1, 0)
+                infoScroll.ScrollingEnabled, infoScroll.Active = false, false
+                infoPanel.Position = UDim2.new(0, 10, 0, 12)
+                infoPanel.Size = UDim2.new(0.43, -16, 1, -24)
+                infoText.Size = UDim2.new(1, -28, 0, 190)
+                infoDisclaimer.Position = UDim2.new(0, 14, 0, 250)
+                infoDisclaimer.Size = UDim2.new(1, -28, 0, 42)
+                settingPanel.Position = UDim2.new(0.44, 2, 0, 12)
+                settingPanel.Size = UDim2.new(0.56, -14, 1, -24)
+            end
+        end
+        local adaptiveLayoutConnection = window:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            task.defer(refreshAdaptivePanelLayout)
+        end)
+        table.insert(self._connections, adaptiveLayoutConnection)
+        task.defer(refreshAdaptivePanelLayout)
 
         -- Lan dau chay tren moi bo luu tru cuc bo: hoi chon executor truoc khi thao tac.
-        if not deviceProfile.Executor or deviceProfile.Executor == "Chưa chọn" then
+        if not deviceProfile.Executor or deviceProfile.Executor == "Chưa chọn" or deviceProfile.Executor == "Not selected" then
             local setupOverlay = newInstance("Frame", {
                 Name = "FirstRunSetup", Size = UDim2.fromScale(1, 1),
                 BackgroundColor3 = Color3.fromRGB(3, 5, 10), BackgroundTransparency = 0.12,
@@ -3995,10 +4824,10 @@ do
             }, setupOverlay)
             addCorner(setupCard, 10)
             addStroke(setupCard, C.ACCENT, 1)
-            makeLabel(setupCard, "CHỌN MÔI TRƯỜNG", UDim2.new(0, 14, 0, 14), UDim2.new(1, -28, 0, 24), {
+            makeLabel(setupCard, "SELECT EXECUTOR", UDim2.new(0, 14, 0, 14), UDim2.new(1, -28, 0, 24), {
                 Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
             }).ZIndex = 152
-            makeLabel(setupCard, "Bạn đang sử dụng executor nào? Lựa chọn được lưu cục bộ trên thiết bị này.",
+            makeLabel(setupCard, "Which executor are you using? Your choice is saved locally on this device.",
                 UDim2.new(0, 14, 0, 44), UDim2.new(1, -28, 0, 42), {
                     TextSize = 9, Color = C.TEXT, Wrapped = true,
                 }).ZIndex = 152
@@ -4019,11 +4848,17 @@ do
         updateCreateButton()
         refreshDropdown()
         refreshMacroDropdown()
+        if tostring(deviceProfile.Executor or ""):lower() == "delta" then
+            task.defer(applyDeltaTextReadability)
+        end
 
         if not SaveManager:HasPersistence() then
-            setStatus("writefile/readfile khong co san - save chi ton tai trong session.", C.YELLOW)
+            setStatus(uiLanguage == "VI"
+                and "Executor không hỗ trợ readfile/writefile; dữ liệu chỉ tồn tại trong phiên."
+                or "File storage is unavailable; data will remain in this session.", C.YELLOW)
         else
-            setStatus("He thong san sang - JSON persistence available.", C.GREEN)
+            setStatus(uiLanguage == "VI" and "Hệ thống sẵn sàng - JSON persistence available."
+                or "System ready - JSON persistence available.", C.GREEN)
         end
 
         return self._api
@@ -4047,6 +4882,14 @@ end
 local autoFollowEnabled = false
 local autoPlayScannerEnabled = false -- legacy compatibility; no UI toggle in V2.6
 local api = nil
+local matchStartToastNotified = setmetatable({}, { __mode = "k" })
+local function notifyMatchStartedOnce(context)
+    if not context or matchStartToastNotified[context] then return end
+    matchStartToastNotified[context] = true
+    if api and api.notify then
+        api.notify("Match started", Color3.fromRGB(70, 160, 255), "ChenFuWei")
+    end
+end
 local enemyElapsed = 0
 local destroyed = false
 local manualMovementActive
@@ -6680,6 +7523,8 @@ function MacroEngine:_activateRecordForContext(ctx)
         end
     end)
 
+    notifyMatchStartedOnce(ctx)
+    if api and api.notify then api.notify("Macro started · recording", Color3.fromRGB(50, 200, 110), "ChenFuWei") end
     if api then
         api.setMacroRecordUI(true, true)
         local modeNote = (self._recordMode == "OBSERVER"
@@ -6919,9 +7764,29 @@ function MacroEngine:_saveRecord(reason)
             statusMessage = statusMessage .. " Có " .. tostring(bananaWithoutTopLevelPathMetadata)
                 .. " Banana Peel không có đủ PathIndex/DistanceAlongPath ở cấp params; hãy kiểm tra PlacementParams gốc trong JSON."
         end
-        api.setMacroStatus(statusMessage, ok and MacroStore:HasPersistence()
+        local recordPanelMessage
+        if ok and MacroStore:HasPersistence() then
+            recordPanelMessage = string.format("RECORD SAVED TO FILE · %d ACTIONS", #cleanActions)
+        elseif ok then
+            recordPanelMessage = string.format("RECORD STORED IN SESSION · %d ACTIONS · NO FILE STORAGE", #cleanActions)
+        else
+            recordPanelMessage = "RECORD SAVE FAILED · " .. tostring(message or "Unknown error")
+        end
+        if unresolvedPlaces > 0 or incompletePayloads > 0 or bananaWithoutTopLevelPathMetadata > 0 then
+            recordPanelMessage ..= " · CHECK PLACEMENT WARNINGS"
+        end
+        api.setMacroStatus(recordPanelMessage, ok and MacroStore:HasPersistence()
             and unresolvedPlaces == 0 and incompletePayloads == 0
             and bananaWithoutTopLevelPathMetadata == 0)
+        if api.notify then
+            if ok and MacroStore:HasPersistence() then
+                api.notify("Macro recorded and saved to file · " .. tostring(#cleanActions) .. " actions", Color3.fromRGB(50, 200, 110), "RECORD COMPLETE")
+            elseif ok then
+                api.notify("Macro recorded in this session · file storage unavailable", Color3.fromRGB(255, 190, 65), "RECORD COMPLETE")
+            else
+                api.notify("Macro save failed · " .. tostring(message), Color3.fromRGB(235, 65, 65), "RECORD FAILED")
+            end
+        end
     end
     return ok, message or "Đã lưu Macro."
 end
@@ -8812,9 +9677,11 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
     self._pendingOrderMappings = {}
 
     self._waitingQueue = actions
+    notifyMatchStartedOnce(ctx)
+    if api and api.notify then api.notify("Macro started · replay", Color3.fromRGB(50, 200, 110), "ChenFuWei") end
     if api then
         api.setMacroPlayUI(true, true)
-        api.setMacroStatus(string.format("Macro đã bắt đầu · %d Action · chạy sớm %.1fs (TickSpeed %.1fx) · FIFO.",
+        api.setMacroStatus(string.format("Macro started · %d actions · run ahead %.1fs (TickSpeed %.1fx) · FIFO.",
             #actions, leadSeconds, tickSpeed), true)
     end
 
@@ -8898,8 +9765,8 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
             if actionOK then
                 completedCount += 1
                 if api then
-                    api.setMacroStatus(string.format("Replay %d/%d · JSON %.2fs → due %.2fs · actual %.2fs · trễ %.2fs · %s",
-                        index, #actions, recordedTargetTime, targetTime, actualFinish, delayNow, tostring(message)), true)
+                    api.setMacroStatus(string.format("ACTION %d/%d · due %.2fs · late %.2fs · %s",
+                        index, #actions, targetTime, delayNow, tostring(message)), true)
                 end
             else
                 failedCount += 1
@@ -8927,7 +9794,13 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
             self._replayState = "WAITING_FOR_MATCH_END"
             if api then
                 api.setMacroPlayUI(true, true)
-                api.setMacroStatus(string.format("Macro đã xử lý %d/%d Action. Đang chờ trận kết thúc...", attempted, #actions), true)
+                local completionMessage = string.format("MACRO COMPLETED · %d/%d · WAITING FOR NEXT MATCH%s",
+                    attempted, #actions, self._autoRepeatArmed and " · REPEAT ON" or "")
+                api.setMacroStatus(completionMessage, true)
+                if api.notify then
+                    api.notify("Macro completed · " .. tostring(completedCount) .. "/" .. tostring(#actions) .. " actions succeeded",
+                        Color3.fromRGB(50, 200, 110), "MACRO COMPLETE")
+                end
             end
         end
     end)
@@ -9071,7 +9944,7 @@ function MacroEngine:_finishReplayMatch(ctx, reason)
         self._replayState = "WAITING_FOR_MATCH"
         if api then
             api.setMacroPlayUI(true, true)
-            api.setMacroStatus("Trận kết thúc. Đang chờ trận tiếp theo...", true)
+            api.setMacroStatus("WAITING FOR NEXT MATCH · Macro sẽ chạy lại khi trận mới bắt đầu.", true)
         end
         -- Nếu Context tiếp theo đã xuất hiện trước tín hiệu kết thúc của Context cũ,
         -- không bỏ lỡ sự kiện GameStartTime đã phát trước đó.
@@ -9519,6 +10392,26 @@ callbacks.onMacroDeleteFile = function(key)
     return MacroStore:DeleteFile(key)
 end
 
+callbacks.onValidateMacroImport = function(raw)
+    local valid, decodedOrError = MacroStore:ValidateJSON(raw)
+    if not valid then return false, decodedOrError end
+    return true, string.format("Valid macro JSON · %d actions", #decodedOrError)
+end
+
+callbacks.onImportMacroData = function(raw, requestedName)
+    if MacroEngine.Recording or MacroEngine.Playing or MacroEngine._savingRecord or MacroEngine._saveQueued then
+        return false, "Stop Record/Replay trước khi Import Macro mới."
+    end
+    local ok, keyOrError, message = MacroStore:ImportJSONAsNew(requestedName, raw)
+    if not ok then return false, keyOrError end
+    if api then
+        api.refreshMacroDropdown()
+        api.selectMacroFile(keyOrError)
+        api.setMacroStatus("IMPORT COMPLETED · " .. tostring(message or "New macro created."), true)
+    end
+    return true, keyOrError, message or "Macro imported successfully."
+end
+
 callbacks.onAutoAbilityChanged = function(enabled)
     if destroyed then return false, "Script đã đóng." end
     AutoAbilityController:SetEnabled(enabled)
@@ -9646,10 +10539,10 @@ end
 
 callbacks.onExportMap = function(path)
     local _, active = SaveManager:GetActiveFile()
-    if not active then return false, "Hay tao/chon Map truoc." end
-    local filePath = cleanMapFileName(path)
-    if not filePath then return false, "Duong dan file khong hop le." end
-    if type(writefile) ~= "function" then return false, "Moi truong khong ho tro writefile." end
+    if not active then return false, "Create or select a map first." end
+    local safeName = tostring(active.MapName or "Map"):gsub('[\\/:*?"<>|]', "_")
+    local filePath = cleanMapFileName(path or ("duy_maps/" .. safeName .. ".json"))
+    if not filePath then return false, "Invalid export path." end
     local mapData = {
         Version = "2.7",
         Name = tostring(active.MapName or "Map"),
@@ -9658,35 +10551,82 @@ callbacks.onExportMap = function(path)
         RoutePoints = active.RoutePoints,
     }
     local valid, reason = validateMapData(mapData)
-    if not valid then return false, "Khong the Export: " .. reason end
-    local ok, err = pcall(function()
-        local folder = filePath:match("^(.*)/[^/]+$")
-        if folder and folder ~= "" and type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(folder) then
-            makefolder(folder)
+    if not valid then return false, "Cannot export: " .. reason end
+    local encoded = HttpService:JSONEncode(mapData)
+    if type(writefile) ~= "function" then
+        if type(setclipboard) == "function" then
+            local copied, copyError = pcall(setclipboard, encoded)
+            if copied then return true, "Map JSON copied to clipboard (file saving is unavailable)." end
+            return false, "Clipboard export failed: " .. tostring(copyError)
         end
-        writefile(filePath, HttpService:JSONEncode(mapData))
-    end)
-    if not ok then return false, "Export loi: " .. tostring(err) end
-    return true, "Export thanh cong: " .. filePath
+        return false, "This executor supports neither writefile nor clipboard export."
+    end
+    local function tryWrite(destination)
+        local folder = destination:match("^(.*)/[^/]+$")
+        if folder and folder ~= "" and type(isfolder) == "function" and type(makefolder) == "function" then
+            local folderOK, exists = pcall(isfolder, folder)
+            if folderOK and not exists then
+                local made, makeErr = pcall(makefolder, folder)
+                if not made then error(makeErr) end
+            end
+        end
+        writefile(destination, encoded)
+    end
+    local ok, err = pcall(tryWrite, filePath)
+    if not ok and not path then
+        filePath = safeName .. ".json"
+        ok, err = pcall(tryWrite, filePath)
+    end
+    if not ok then
+        if type(setclipboard) == "function" then
+            local copyOK = pcall(setclipboard, encoded)
+            if copyOK then return true, "Map JSON copied to clipboard; file write failed: " .. tostring(err) end
+        end
+        return false, "Export failed: " .. tostring(err)
+    end
+    local copied = false
+    if type(setclipboard) == "function" then
+        local clipboardOK = pcall(setclipboard, encoded)
+        copied = clipboardOK == true
+    end
+    local exportMessage = "Map JSON exported to " .. filePath .. (copied and " and copied to clipboard." or ".")
+    if api and api.setMapOperationStatus then api.setMapOperationStatus(exportMessage, true) end
+    return true, exportMessage
 end
 
-callbacks.onImportMap = function(path)
-    local filePath = cleanMapFileName(path)
-    if not filePath then return false, "Duong dan file khong hop le." end
-    if type(readfile) ~= "function" or type(isfile) ~= "function" then
-        return false, "Moi truong khong ho tro readfile/isfile."
+callbacks.onValidateMapImport = function(raw)
+    if type(raw) ~= "string" or trim(raw) == "" then return false, "Paste map JSON first." end
+    local decodedOK, imported = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not decodedOK or type(imported) ~= "table" then return false, "Invalid JSON object." end
+    local validationCopy = table.clone(imported)
+    if type(validationCopy.Name) ~= "string" or trim(validationCopy.Name) == "" then
+        validationCopy.Name = "ImportValidation"
     end
-    if not isfile(filePath) then return false, "Khong tim thay file: " .. filePath end
-    local okRead, raw = pcall(readfile, filePath)
-    if not okRead or type(raw) ~= "string" then return false, "Khong doc duoc file JSON." end
+    local valid, reason = validateMapData(validationCopy)
+    if not valid then return false, "Map JSON rejected: " .. reason end
+    return true, string.format("Valid map JSON · %d route points", #validationCopy.RoutePoints)
+end
+
+callbacks.onImportMapData = function(raw, requestedName)
+    if type(raw) ~= "string" or trim(raw) == "" then return false, "Paste map JSON first." end
     local okDecode, imported = pcall(function() return HttpService:JSONDecode(raw) end)
-    if not okDecode then return false, "JSON khong hop le." end
+    if not okDecode or type(imported) ~= "table" then return false, "Invalid JSON object." end
+
+    local requested = trim(requestedName or "")
+    if requested == "" then
+        local suffix = 1
+        repeat
+            requested = "Map" .. tostring(suffix)
+            suffix += 1
+        until not SaveManager:NameExists(requested) or suffix > 10000
+    end
+    if SaveManager:NameExists(requested) then return false, "A map with this name already exists. Choose another name." end
+
+    imported.Name = requested
     local valid, reason = validateMapData(imported)
-    if not valid then return false, "Import bi tu choi: " .. reason end
-    -- Prepare all values first. A valid import becomes a new SaveManager map file,
-    -- so the currently selected map is never overwritten accidentally.
+    if not valid then return false, "Map JSON rejected: " .. reason end
     local staged = {
-        MapName = imported.Name,
+        MapName = requested,
         SpawnPoint = { X = tonumber(imported.SpawnPoint.X), Y = tonumber(imported.SpawnPoint.Y), Z = tonumber(imported.SpawnPoint.Z) },
         DestinationPoint = { X = tonumber(imported.DestinationPoint.X), Y = tonumber(imported.DestinationPoint.Y), Z = tonumber(imported.DestinationPoint.Z) },
         RoutePoints = {},
@@ -9694,32 +10634,57 @@ callbacks.onImportMap = function(path)
     for _, point in ipairs(imported.RoutePoints) do
         table.insert(staged.RoutePoints, { X = tonumber(point.X), Y = tonumber(point.Y), Z = tonumber(point.Z) })
     end
-    if SaveManager:NameExists(staged.MapName) then
-        return false, "Ten Map da ton tai trong File Manager. Hay doi ten file JSON roi Import lai."
-    end
     local created, activeKey = SaveManager:CreateFile(staged.MapName)
-    if not created then return false, "Khong tao duoc Map moi: " .. tostring(activeKey) end
+    if not created then return false, "Could not create map: " .. tostring(activeKey) end
     local _, active = SaveManager:GetActiveFile()
-    if not active then return false, "Khong kich hoat duoc Map vua Import." end
+    if not active then
+        SaveManager:DeleteFile(activeKey)
+        return false, "Could not activate imported map."
+    end
     active.MapName = staged.MapName
     active.SpawnPoint = staged.SpawnPoint
     active.DestinationPoint = staged.DestinationPoint
     active.RoutePoints = staged.RoutePoints
-    -- New file starts with default Settings; map import never imports personal settings.
-    SaveManager:UpdateActivePoints(Vector3.new(staged.SpawnPoint.X, staged.SpawnPoint.Y, staged.SpawnPoint.Z), Vector3.new(staged.DestinationPoint.X, staged.DestinationPoint.Y, staged.DestinationPoint.Z))
+    SaveManager:UpdateActivePoints(
+        Vector3.new(staged.SpawnPoint.X, staged.SpawnPoint.Y, staged.SpawnPoint.Z),
+        Vector3.new(staged.DestinationPoint.X, staged.DestinationPoint.Y, staged.DestinationPoint.Z)
+    )
     local routeVectors = {}
     for _, point in ipairs(staged.RoutePoints) do
         table.insert(routeVectors, Vector3.new(point.X, point.Y, point.Z))
     end
     SaveManager:UpdateActiveRoute(routeVectors)
     MapManager:LoadFromFile(active)
+    local persistenceOK, persistenceError = SaveManager:Persist()
+    local persistenceNote = ""
+    if SaveManager:HasPersistence() and not persistenceOK then
+        persistenceNote = " · Imported in memory, but local save failed: " .. tostring(persistenceError)
+    elseif not SaveManager:HasPersistence() then
+        persistenceNote = " · Session only (file persistence unavailable)"
+    end
     if api then
         api.setSpawnLabel(MapManager:GetSpawn())
         api.setDestinationLabel(MapManager:GetDestination())
-        api.setRouteStatus(tostring(#MapManager:GetRoute()) .. " diem - IMPORTED")
+        api.setRouteStatus(tostring(#MapManager:GetRoute()) .. " points · IMPORTED")
         api.setSelectedKey(activeKey)
+        if api.setMapOperationStatus then
+            api.setMapOperationStatus("Imported map: " .. staged.MapName .. persistenceNote, true)
+        end
     end
-    return true, "Import thanh cong: " .. staged.MapName
+    return true, activeKey, "Map imported successfully: " .. staged.MapName .. persistenceNote
+end
+
+callbacks.onImportMap = function(path)
+    local filePath = cleanMapFileName(path)
+    if not filePath then return false, "Invalid import path." end
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then
+        return false, "This executor does not support readfile/isfile. Use Import JSON paste instead."
+    end
+    local existsOK, exists = pcall(isfile, filePath)
+    if not existsOK or not exists then return false, "File not found: " .. filePath end
+    local okRead, raw = pcall(readfile, filePath)
+    if not okRead or type(raw) ~= "string" then return false, "Could not read JSON file." end
+    return callbacks.onImportMapData(raw, "")
 end
 
 callbacks.onCreateFile = function(name)
@@ -9851,8 +10816,8 @@ matchWatchConnection = RunService.Heartbeat:Connect(function(dt)
     local endStamp = tonumber(ctx:GetAttribute("GameEndTime")) or 0
     if ctx ~= matchWatchContext or startStamp ~= matchWatchStart then
         matchWatchContext, matchWatchStart, matchWatchEnded = ctx, startStamp, false
-        if startStamp > 0 and endStamp <= 0 and api and api.notify then
-            api.notify("TRẬN ĐẤU ĐÃ BẮT ĐẦU", Color3.fromRGB(91, 169, 255))
+        if startStamp > 0 and endStamp <= 0 then
+            notifyMatchStartedOnce(ctx)
         end
     end
     if startStamp > 0 and endStamp > 0 and not matchWatchEnded then
@@ -10177,6 +11142,11 @@ local teleportResumeToken = 0
 local heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
     if destroyed then return end
 
+    local activeMatchContext = getActiveMacroMatchContext()
+    if activeMatchContext and isMacroMatchActive(activeMatchContext) then
+        notifyMatchStartedOnce(activeMatchContext)
+    end
+
     local root = getHRP()
     if root then
         if autoFollowEnabled and lastObservedPosition and not manualMovementActive() then
@@ -10227,6 +11197,6 @@ local heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
 end)
 table.insert(runtimeConnections, heartbeatConnection)
 
-print("[DUY SYSTEM] V2.19 da khoi dong - Hybrid Macro Recorder (Hook nhieu duong + Observer du phong).")
-print("[DUY SYSTEM] Record route: bat dau tai Spawn, di theo tuyen, Stop gan Destination.")
-print("[DUY SYSTEM] External movement pause API: PlayerGui.DuySystemMovementOverride:Fire(true/false)")
+print("[ChenFuWei] Hybrid Macro Recorder initialized.")
+print("[ChenFuWei] Route recording: start at Spawn, follow the route, stop near Destination.")
+print("[ChenFuWei] Movement pause API: PlayerGui.DuySystemMovementOverride:Fire(true/false)")
