@@ -5335,6 +5335,7 @@ local MacroEngine = {
     _replayScheduleOffset = 0,
     _replayLeadSeconds = 0, -- số giây thực chạy sớm; chuyển đổi theo TickSpeed khi Replay
     _replayFailedActions = {},
+    _preflightSkipActions = {}, -- Action khong an toan/bi lap duoc bo qua rieng, khong chan ca Macro
     _sellSentRuntimeIds = {}, -- chặn gửi SellUnit lần hai cho cùng Runtime ID trong một trận
     OrderMap = {},
     _runtimeIdClaimed = {},
@@ -9780,6 +9781,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
     self._pendingOrderMappings = {}
 
     self._waitingQueue = actions
+    local preflightSkipActions = self._preflightSkipActions or {}
     notifyMatchStartedOnce(ctx)
     if api and api.notify then api.notify("Macro started · replay", Color3.fromRGB(50, 200, 110), "ChenFuWei") end
     if api then
@@ -9799,6 +9801,25 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
             if isMacroContextEnded(ctx) then
                 self:_finishReplayMatch(ctx, "Trận kết thúc trong lúc Replay")
                 break
+            end
+
+            local skipReason = preflightSkipActions[index]
+            if skipReason then
+                attempted += 1
+                failedCount += 1
+                table.insert(self._replayFailedActions, {
+                    Index = index, Type = tostring(action.Type),
+                    TargetTime = math.max(0, tonumber(action.Time) or 0),
+                    ActualTime = getMacroElapsed(ctx), Delay = 0,
+                    Reason = skipReason, SkippedBeforeReplay = true,
+                })
+                if api then
+                    api.setMacroStatus(string.format(
+                        "SKIPPED ACTION %d/%d · %s · các Action tiếp theo vẫn tiếp tục FIFO",
+                        index, #actions, skipReason), false)
+                end
+                task.wait()
+                continue
             end
 
             local recordedTargetTime = math.max(0, tonumber(action.Time) or 0)
@@ -9933,6 +9954,7 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
     -- Preflight theo schema ID + Action + Time. Mỗi ID chỉ được dùng sau PlaceUnit tương ứng.
     local recordedIds = {}
     local soldIds = {}
+    local preflightSkipActions = {}
     local idActionTypes = { SellUnit = true, UpgradeUnit = true, ToggleAutoUpgrade = true, LockUnit = true }
     for index, action in ipairs(actions) do
         if type(action) ~= "table" or type(action.Type) ~= "string" then
@@ -9968,10 +9990,18 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
                     .. " tham chiếu ID chưa được Place trước đó: " .. tostring(action.ID)
             end
             if soldIds[id] then
-                return false, action.Type .. " Action " .. tostring(index)
-                    .. " tham chiếu ID " .. tostring(id) .. " đã Sell trước đó."
+                if action.Type == "SellUnit" then
+                    -- Một SellUnit lặp cho cùng Record ID không được chặn toàn bộ Replay.
+                    -- Đánh dấu đúng Action này để scheduler bỏ qua, không gửi Sell lần hai.
+                    preflightSkipActions[index] = "SellUnit ID " .. tostring(id)
+                        .. " đã được Sell trước đó; bỏ qua thao tác trùng."
+                else
+                    return false, action.Type .. " Action " .. tostring(index)
+                        .. " tham chiếu ID " .. tostring(id) .. " đã Sell trước đó."
+                end
             end
-            if self._remoteReplaySignatureSafe and self._remoteReplaySignatureSafe[action.Type] == false then
+            if not preflightSkipActions[index]
+                and self._remoteReplaySignatureSafe and self._remoteReplaySignatureSafe[action.Type] == false then
                 return false, action.Type .. " Remote có chữ ký tham số không tương thích JSON Type/Time/ID. Xem REMOTE ARGS trong Diagnostics."
             end
             if action.Type == "UpgradeUnit" and not self._remote.UpgradeUnit then
@@ -10001,6 +10031,7 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
         end
     end
 
+    self._preflightSkipActions = preflightSkipActions
     self._autoRepeatArmed = true -- không phụ thuộc Auto Play Again
     self._waitingNextMatch = true
     self._replayState = "WAITING_FOR_MATCH"
@@ -10096,6 +10127,7 @@ function MacroEngine:StopPlay(reason)
     self._runtimeIdClaimed = {}
     self._pendingOrderMappings = {}
     self._sellSentRuntimeIds = {}
+    self._preflightSkipActions = {}
     self._replayScheduleOffset = 0
     self:_disconnectMacroLifecycleWatchers()
     if api then
@@ -10434,6 +10466,7 @@ function MacroEngine:Destroy()
     self._waitingQueue = {}
     self._replayState = "IDLE"
     self._replayBlockedIndex = nil
+    self._preflightSkipActions = {}
     self._activeReplayContext = nil
     stopMacroGameClock()
 
