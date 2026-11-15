@@ -2326,13 +2326,9 @@ do
         {"SAVED MAP FILES", "SAVED MAP FILES"},
         {"MAP FILE (vi du: duy_maps/Map_A.json)", "MAP FILE (auto-saved under duy_maps/)"},
         {"Current Map: -- | Route Points: 0 | Status: NOT READY", "Current map: -- | Route points: 0 | Status: NOT READY"},
-        {"Target: --  |  HP: --
-Route progress: --", "Target: --  |  HP: --
-Route progress: --"},
+        {"Target: --  |  HP: --\nRoute progress: --", "Target: --  |  HP: --\nRoute progress: --"},
         {"Boss: chua cau hinh", "Boss: not configured"},
-        {"Boss monitor: chua cau hinh
-Theo doi theo Max HP", "Boss monitor: not configured
-Tracking by maximum HP"},
+        {"Boss monitor: chua cau hinh\nTheo doi theo Max HP", "Boss monitor: not configured\nTracking by maximum HP"},
         {"Nhap webhook cua ban. URL chi giu trong bo nho script hien tai; dong script se mat URL.", "Enter your Discord webhook. The URL stays in memory only and is cleared when the script closes."},
         {"Webhook: chua cau hinh", "Webhook: not configured"},
         {"Bao cao ket qua tran va Boss khi duoc xac nhan bi ha.", "Reports match results and confirmed boss defeats."},
