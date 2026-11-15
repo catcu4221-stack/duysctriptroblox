@@ -1488,9 +1488,11 @@ do
         return self._noclip
     end
 
-    LP.CharacterAdded:Connect(function(character)
+    PlayerController._characterConnection = LP.CharacterAdded:Connect(function(character)
         task.spawn(function()
+            if PlayerController._shutdown then return end
             local humanoid = character:WaitForChild("Humanoid", 10)
+            if PlayerController._shutdown then return end
             character:WaitForChild("HumanoidRootPart", 10)
             if humanoid then
                 humanoid.WalkSpeed = CONFIG.BASE_WALK_SPEED * PlayerController._speed
@@ -2245,7 +2247,7 @@ do
                     return
                 end
                 if GUI._notify then
-                    GUI._notify(tostring(title) .. (state and " đã bật." or " đã tắt."), state and Color3.fromRGB(50, 200, 110) or Color3.fromRGB(200, 200, 205), "DUY SYSTEM")
+                    GUI._notify(tostring(title) .. (state and " đã bật." or " đã tắt."), state and Color3.fromRGB(50, 200, 110) or Color3.fromRGB(200, 200, 205), "ChenFuWei")
                 end
             end
         end
@@ -2362,19 +2364,34 @@ do
         return setValue, function() return current end
     end
 
-    local function makeDraggable(handle, target)
+    -- makeDraggable(handle, target, options)
+    --   handle/target: hành vi cũ (thanh tiêu đề, logo) giữ nguyên.
+    --   options.extraHandles: thêm vùng nền được phép kéo (sidebar/content) dùng CHUNG một trạng thái kéo.
+    --   options.canStart(input): trả false nếu điểm bấm nằm trên điều khiển (nút, TextBox, thanh cuộn...).
+    local function makeDraggable(handle, target, options)
         local dragging = false
         local dragStart
         local startPosition
+        local dragType
+        options = options or {}
 
-        handle.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                dragStart = input.Position
-                startPosition = target.Position
+        local function beginDrag(input, gated)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
             end
-        end)
+            if dragging then return end
+            if gated and options.canStart and not options.canStart(input) then return end
+            dragging = true
+            dragType = input.UserInputType
+            dragStart = input.Position
+            startPosition = target.Position
+        end
+
+        handle.InputBegan:Connect(function(input) beginDrag(input, false) end)
+        for _, extra in ipairs(options.extraHandles or {}) do
+            extra.InputBegan:Connect(function(input) beginDrag(input, true) end)
+        end
 
         local moveConnection = UserInputService.InputChanged:Connect(function(input)
             if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
@@ -2392,6 +2409,7 @@ do
             if input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch then
                 dragging = false
+                dragType = nil
             end
         end)
         table.insert(GUI._connections, endConnection)
@@ -2477,7 +2495,7 @@ do
             BorderSizePixel = 0,
         }, header)
 
-        makeLabel(header, "DUY TARGET FIRST  |  V2.19", UDim2.new(0, 15, 0, 0), UDim2.new(1, -120, 1, 0), {
+        makeLabel(header, "ChenFuWei", UDim2.new(0, 15, 0, 0), UDim2.new(1, -120, 1, 0), {
             Font = Enum.Font.GothamBold,
             TextSize = 14,
             Color = C.ACCENT,
@@ -2493,15 +2511,45 @@ do
             TextColor = C.RED,
         })
 
-        local logo = makeButton(screen, "D", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
-            TextSize = 23,
+        local logo = makeButton(screen, "CFW", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
+            TextSize = 14,
             Background = Color3.fromRGB(18, 39, 70),
             TextColor = C.ACCENT,
             Radius = 27,
         })
         logo.Visible = false
 
-        makeDraggable(header, window)
+        -- Chỉ cho phép kéo từ NỀN TRỐNG: bỏ qua nếu điểm bấm nằm trên nút/TextBox (kể cả Slider hitbox),
+        -- thanh cuộn, hoặc (với cảm ứng) vùng ScrollingFrame để không tranh chấp với cuộn nội dung.
+        local function isEmptyBackgroundPoint(input)
+            local point = UserInputService:GetMouseLocation()
+            local isTouch = input.UserInputType == Enum.UserInputType.Touch
+            for _, object in ipairs(window:GetDescendants()) do
+                local interactive = object:IsA("GuiButton") or object:IsA("TextBox")
+                local scroller = object:IsA("ScrollingFrame")
+                if interactive or scroller then
+                    local visible = true
+                    local node = object
+                    while node and node ~= window do
+                        if node:IsA("GuiObject") and not node.Visible then visible = false break end
+                        node = node.Parent
+                    end
+                    if visible then
+                        local pos, size = object.AbsolutePosition, object.AbsoluteSize
+                        local inside = point.X >= pos.X and point.X <= pos.X + size.X
+                            and point.Y >= pos.Y and point.Y <= pos.Y + size.Y
+                        if inside then
+                            if interactive or isTouch then return false end
+                            -- Chuột trong ScrollingFrame: chặn riêng dải thanh cuộn.
+                            local barWidth = (tonumber(object.ScrollBarThickness) or 0) + 4
+                            if point.X >= pos.X + size.X - barWidth then return false end
+                        end
+                    end
+                end
+            end
+            return true
+        end
+
         makeDraggable(logo, logo)
 
         local function collapseMenu()
@@ -2537,6 +2585,12 @@ do
             Size = UDim2.new(1, -126, 1, -66),
             BackgroundTransparency = 1,
         }, window)
+
+        -- sidebar/content đã tồn tại tại đây; header + hai vùng nền dùng chung một trạng thái kéo.
+        makeDraggable(header, window, {
+            extraHandles = { sidebar, content },
+            canStart = isEmptyBackgroundPoint,
+        })
 
         local statusBar = newInstance("Frame", {
             Position = UDim2.new(0, 0, 1, -24),
@@ -2599,7 +2653,7 @@ do
                 Position = UDim2.new(0, 13, 0, 6),
                 Size = UDim2.new(1, -22, 0, 19),
                 BackgroundTransparency = 1,
-                Text = tostring(title or "DUY SYSTEM"),
+                Text = tostring(title or "ChenFuWei"),
                 TextColor3 = Color3.fromRGB(240, 240, 245),
                 TextTransparency = 1,
                 Font = Enum.Font.GothamBold,
@@ -2687,12 +2741,27 @@ do
         -- TAB MAIN MOI: CAC DIEU KHIEN CHUNG
         -- ============================================================
         local globalMain = tabFrames[1]
+        -- Vùng nội dung MAIN là ScrollingFrame: cửa sổ giữ nguyên kích thước, phần dư (Automation) cuộn dọc.
+        local mainScroll = newInstance("ScrollingFrame", {
+            Name = "MainScroll",
+            Position = UDim2.new(0, 0, 0, 0),
+            Size = UDim2.new(1, 0, 1, 0),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ScrollBarThickness = 4,
+            ScrollBarImageColor3 = C.ACCENT,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            CanvasSize = UDim2.new(0, 0, 0, 0),
+            AutomaticCanvasSize = Enum.AutomaticSize.None,
+            Active = true,
+            ScrollingEnabled = true,
+        }, globalMain)
         local globalPanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
-            Size = UDim2.new(1, -24, 1, -24),
+            Size = UDim2.new(1, -28, 0, 486), -- chiều cao = vị trí đáy nội dung thấp nhất (440 + 34) + đệm; rộng chừa chỗ thanh cuộn
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
-        }, globalMain)
+        }, mainScroll)
         addCorner(globalPanel, 9)
         makeLabel(globalPanel, "MAIN CONTROL", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
@@ -2872,6 +2941,21 @@ do
             applyGameSpeed(activeGameSpeed == 3 and 1 or 3)
         end)
         refreshGameSpeedButtons()
+
+        -- CanvasSize theo đáy thực tế của các phần tử nằm trong globalPanel (đều dùng Y offset),
+        -- không đặt cứng một số không liên quan tới nội dung.
+        local function fitMainCanvas()
+            local bottom = 0
+            for _, child in ipairs(globalPanel:GetChildren()) do
+                if child:IsA("GuiObject") and child.Size.Y.Scale == 0 and child.Position.Y.Scale == 0 then
+                    bottom = math.max(bottom, child.Position.Y.Offset + child.Size.Y.Offset)
+                end
+            end
+            local panelHeight = math.max(bottom + 12, 120)
+            globalPanel.Size = UDim2.new(1, -28, 0, panelHeight)
+            mainScroll.CanvasSize = UDim2.new(0, 0, 0, panelHeight + 24)
+        end
+        fitMainCanvas()
 
         -- ============================================================
         -- TAB MACRO: TAO FILE / DROPDOWN / JSON / RECORD / PLAY
@@ -9603,7 +9687,11 @@ callbacks.onClose = function()
     -- MacroEngine khóa scheduler + chuyển hook thành pass-through trước khi GUI bị hủy.
     pcall(function() if MacroEngine then MacroEngine:Destroy() end end)
 
+    -- Tắt cờ Automation trước để mọi callback/task đã lên lịch (resume Auto Follow, scanner...) tự thoát.
+    autoFollowEnabled = false
+    autoPlayScannerEnabled = false
     antiAfkEnabled = false
+    pcall(function() AutoAbilityController:SetEnabled(false) end)
     if antiAfkConnection then
         pcall(function() antiAfkConnection:Disconnect() end)
         antiAfkConnection = nil
@@ -9613,9 +9701,17 @@ callbacks.onClose = function()
         pcall(function() RouteRecorder._connection:Disconnect() end)
         RouteRecorder._connection = nil
     end
-    pcall(function() MovementController:Stop() end)
+    pcall(function() RouteRecorder.Recording = false end)
+    pcall(function() MovementController:Stop() end) -- Stop() cũng đặt SetSpeed(1)
     pcall(function() MatchScanner:Stop() end)
+    -- Player Control: trả va chạm + WalkSpeed về mặc định rồi gỡ listener respawn của script.
     pcall(function() PlayerController:SetNoclip(false) end)
+    pcall(function() PlayerController:SetSpeed(1) end)
+    PlayerController._shutdown = true
+    if PlayerController._characterConnection then
+        pcall(function() PlayerController._characterConnection:Disconnect() end)
+        PlayerController._characterConnection = nil
+    end
     pcall(function() PerformanceManager:Destroy() end)
     pcall(function() EnemyDetector:Destroy() end)
     for _, connection in ipairs(runtimeConnections) do
