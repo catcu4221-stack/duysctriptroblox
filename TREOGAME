@@ -9681,44 +9681,63 @@ callbacks.onAutoSkipChanged = function(enabled)
 end
 
 callbacks.onClose = function()
+    -- Bước 1: đánh dấu Shutdown (chỉ chạy một lần); mọi callback/task kiểm tra `destroyed` sẽ tự thoát.
     if destroyed then return end
     destroyed = true
 
-    -- MacroEngine khóa scheduler + chuyển hook thành pass-through trước khi GUI bị hủy.
-    pcall(function() if MacroEngine then MacroEngine:Destroy() end end)
+    -- Mỗi bước được bọc pcall riêng để một thành phần lỗi không chặn các thành phần còn lại.
+    local function step(fn) pcall(fn) end
 
-    -- Tắt cờ Automation trước để mọi callback/task đã lên lịch (resume Auto Follow, scanner...) tự thoát.
+    -- Bước 2: Macro. Destroy() khóa scheduler/token Replay, Auto Repeat, Waiting Next Match, Game Clock,
+    -- watcher vòng đời, chuyển Hook thành pass-through và lưu Record (một lần) theo quy trình sẵn có.
+    step(function() if MacroEngine then MacroEngine:Destroy() end end)
+
+    -- Bước 3: Automation. Tắt cờ trước để callback đã lên lịch (resume Auto Follow, scanner...) tự thoát.
     autoFollowEnabled = false
     autoPlayScannerEnabled = false
     antiAfkEnabled = false
-    pcall(function() AutoAbilityController:SetEnabled(false) end)
-    if antiAfkConnection then
-        pcall(function() antiAfkConnection:Disconnect() end)
+    step(function() AutoAbilityController:SetEnabled(false) end)
+    step(function()
+        if antiAfkConnection then antiAfkConnection:Disconnect() end
         antiAfkConnection = nil
-    end
-    if RouteRecorder and RouteRecorder._connection then
-        RouteRecorder.Recording = false
-        pcall(function() RouteRecorder._connection:Disconnect() end)
-        RouteRecorder._connection = nil
-    end
-    pcall(function() RouteRecorder.Recording = false end)
-    pcall(function() MovementController:Stop() end) -- Stop() cũng đặt SetSpeed(1)
-    pcall(function() MatchScanner:Stop() end)
-    -- Player Control: trả va chạm + WalkSpeed về mặc định rồi gỡ listener respawn của script.
-    pcall(function() PlayerController:SetNoclip(false) end)
-    pcall(function() PlayerController:SetSpeed(1) end)
+    end)
+    step(function()
+        if RouteRecorder then
+            RouteRecorder.Recording = false
+            if RouteRecorder._connection then
+                RouteRecorder._connection:Disconnect()
+                RouteRecorder._connection = nil
+            end
+        end
+    end)
+    step(function() MovementController:Stop() end) -- Stop() cũng đặt SetSpeed(1)
+    step(function() MatchScanner:Stop() end)
+
+    -- Bước 4: Player Control: trả va chạm + WalkSpeed về mặc định rồi gỡ listener respawn của script.
+    step(function() PlayerController:SetNoclip(false) end)
+    step(function() PlayerController:SetSpeed(1) end)
     PlayerController._shutdown = true
-    if PlayerController._characterConnection then
-        pcall(function() PlayerController._characterConnection:Disconnect() end)
+    step(function()
+        if PlayerController._characterConnection then PlayerController._characterConnection:Disconnect() end
         PlayerController._characterConnection = nil
-    end
-    pcall(function() PerformanceManager:Destroy() end)
-    pcall(function() EnemyDetector:Destroy() end)
+    end)
+
+    -- Bước 5: Runtime (Workspace/Lighting của Performance, Workspace của Enemy Detector, RunService,
+    -- UserInputService, movementOverride...).
+    step(function() PerformanceManager:Destroy() end)
+    step(function() EnemyDetector:Destroy() end)
     for _, connection in ipairs(runtimeConnections) do
-        pcall(function() connection:Disconnect() end)
+        step(function() connection:Disconnect() end)
     end
     table.clear(runtimeConnections)
-    pcall(function() GUI:Destroy() end)
+
+    -- Bước 6-7: GUI connections + ScreenGui (logo thu nhỏ là con của ScreenGui nên bị xóa cùng).
+    step(function() GUI:Destroy() end)
+    -- Chỉ dọn đúng ScreenGui do script tạo nếu còn sót (không đụng GUI khác).
+    step(function()
+        local leftover = PlayerGui:FindFirstChild("DuySystem")
+        if leftover then leftover:Destroy() end
+    end)
 end
 
 callbacks.onSetSpawn = function()
