@@ -3792,7 +3792,7 @@ do
             end,
             setMacroRecordPreview = function(key, raw, actionCount)
                 if selectedMacroKey == key then
-                    macroJsonBox.Text = tostring(raw or "[]")
+                    -- Chỉ cập nhật bộ đếm; không thay TextBox bằng toàn bộ JSON mỗi Action.
                     local data = MacroStore:GetFile(key)
                     local name = data and data.Name or "Macro"
                     macroFileStatus.Text = string.format("Macro file: %s | Actions: %d (RECORDING · chưa lưu file)",
@@ -4762,37 +4762,32 @@ function MacroEngine:_queueAction(action, eventTime, reservedSeq)
     action.Time = elapsed
     action.EventSeq = seq
     action._EventSeq = seq
-    -- Hook confirmation can arrive after later observer events. Insert by reserved
-    -- EventSeq so the saved JSON follows the original action order, not callback finish order.
-    local insertAt = #self.Actions + 1
-    for index, existing in ipairs(self.Actions) do
-        local existingSeq = tonumber(existing.EventSeq or existing._EventSeq) or math.huge
-        if seq < existingSeq then
-            insertAt = index
-            break
-        end
-    end
-    table.insert(self.Actions, insertAt, action)
-    if self.Recording and self._recordKey and api and api.setMacroRecordPreview then
-        local cleanActions = {}
-        for _, source in ipairs(self.Actions) do
-            local clean = {}
-            for field, value in pairs(source) do
-                if type(field) ~= "string" or field:sub(1, 1) ~= "_" then
-                    clean[field] = value
-                end
+
+    -- Fast path: phần lớn Action đến theo thứ tự EventSeq nên nối cuối O(1).
+    -- Chỉ tìm vị trí chèn khi một Hook/Observer hoàn tất trễ hơn EventSeq đã ghi.
+    local last = self.Actions[#self.Actions]
+    local lastSeq = last and tonumber(last.EventSeq or last._EventSeq) or nil
+    if not last or (lastSeq ~= nil and seq >= lastSeq) then
+        table.insert(self.Actions, action)
+    else
+        local insertAt = #self.Actions + 1
+        for index, existing in ipairs(self.Actions) do
+            local existingSeq = tonumber(existing.EventSeq or existing._EventSeq) or math.huge
+            if seq < existingSeq then
+                insertAt = index
+                break
             end
-            cleanActions[#cleanActions + 1] = clean
         end
-        local previewOK, previewJSON = pcall(function()
-            return HttpService:JSONEncode(cleanActions)
-        end)
-        if previewOK then
-            pcall(api.setMacroRecordPreview, self._recordKey, previewJSON, #self.Actions)
-        end
+        table.insert(self.Actions, insertAt, action)
     end
-    if self.Recording and api and api.setMacroStatus then
-        api.setMacroStatus(string.format("RECORDING · %d Action · Game Time %.2fs", #self.Actions, getMacroElapsed(self._recordContext)), true)
+
+    -- Không JSONEncode và không đẩy toàn bộ JSON vào TextBox sau từng Action.
+    -- JSON hoàn chỉnh chỉ được cập nhật một lần khi Stop/Save; GUI vẫn hiển thị bộ đếm.
+    local actionCount = #self.Actions
+    if self.Recording and api and api.setMacroStatus
+        and (actionCount <= 3 or actionCount % 10 == 0) then
+        api.setMacroStatus(string.format("RECORDING · %d Action · Game Time %.2fs",
+            actionCount, getMacroElapsed(self._recordContext)), true)
     end
     return action
 end
@@ -5314,13 +5309,46 @@ end
 --]]
 function MacroEngine:_isPlayerUnit(model)
     if not model or not model.Parent then return false end
-    -- Cách 1: OwnedIndicator child (một số game dùng)
-    if model:FindFirstChild("OwnedIndicator") then return true end
-    -- Cách 2: Attribute Owner hoặc UserId
-    local owner = model:GetAttribute("Owner") or model:GetAttribute("UserId")
-    if owner ~= nil then
-        return tostring(owner) == LP.Name or tostring(owner) == tostring(LP.UserId)
+
+    local function matchesLocalOwner(value)
+        if typeof(value) == "Instance" then
+            if value:IsA("Player") then return value == LP end
+            if value:IsA("ObjectValue") then
+                return value.Value == LP
+            end
+            if value:IsA("ValueBase") then
+                value = value.Value
+            else
+                return false
+            end
+        end
+        if type(value) == "number" then
+            return value == LP.UserId
+        end
+        if type(value) == "string" then
+            return value == LP.Name or value == tostring(LP.UserId)
+        end
+        return false
     end
+
+    -- Owner/UserId phải xác nhận đúng LocalPlayer; không coi "có marker" là của mình.
+    for _, attributeName in ipairs({ "Owner", "UserId" }) do
+        local owner = model:GetAttribute(attributeName)
+        if owner ~= nil then
+            return matchesLocalOwner(owner)
+        end
+    end
+
+    for _, childName in ipairs({ "Owner", "UserId", "OwnedIndicator" }) do
+        local marker = model:FindFirstChild(childName, true)
+        if marker and marker:IsA("ValueBase") then
+            if matchesLocalOwner(marker) then return true end
+            -- Marker có dữ liệu nhưng không chỉ LocalPlayer: không suy đoán là Unit của mình.
+            if childName ~= "OwnedIndicator" then return false end
+        end
+    end
+
+    -- OwnedIndicator dạng BoolValue chỉ báo có marker, không chứng minh chủ sở hữu.
     return false
 end
 
@@ -5566,7 +5594,12 @@ function MacroEngine:_captureTrackedLevel(trackedInfo, newLevel, eventTime)
             local upgradeSchemaUnsafe = self._remoteReplaySignatureSafe
                 and self._remoteReplaySignatureSafe.UpgradeUnit == false
 
-            if not suppressedByHookMarker and not suppressedByUpgradeAll and not upgradeSchemaUnsafe then
+            local upgradeHookAvailable = self._remoteCaptureReady
+                and self._remoteCaptureReady.UpgradeUnit == true
+            local allowLevelObserverFallback = self._recordMode == "OBSERVER" or not upgradeHookAvailable
+
+            if not suppressedByHookMarker and not suppressedByUpgradeAll and not upgradeSchemaUnsafe
+                and allowLevelObserverFallback then
                 local actionTime = (pending and tonumber(pending.Time)) or elapsed or getMacroElapsed()
                 local actionSeq = pending and tonumber(pending.EventSeq) or self:_reserveEventSeq()
                 if trackedInfo.recordedPlace then
@@ -5596,6 +5629,15 @@ function MacroEngine:_captureTrackedLevel(trackedInfo, newLevel, eventTime)
                         LevelConfirmed = true,
                         ConfirmSource = pending and "LEVEL+REMOTE" or "LEVEL_OBSERVER_FALLBACK",
                     })
+                end
+            elseif not suppressedByHookMarker and not suppressedByUpgradeAll and not upgradeSchemaUnsafe
+                and self._recordMode == "HOOK" and upgradeHookAvailable then
+                -- Trong HOOK mode, Level chỉ xác nhận request đã có từ Hook; không tự sinh
+                -- UpgradeUnit cho thay đổi Level không gắn với thao tác UpgradeUnit đã bắt.
+                if not trackedInfo._levelFallbackFiltered then
+                    trackedInfo._levelFallbackFiltered = true
+                    self:_diag("FILTER", "Bỏ Level transition không có Hook request cho ID "
+                        .. tostring(trackedInfo.id) .. "; giữ nguyên các Upgrade request đã được Hook bắt.")
                 end
             elseif suppressedByUpgradeAll then
                 self:_diag("UPGRADE_ALL", "Gộp Level của ID " .. tostring(unitId)
@@ -5627,6 +5669,9 @@ function MacroEngine:_watchLevel(model, trackedInfo)
         if previousState == nextState then return end
         if not (self.Recording or self._recordState == "SAVING") or self._savingRecord or self._recordClosing then return end
         if trackedInfo.autoUpgradeTransitionPending == true then return end
+        local toggleHookAvailable = self._remoteCaptureReady
+            and self._remoteCaptureReady.ToggleAutoUpgrade == true
+        if self._recordMode == "HOOK" and toggleHookAvailable then return end
         if self._remoteReplaySignatureSafe and self._remoteReplaySignatureSafe.ToggleAutoUpgrade == false then
             self:_diag("TOGGLE", "Không ghi ToggleAutoUpgrade fallback vì Remote có tham số ngoài schema JSON ID/Type/Time.")
             return
@@ -5949,6 +5994,40 @@ function MacroEngine:_onEntityAdded(model)
     if not model or not model:IsA("Model") then return end
     if self._trackedUnits[model] then return end  -- đã xử lý
 
+    -- HOOK mode: lọc ngay Entity không liên quan tới Place request vừa được Hook bắt.
+    -- Tránh tạo hàng loạt task chờ Owner/ID cho các Model sinh ra tự động hoặc của người khác.
+    if self._recordMode == "HOOK" then
+        local unitName = tostring(model.Name or "")
+        if unitName:sub(1, 5) ~= "unit_" then return end
+        local modelId = getMacroEntityId(model)
+        local nowClock = os.clock()
+        local hasRecentHookPlace = false
+        for _, request in ipairs(self._pendingPlaceRequests or {}) do
+            local age = nowClock - (tonumber(request.Clock) or nowClock)
+            if request.Unit == unitName and age >= 0 and age <= 8 then
+                hasRecentHookPlace = true
+                break
+            end
+        end
+        if not hasRecentHookPlace then
+            for _, action in ipairs(self.Actions or {}) do
+                if action.Type == "PlaceUnit" and action.Unit == unitName then
+                    if not action._idResolved then
+                        local requestClock = tonumber(action._RequestClock)
+                        if requestClock and nowClock - requestClock >= 0 and nowClock - requestClock <= 8 then
+                            hasRecentHookPlace = true
+                            break
+                        end
+                    elseif modelId and tonumber(action.ID) == tonumber(modelId) then
+                        hasRecentHookPlace = true
+                        break
+                    end
+                end
+            end
+        end
+        if not hasRecentHookPlace then return end
+    end
+
     -- V2.23: chụp mốc thời gian NGAY khi Model xuất hiện, trước mọi lần chờ.
     local detectTime = getMacroElapsed()
     local detectClock = os.clock()
@@ -5975,7 +6054,8 @@ function MacroEngine:_onEntityAdded(model)
     local hadPending = self:_hasPendingPlaceMatch(model)
     -- Một Place chỉ cần fallback khi chính event này không khớp request/action do Hook tạo.
     -- Không dùng tổng Hook hit từ thao tác trước để khóa Observer cho các Place sau.
-    local detectSeq = (not hadPending) and self:_reserveEventSeq() or nil
+    local detectSeq = (self._recordMode == "OBSERVER" and not hadPending)
+        and self:_reserveEventSeq() or nil
 
     -- Chờ dữ liệu Owner, ID, Position trong tối đa 5 giây chỉ cho candidate hợp lệ.
     local id, pos = self:_waitForUnitReady(model, os.clock() + 5)
@@ -5987,21 +6067,22 @@ function MacroEngine:_onEntityAdded(model)
     end
 
     if id and pos then
-        self:_registerTrackedUnit(model, id, pos, detectClock)
-        -- Owner/ID có thể chỉ xuất hiện sau khi Hook đã nhận request; kiểm tra lại ở thời điểm
-        -- đã có đủ dữ liệu để tránh tạo Place fallback trùng với request vừa replicate.
+        -- Ở Delta/HOOK, chỉ Model khớp một Place request do Hook bắt được mới được đưa
+        -- vào UnitTracker. Entity không liên quan không được biến thành Place/Upgrade Action.
         local matchedHookPlace = self:_hasPendingPlaceMatch(model, pos)
-        local observerRecord = detectSeq ~= nil and not matchedHookPlace
-        if observerRecord and self._recordMode ~= "OBSERVER" then
-            self._hookLiveFailed = self._hookLiveFailed or {}
-            self._hookLiveFailed.PlaceUnit = true
-            self:_diag("HOOK", "PlaceUnit fallback theo Model: event này không có request Place tương ứng từ Hook; "
-                .. "ghi Observer cho riêng Unit ID " .. tostring(id) .. ".")
-            if api then
-                api.setMacroStatus("PlaceUnit Hook không bắt được event này → đã dùng Observer riêng cho Unit này. "
-                    .. self:GetHookSummary(), false)
+        if self._recordMode == "HOOK" and not matchedHookPlace then
+            self._filteredUncorrelatedEntities = (tonumber(self._filteredUncorrelatedEntities) or 0) + 1
+            if self._filteredUncorrelatedEntities <= 5 then
+                self:_diag("FILTER", "Bỏ qua Model " .. tostring(model.Name)
+                    .. " ID " .. tostring(id) .. ": không có Place request tương ứng từ Hook.")
             end
+            return
         end
+
+        self:_registerTrackedUnit(model, id, pos, detectClock)
+        -- Observer chỉ tự tạo Place fallback khi Hook không khả dụng và Recorder chạy OBSERVER.
+        local observerRecord = self._recordMode == "OBSERVER"
+            and detectSeq ~= nil and not matchedHookPlace
         if observerRecord and not self._recordClosing then
             local info = self._trackedUnits[model]
             if info and info.spawnedDuringRecord and not info.recordedPlace
@@ -6653,6 +6734,7 @@ function MacroEngine:_activateRecordForContext(ctx)
     self._diagLog = {}
     self._modelDumpCount = 0
     self._levelScanDiagCount = 0
+    self._filteredUncorrelatedEntities = 0
     self._hookLiveFailed = {}
     if self._recordHookReady then self._recordMode = "HOOK" end
 
@@ -7183,18 +7265,6 @@ function MacroEngine:_cancelPendingUpgradeRequest(request)
                 end
             end
         end
-        if api and api.setMacroRecordPreview and self._recordKey then
-            local cleanActions = {}
-            for _, source in ipairs(self.Actions) do
-                local clean = {}
-                for field, value in pairs(source) do
-                    if type(field) ~= "string" or field:sub(1, 1) ~= "_" then clean[field] = value end
-                end
-                cleanActions[#cleanActions + 1] = clean
-            end
-            local previewOK, previewJSON = pcall(function() return HttpService:JSONEncode(cleanActions) end)
-            if previewOK then pcall(api.setMacroRecordPreview, self._recordKey, previewJSON, #self.Actions) end
-        end
     end
     self:_finishPendingUpgradeRequest(request)
 end
@@ -7375,34 +7445,10 @@ function MacroEngine:_recordRemote(remote, args, eventTime, response, eventSeq, 
                 action.Valid = true
                 action._idResolved = true
                 self:_markRecordedPlace(resolvedId, action)
-                if api and api.setMacroRecordPreview and self._recordKey then
-                    local cleanActions = {}
-                    for _, source in ipairs(self.Actions) do
-                        local clean = {}
-                        for field, value in pairs(source) do
-                            if type(field) ~= "string" or field:sub(1, 1) ~= "_" then clean[field] = value end
-                        end
-                        cleanActions[#cleanActions + 1] = clean
-                    end
-                    local previewOK, previewJSON = pcall(function() return HttpService:JSONEncode(cleanActions) end)
-                    if previewOK then pcall(api.setMacroRecordPreview, self._recordKey, previewJSON, #self.Actions) end
-                end
             else
                 action.ID = 0
                 action.Valid = false
                 action._idResolved = true
-                if api and api.setMacroRecordPreview and self._recordKey then
-                    local cleanActions = {}
-                    for _, source in ipairs(self.Actions) do
-                        local clean = {}
-                        for field, value in pairs(source) do
-                            if type(field) ~= "string" or field:sub(1, 1) ~= "_" then clean[field] = value end
-                        end
-                        cleanActions[#cleanActions + 1] = clean
-                    end
-                    local previewOK, previewJSON = pcall(function() return HttpService:JSONEncode(cleanActions) end)
-                    if previewOK then pcall(api.setMacroRecordPreview, self._recordKey, previewJSON, #self.Actions) end
-                end
                 if api then
                     api.setMacroStatus("Không ánh xạ được ID cho " .. tostring(unitId)
                         .. (err and (": " .. tostring(err)) or "; PlaceUnit bị đánh dấu Valid=false."), false)
@@ -7885,18 +7931,6 @@ function MacroEngine:Init()
                         transition.UpgradeCost = pendingUpgradeRequest.UpgradeCost
                     end
                 end
-            end
-            if api and api.setMacroRecordPreview and self._recordKey then
-                local cleanActions = {}
-                for _, source in ipairs(self.Actions) do
-                    local clean = {}
-                    for field, value in pairs(source) do
-                        if type(field) ~= "string" or field:sub(1, 1) ~= "_" then clean[field] = value end
-                    end
-                    cleanActions[#cleanActions + 1] = clean
-                end
-                local previewOK, previewJSON = pcall(function() return HttpService:JSONEncode(cleanActions) end)
-                if previewOK then pcall(api.setMacroRecordPreview, self._recordKey, previewJSON, #self.Actions) end
             end
         end
         if acceptingRecord and trackedMacroRemote then
