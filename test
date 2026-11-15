@@ -1,0 +1,252 @@
+-- Garden Tower Defense: Direct Remote Speed Controller (x1 - x5, không cần UI game)
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local UI_NAME = "GTD_DirectSpeedUI"
+local targetParent = (gethui and gethui()) or CoreGui or PlayerGui
+if targetParent:FindFirstChild(UI_NAME) then
+	targetParent[UI_NAME]:Destroy()
+end
+
+local SpeedOptions = { 1, 2, 3, 4, 5 }
+local selectedIdx = 5 -- Mặc định x5
+local autoSpeedEnabled = false
+local lastSendTime = 0
+
+-- ================= 1. TÌM REMOTE & CONTEXT HỆ THỐNG =================
+local cachedSettingRemote = nil
+
+local function GetGameSettingRemote()
+	if cachedSettingRemote and cachedSettingRemote.Parent then
+		return cachedSettingRemote
+	end
+	for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+		if (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")) and obj.Name == "GameSetting" then
+			cachedSettingRemote = obj
+			return obj
+		end
+	end
+	return nil
+end
+
+local function GetActiveContext()
+	local contexts = Workspace:FindFirstChild("Contexts")
+	if not contexts then return nil end
+
+	local bestCtx, bestScore = nil, -1
+	for _, ctx in ipairs(contexts:GetChildren()) do
+		local tdNum = tonumber(ctx.Name:match("(%d+)$")) or 0
+		local score = tdNum * 1000
+		local endTime = ctx:GetAttribute("GameEndTime")
+		local baseHP = ctx:GetAttribute("BaseHP_1") or 0
+
+		if (not endTime or endTime == 0) and baseHP > 0 then
+			score = score + 10000000000
+		end
+		if score > bestScore then
+			bestScore = score
+			bestCtx = ctx
+		end
+	end
+	return bestCtx
+end
+
+-- ================= 2. GỬI LỆNH TỐC ĐỘ TRỰC TIẾP LÊN SERVER =================
+local function FireSettingPayload(remote, ...)
+	local args = { ... }
+	task.spawn(function()
+		pcall(function()
+			if remote:IsA("RemoteEvent") then
+				remote:FireServer(unpack(args))
+			elseif remote:IsA("RemoteFunction") then
+				remote:InvokeServer(unpack(args))
+			end
+		end)
+	end)
+end
+
+local function ApplyDirectSpeed(targetSpeed, forceImmediate)
+	local now = tick()
+	if not forceImmediate and (now - lastSendTime < 1.2) then
+		return
+	end
+	lastSendTime = now
+
+	-- 1. Gọi API GTD.SetSpeed nếu script chính đang chạy kèm
+	local gtdEnv = (getgenv and getgenv().GTD) or _G.GTD
+	if gtdEnv and type(gtdEnv.SetSpeed) == "function" then
+		pcall(function() gtdEnv.SetSpeed(targetSpeed) end)
+	end
+
+	-- 2. Gửi thẳng qua Remote GameSetting (bỏ qua toàn bộ UI Cài đặt)
+	local remote = GetGameSettingRemote()
+	local activeCtx = GetActiveContext()
+
+	if remote then
+		-- Cấu trúc chuẩn của GameSetting trong GTD
+		FireSettingPayload(remote, "TickSpeed", targetSpeed)
+		FireSettingPayload(remote, "GameSpeed", targetSpeed)
+		if activeCtx then
+			FireSettingPayload(remote, activeCtx, "TickSpeed", targetSpeed)
+		end
+	end
+
+	-- 3. Đồng bộ thuộc tính TickSpeed cục bộ để client render mượt ở mức 4x-5x
+	pcall(function()
+		if Workspace:GetAttribute("TickSpeed") ~= targetSpeed then
+			Workspace:SetAttribute("TickSpeed", targetSpeed)
+		end
+	end)
+end
+
+-- ================= 3. TẠO MENU GUI (MODERN BASIC) =================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = UI_NAME
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = targetParent
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 220, 0, 130)
+MainFrame.Position = UDim2.new(0.5, -110, 0.18, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(28, 30, 36)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 8)
+
+local UIStroke = Instance.new("UIStroke", MainFrame)
+UIStroke.Color = Color3.fromRGB(65, 70, 85)
+UIStroke.Thickness = 1.5
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, 0, 0, 30)
+TitleLabel.BackgroundColor3 = Color3.fromRGB(38, 41, 50)
+TitleLabel.BorderSizePixel = 0
+TitleLabel.Text = "GTD Direct Speed"
+TitleLabel.TextColor3 = Color3.fromRGB(240, 240, 245)
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextSize = 13
+TitleLabel.Parent = MainFrame
+Instance.new("UICorner", TitleLabel).CornerRadius = UDim.new(0, 8)
+
+local SelectorFrame = Instance.new("Frame")
+SelectorFrame.Size = UDim2.new(0.9, 0, 0, 36)
+SelectorFrame.Position = UDim2.new(0.05, 0, 0, 40)
+SelectorFrame.BackgroundColor3 = Color3.fromRGB(42, 45, 55)
+SelectorFrame.Parent = MainFrame
+Instance.new("UICorner", SelectorFrame).CornerRadius = UDim.new(0, 6)
+
+local PrevBtn = Instance.new("TextButton")
+PrevBtn.Size = UDim2.new(0, 32, 1, 0)
+PrevBtn.BackgroundColor3 = Color3.fromRGB(55, 60, 75)
+PrevBtn.Text = "<"
+PrevBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+PrevBtn.Font = Enum.Font.GothamBold
+PrevBtn.TextSize = 14
+PrevBtn.Parent = SelectorFrame
+Instance.new("UICorner", PrevBtn).CornerRadius = UDim.new(0, 6)
+
+local NextBtn = Instance.new("TextButton")
+NextBtn.Size = UDim2.new(0, 32, 1, 0)
+NextBtn.Position = UDim2.new(1, -32, 0, 0)
+NextBtn.BackgroundColor3 = Color3.fromRGB(55, 60, 75)
+NextBtn.Text = ">"
+NextBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+NextBtn.Font = Enum.Font.GothamBold
+NextBtn.TextSize = 14
+NextBtn.Parent = SelectorFrame
+Instance.new("UICorner", NextBtn).CornerRadius = UDim.new(0, 6)
+
+local SpeedLabel = Instance.new("TextLabel")
+SpeedLabel.Size = UDim2.new(1, -68, 1, 0)
+SpeedLabel.Position = UDim2.new(0, 34, 0, 0)
+SpeedLabel.BackgroundTransparency = 1
+SpeedLabel.Text = "Tốc độ: x" .. tostring(SpeedOptions[selectedIdx])
+SpeedLabel.TextColor3 = Color3.fromRGB(255, 75, 75)
+SpeedLabel.Font = Enum.Font.GothamSemibold
+SpeedLabel.TextSize = 13
+SpeedLabel.Parent = SelectorFrame
+
+local AutoBtn = Instance.new("TextButton")
+AutoBtn.Size = UDim2.new(0.9, 0, 0, 36)
+AutoBtn.Position = UDim2.new(0.05, 0, 0, 84)
+AutoBtn.BackgroundColor3 = Color3.fromRGB(180, 55, 55)
+AutoBtn.Text = "Auto Speed: OFF"
+AutoBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoBtn.Font = Enum.Font.GothamBold
+AutoBtn.TextSize = 13
+AutoBtn.Parent = MainFrame
+Instance.new("UICorner", AutoBtn).CornerRadius = UDim.new(0, 6)
+
+-- ================= 4. TỰ ĐỘNG DUY TRÌ KHI SANG VÁN MỚI =================
+-- Bắt sự kiện khi server đổi TickSpeed về 1 lúc bắt đầu trận mới
+Workspace:GetAttributeChangedSignal("TickSpeed"):Connect(function()
+	if autoSpeedEnabled then
+		local target = SpeedOptions[selectedIdx]
+		if Workspace:GetAttribute("TickSpeed") ~= target then
+			task.wait(0.3)
+			ApplyDirectSpeed(target, false)
+		end
+	end
+end)
+
+-- Bắt sự kiện khi Context trận mới được tạo hoặc bắt đầu đếm giờ
+local contextsFolder = Workspace:WaitForChild("Contexts")
+local function HookContextSpeed(ctx)
+	ctx:GetAttributeChangedSignal("GameStartTime"):Connect(function()
+		if autoSpeedEnabled then
+			task.wait(0.5)
+			ApplyDirectSpeed(SpeedOptions[selectedIdx], true)
+		end
+	end)
+end
+
+for _, ctx in ipairs(contextsFolder:GetChildren()) do
+	HookContextSpeed(ctx)
+end
+contextsFolder.ChildAdded:Connect(function(newCtx)
+	HookContextSpeed(newCtx)
+	if autoSpeedEnabled then
+		task.wait(0.8)
+		ApplyDirectSpeed(SpeedOptions[selectedIdx], true)
+	end
+end)
+
+-- ================= 5. ĐIỀU KHIỂN NÚT MENU =================
+local function updateDisplay()
+	local spd = SpeedOptions[selectedIdx]
+	SpeedLabel.Text = "Tốc độ: x" .. tostring(spd)
+	SpeedLabel.TextColor3 = (spd >= 4) and Color3.fromRGB(255, 75, 75) or Color3.fromRGB(255, 215, 100)
+	if autoSpeedEnabled then
+		ApplyDirectSpeed(spd, true)
+	end
+end
+
+PrevBtn.MouseButton1Click:Connect(function()
+	selectedIdx = (selectedIdx - 2) % #SpeedOptions + 1
+	updateDisplay()
+end)
+
+NextBtn.MouseButton1Click:Connect(function()
+	selectedIdx = (selectedIdx % #SpeedOptions) + 1
+	updateDisplay()
+end)
+
+AutoBtn.MouseButton1Click:Connect(function()
+	autoSpeedEnabled = not autoSpeedEnabled
+	if autoSpeedEnabled then
+		AutoBtn.BackgroundColor3 = Color3.fromRGB(45, 165, 85)
+		AutoBtn.Text = "Auto Speed: ON"
+		ApplyDirectSpeed(SpeedOptions[selectedIdx], true)
+	else
+		AutoBtn.BackgroundColor3 = Color3.fromRGB(180, 55, 55)
+		AutoBtn.Text = "Auto Speed: OFF"
+		ApplyDirectSpeed(1, true) -- Trả về x1 khi tắt
+	end
+end)
