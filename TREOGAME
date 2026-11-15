@@ -3286,6 +3286,11 @@ do
             end)
         end
 
+        -- Keo cua so tu vung nen cua noi dung va thanh tab, ngoai header.
+        -- Cac nut/tab con van nhan click rieng, khong bi doi thanh thao tac keo.
+        makeDraggable(content, window)
+        makeDraggable(sidebar, window)
+
         local tabNames = isMobileLayout
             and { "MAIN", "TARGET", "MACRO", "WEBHOOK", "PERF", "INFO" }
             or { "MAIN", "TARGET", "MACRO", "WEBHOOK", "PERF", "INFO" }
@@ -3302,19 +3307,22 @@ do
                 })
             tabButtons[index] = tabButton
 
-            local frameClass = index == 2 and "ScrollingFrame" or "Frame"
+            -- MAIN va TARGET deu la ScrollingFrame: automation co the dai hon viewport,
+            -- khong tran khoi cua so va khong de menu bi keo dai theo noi dung.
+            local frameClass = (index == 1 or index == 2) and "ScrollingFrame" or "Frame"
             local frameProperties = {
                 Size = UDim2.new(1, 0, 1, 0),
                 BackgroundTransparency = 1,
                 Visible = index == 1,
             }
-            if index == 2 then
-                frameProperties.CanvasSize = UDim2.new(0, 0, 0, 540)
+            if index == 1 or index == 2 then
+                frameProperties.CanvasSize = UDim2.new(0, 0, 0, index == 1 and 560 or 540)
                 frameProperties.ScrollBarThickness = 4
                 frameProperties.ScrollBarImageColor3 = C.ACCENT
                 frameProperties.ScrollingDirection = Enum.ScrollingDirection.Y
                 frameProperties.Active = true
                 frameProperties.ClipsDescendants = true
+                frameProperties.AutomaticCanvasSize = Enum.AutomaticSize.None
             end
             local frame = newInstance(frameClass, frameProperties, content)
             tabFrames[index] = frame
@@ -3341,7 +3349,7 @@ do
         local globalMain = tabFrames[1]
         local globalPanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
-            Size = UDim2.new(1, -24, 1, -24),
+            Size = UDim2.new(1, -24, 0, 510),
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, globalMain)
@@ -10458,7 +10466,12 @@ callbacks.onClose = function()
     -- MacroEngine khóa scheduler + chuyển hook thành pass-through trước khi GUI bị hủy.
     pcall(function() if MacroEngine then MacroEngine:Destroy() end end)
 
+    -- Tat tat ca co che tu dong truoc khi ngat cac ket noi nen.
+    autoFollowEnabled = false
+    autoPlayScannerEnabled = false
     antiAfkEnabled = false
+    pcall(function() if AutoAbilityController then AutoAbilityController:SetEnabled(false) end end)
+    pcall(function() if RouteRecorder then RouteRecorder.Recording = false end end)
     if antiAfkConnection then
         pcall(function() antiAfkConnection:Disconnect() end)
         antiAfkConnection = nil
@@ -10471,13 +10484,26 @@ callbacks.onClose = function()
     pcall(function() MovementController:Stop() end)
     pcall(function() MatchScanner:Stop() end)
     pcall(function() PlayerController:SetNoclip(false) end)
+    pcall(function() PlayerController:SetSpeed(1) end)
     pcall(function() PerformanceManager:Destroy() end)
     pcall(function() EnemyDetector:Destroy() end)
+    -- Huy cac watcher phu neu module co expose Stop/Destroy.
+    for _, controller in ipairs({TargetSelector, BossTracker, AutoAbilityController}) do
+        if controller then
+            pcall(function() if controller.Stop then controller:Stop() end end)
+            pcall(function() if controller.Destroy then controller:Destroy() end end)
+        end
+    end
     for _, connection in ipairs(runtimeConnections) do
         pcall(function() connection:Disconnect() end)
     end
     table.clear(runtimeConnections)
     pcall(function() GUI:Destroy() end)
+    -- X dong script: an logo/ScreenGui bi huy, khong con UI nao co the bat lai chuc nang.
+    pcall(function()
+        local gui = PlayerGui:FindFirstChild("ChenFuWei")
+        if gui then gui:Destroy() end
+    end)
 end
 
 callbacks.onSetSpawn = function()
