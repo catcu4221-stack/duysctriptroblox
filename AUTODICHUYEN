@@ -22,7 +22,7 @@ local DEST_MAX_HP = 250 -- Bỏ qua HP nhà chính
 
 local AppState = {
     IsActive = false,
-    ScanRadius = 30,
+    ScanRadius = 60,
     FleeDistance = 20,
     InForbiddenZone = false,
     ManualOverride = false, -- V8: true khi người chơi đang kéo joystick/bấm phím di chuyển
