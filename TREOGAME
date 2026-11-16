@@ -15,7 +15,7 @@
       - Macro FIFO nghiêm ngặt theo Game Clock × TickSpeed; chỉ chạy ở trận kế tiếp.
       - Lưu payload PlaceUnit gốc, Remote args và trạng thái serializer; không bịa dữ liệu Banana.
       - Record Upgrade theo Hook correlation + xác nhận Level; fallback có timeout và drain trước khi lưu.
-      - Record Sell xác nhận bằng Remote + Model removal; Observer fallback cần Model removal + Cash tăng gần thời điểm đó.
+      - Record Sell chỉ ghi khi có lời gọi Remote SellUnit tường minh; không suy luận Sell từ Model removal/Cash tăng.
       - Record tuyen duong bang vi tri nguoi choi; KHONG phat lai chuyen dong.
       - Boss scanner theo MaxHP; chi gui thong bao khi HP ve 0 duoc xac nhan.
       - Tab WEBHOOK: URL duoc luu cuc bo de tu nap lai; co nut RESET DISCORD LINK.
@@ -7580,78 +7580,21 @@ function MacroEngine:_onEntityRemoved(model)
     local info = self._trackedUnits[model]
     if not info then return end
 
-    -- OBSERVER fallback: chỉ ghi Sell khi đúng Model của Unit trong Macro biến mất
-    -- VÀ có Cash tăng gần thời điểm đó. Cash tăng một mình không đủ chứng minh Sell.
-    if self.Recording and not self._savingRecord
-        and info.recordedPlace and info.spawnedDuringRecord
-        and not isKnownSummonedCompanionName(info.name) and not info.sellRecorded
-        and not (self._sellRecordedIds and self._sellRecordedIds[info.id])
-        and not info.sellPending and not info.sellHookPending then
-        local ctx = self._recordContext
-        local endedStamp = tonumber(ctx and ctx:GetAttribute("GameEndTime")) or 0
-        local baseHP = tonumber(ctx and ctx:GetAttribute("BaseHP_1"))
-        if ctx and ctx.Parent and endedStamp <= 0 and not (baseHP ~= nil and baseHP <= 0) then
-            info.sellPending = true
-            self._pendingSellChecks = (tonumber(self._pendingSellChecks) or 0) + 1
-            local recordKey = self._recordKey
-            local removedAt = os.clock()
-            local removedGameTime = getMacroElapsed()
-            local removedEventSeq = self:_reserveEventSeq()
-            task.spawn(function()
-                -- V2.27: Model của Tower do Macro Place biến mất giữa trận (Context còn sống) = Sell.
-                local confirmedCash = nil
-                -- Cash refund có thể replicate sau khi Model bị xóa; cho Observer một cửa sổ ngắn
-                -- để đối chiếu. Không dùng deadline=removedAt vì khi đó vòng lặp không chạy.
-                local deadline = removedAt + 2.0
-                while os.clock() < deadline and self._recordKey == recordKey do
-                    local increases = self._recentCashIncreases or {}
-                    local bestIndex, bestDistance = nil, math.huge
-                    for index, recent in ipairs(increases) do
-                        local stamp = tonumber(recent.Time) or 0
-                        local distance = math.abs(stamp - removedAt)
-                        if not recent.Consumed and stamp >= removedAt - 1.5 and stamp <= os.clock()
-                            and (recent.After or 0) > (recent.Before or 0)
-                            and distance < bestDistance then
-                            bestIndex, bestDistance = index, distance
-                        end
-                    end
-                    if bestIndex then
-                        local recent = increases[bestIndex]
-                        recent.Consumed = true
-                        confirmedCash = recent
-                        break
-                    end
-                    local currentContext = self._recordContext
-                    local endStamp = tonumber(currentContext and currentContext:GetAttribute("GameEndTime")) or 0
-                    local currentBaseHP = tonumber(currentContext and currentContext:GetAttribute("BaseHP_1"))
-                    if not currentContext or not currentContext.Parent or endStamp > 0
-                        or (currentBaseHP ~= nil and currentBaseHP <= 0) then break end
-                    task.wait(0.05)
-                end
-                self._sellRecordedIds = self._sellRecordedIds or {}
-                if confirmedCash and self._recordKey == recordKey and not info.sellRecorded
-                    and not self._sellRecordedIds[info.id] then
-                    -- Khóa theo ID trước khi tạo Action: Hook và Observer không thể cùng ghi Sell.
-                    self._sellRecordedIds[info.id] = true
-                    info.sellRecorded = true
-                    self:_queueAction({
-                        ID = info.id, Type = "SellUnit", Unit = info.name, Position = info.posStr,
-                        Valid = true, RecordMode = "OBSERVER", TimeSource = "MODEL_REMOVED+CASH_INCREASE",
-                        SellConfirmSource = "MODEL_REMOVED+CASH_INCREASE",
-                        CashBefore = confirmedCash.Before, CashAfter = confirmedCash.After,
-                        Refund = confirmedCash.Delta,
-                        SellWarning = "Observer fallback: Model biến mất và Cash tăng gần cùng thời điểm; vẫn có thể trùng với nguồn tiền khác.",
-                    }, removedGameTime, removedEventSeq)
-                    self._recordedPlaceIds[info.id] = nil
-                    self:_diag("SELL", "ID " .. tostring(info.id) .. " " .. tostring(info.name)
-                        .. ": xác nhận bằng Model removal + Cash tăng " .. tostring(confirmedCash.Delta) .. ".")
-                else
-                    self:_diag("SELL", "ID " .. tostring(info.id) .. " " .. tostring(info.name)
-                        .. ": Model biến mất nhưng không có Cash tăng tương quan; không ghi Sell để tránh nhận nhầm cleanup/địch.")
-                end
-                info.sellPending = false
-                self._pendingSellChecks = math.max(0, (tonumber(self._pendingSellChecks) or 1) - 1)
-            end)
+    -- V2.31.1 SELL GUARD:
+    -- Model removal + Cash increase is NOT sufficient evidence of a player Sell.
+    -- Some newer Units replace/rebuild their Model during spawn/initialization, while
+    -- ordinary match income can increase Cash in the same short window. Inferring Sell
+    -- from those two unrelated signals created false SellUnit Actions and marked the
+    -- tracked Unit as sold, which then suppressed its later Upgrade Actions.
+    -- SellUnit is now recorded ONLY by the explicit SellUnit Remote hook below.
+    if self.Recording and not self._savingRecord and info.recordedPlace
+        and info.spawnedDuringRecord and not info.sellRecorded then
+        if info.sellHookPending then
+            self:_diag("SELL", "Model " .. tostring(info.name) .. " ID " .. tostring(info.id)
+                .. " biến mất trong lúc Remote SellUnit đang chạy; chờ Hook ghi nhận Remote.")
+        else
+            self:_diag("ENTITY_REMOVE", "Model " .. tostring(info.name) .. " ID " .. tostring(info.id)
+                .. " biến mất nhưng không có Remote SellUnit tương ứng; xem là lifecycle/replace, KHÔNG ghi Sell.")
         end
     end
 
@@ -7821,58 +7764,7 @@ function MacroEngine:_startObserver(context)
     self._placedModels      = {}
     self._towerObjById      = {}
     self._lastTowerTableScanClock = -math.huge
-    self._recentCashIncreases = {}
-    self._observerCashValue = readMacroCash()
-
-    -- Cash observer chỉ ghi nhận biến động tăng để làm tín hiệu phụ cho Sell ở chế độ OBSERVER.
-    -- Không dùng Cash một mình để kết luận Sell; bắt buộc phải có Model của đúng Unit biến mất.
-    local function bindCashValue(cashValue)
-        if not cashValue or not (cashValue:IsA("IntValue") or cashValue:IsA("NumberValue") or cashValue:IsA("StringValue")) then return end
-        local function readCashNumber()
-            local raw = cashValue.Value
-            if type(raw) == "string" then raw = raw:gsub("[,%s%$]", "") end
-            return tonumber(raw)
-        end
-        self._observerCashValue = readCashNumber() or self._observerCashValue
-        local cashConn = cashValue:GetPropertyChangedSignal("Value"):Connect(function()
-            local nextValue = readCashNumber()
-            local previous = tonumber(self._observerCashValue)
-            self._observerCashValue = nextValue
-            if nextValue and previous and nextValue > previous then
-                local increases = self._recentCashIncreases or {}
-                self._recentCashIncreases = increases
-                local now = os.clock()
-                -- Giữ nhiều thay đổi gần nhất; không để một khoản tiền khác ghi đè hoàn tiền Sell.
-                for index = #increases, 1, -1 do
-                    if now - (tonumber(increases[index].Time) or 0) > 5 then
-                        table.remove(increases, index)
-                    end
-                end
-                table.insert(increases, {
-                    Time = now, Before = previous, After = nextValue,
-                    Delta = nextValue - previous, Consumed = false,
-                })
-                while #increases > 24 do table.remove(increases, 1) end
-            end
-        end)
-        table.insert(self._observerConnections, cashConn)
-    end
-    local leaderstats = LP:FindFirstChild("leaderstats")
-    if leaderstats then
-        bindCashValue(leaderstats:FindFirstChild("Cash"))
-        table.insert(self._observerConnections, leaderstats.ChildAdded:Connect(function(child)
-            if child.Name == "Cash" then bindCashValue(child) end
-        end))
-    else
-        table.insert(self._observerConnections, LP.ChildAdded:Connect(function(child)
-            if child.Name == "leaderstats" then
-                bindCashValue(child:FindFirstChild("Cash") or child:WaitForChild("Cash", 3))
-                table.insert(self._observerConnections, child.ChildAdded:Connect(function(cash)
-                    if cash.Name == "Cash" then bindCashValue(cash) end
-                end))
-            end
-        end))
-    end
+    -- Cash changes are no longer used to infer SellUnit. Only the explicit Remote hook may record Sell.
 
     local entities = getMacroEntities(context)
     if not entities then
@@ -7985,7 +7877,6 @@ function MacroEngine:_stopObserver()
     table.clear(self._pendingPlaceRequests)
     table.clear(self._placedModels)
     self._towerObjById = {}
-    self._recentCashIncreases = {}
 end
 
 function MacroEngine:_disconnectMacroLifecycleWatchers()
@@ -8338,6 +8229,13 @@ function MacroEngine:_saveRecord(reason)
                 end
             elseif action.ID ~= nil then
                 clean.ID = action.ID
+                if action.Type == "SellUnit" then
+                    -- Store provenance so Replay can distinguish explicit Sell requests
+                    -- from older JSON created by the unsafe ModelRemoved+Cash heuristic.
+                    if action.Unit then clean.Unit = action.Unit end
+                    clean.SellSource = action.SellSource == "EXPLICIT_REMOTE"
+                        and "EXPLICIT_REMOTE" or "LEGACY_UNVERIFIED"
+                end
             end
             table.insert(cleanActions, clean)
         end
@@ -8973,6 +8871,7 @@ function MacroEngine:_recordRemote(remote, args, eventTime, response, eventSeq, 
             self:_queueAction({
                 ID = id, Type = "SellUnit", Unit = info and info.name or nil, Position = info and info.posStr or nil,
                 Valid = true, RecordMode = "HOOK", TimeSource = "REMOTE",
+                SellSource = "EXPLICIT_REMOTE",
             }, elapsed, eventSeq)
         end
     elseif remote == self._remote.ActivateUnitAbility then
@@ -10566,8 +10465,15 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
                 return false, action.Type .. " Action " .. tostring(index)
                     .. " tham chiếu ID chưa được Place trước đó: " .. tostring(action.ID)
             end
-            if soldIds[id] then
-                -- Sell trung hoac Upgrade/Lock/Toggle sau Sell deu la thao tac stale.
+            if action.Type == "SellUnit" and action.SellSource ~= "EXPLICIT_REMOTE" then
+                -- Older JSON did not preserve Sell provenance. Its Sell may have been
+                -- inferred from Model removal + unrelated income, so fail safe: skip it
+                -- without marking the Unit sold. Later Upgrade/Toggle/Lock Actions remain
+                -- eligible and the whole Macro continues.
+                preflightSkipActions[index] = "SellUnit ID " .. tostring(id)
+                    .. " thiếu nguồn Remote xác thực (JSON cũ); bỏ qua để tránh bán nhầm Unit."
+            elseif soldIds[id] then
+                -- Sell trùng hoac Upgrade/Lock/Toggle sau Sell deu la thao tac stale.
                 -- Chi bo qua Action lien quan; khong chan ca Macro nhu ban cu.
                 preflightSkipActions[index] = action.Type .. " ID " .. tostring(id)
                     .. " đã Sell trước đó; bỏ qua Action này."
@@ -10585,7 +10491,9 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
                     return false, "JSON có LockUnit nhưng game không có Remote LockUnit tương thích. " .. self:GetHookSummary()
                 end
             end
-            if action.Type == "SellUnit" then soldIds[id] = true end
+            if action.Type == "SellUnit" and not preflightSkipActions[index] then
+                soldIds[id] = true
+            end
         elseif action.Type == "UpgradeAll" or action.Type == "SellAll" or action.Type == "ActivateUnitAbility" then
             -- UpgradeAll/SellAll không dùng ID; Ability cũ sẽ được bỏ qua.
             if action.Type == "UpgradeAll" and self._remoteReplaySignatureSafe
