@@ -1,5 +1,5 @@
 --[[
-    DUY TARGET FIRST SYSTEM - V2.30 HYBRID RECORDER / MATCH CLOCK / SHUTDOWN FIX
+    DUY TARGET FIRST SYSTEM - V2.31 SUMMON FILTER / REPLAY PREFLIGHT / DISCORD REPORT
     Phien ban danh cho du an Roblox do ban so huu / co quyen chinh sua.
 
     Chuc nang:
@@ -18,7 +18,8 @@
       - Record Sell xác nhận bằng Remote + Model removal; Observer fallback cần Model removal + Cash tăng gần thời điểm đó.
       - Record tuyen duong bang vi tri nguoi choi; KHONG phat lai chuyen dong.
       - Boss scanner theo MaxHP; chi gui thong bao khi HP ve 0 duoc xac nhan.
-      - Tab WEBHOOK: URL chi giu trong RAM cua script.
+      - Tab WEBHOOK: URL chi giu trong RAM; gui Macro/Map JSON va bao cao WIN/DEFEAT.
+      - Match report: dem tran trong phien Play Macro, WIN/LOSS, thoi gian, Cash/Seeds/Damage.
 
     LUU Y QUAN TRONG:
       1. writefile/readfile la API cua mot so moi truong; Roblox Studio LocalScript
@@ -119,6 +120,70 @@ local function postDiscordPayload(payload)
         return false, "Discord tra ve HTTP " .. tostring(statusCode)
     end
     return true, "Da gui request toi Discord."
+end
+
+-- Gui tep JSON truc tiep qua Discord webhook bang multipart/form-data.
+-- Khong can tao file tren may; MacroStore/SaveManager cung cap noi dung trong RAM.
+local function postDiscordFile(fileName, fileContent, caption, embedColor)
+    if not savedWebhookUrl then
+        return false, "Hay SAVE WEBHOOK truoc."
+    end
+    if type(executorRequest) ~= "function" then
+        return false, "Executor khong ho tro HTTP request."
+    end
+    if type(fileContent) ~= "string" or fileContent == "" then
+        return false, "Noi dung JSON dang trong."
+    end
+
+    fileName = tostring(fileName or "export.json")
+        :gsub("[\r\n]", "_")
+        :gsub('[\\/:*?"<>|]', "_")
+    if not fileName:match("%.json$") then fileName ..= ".json" end
+
+    local boundary = "----DUYDiscord" .. HttpService:GenerateGUID(false):gsub("-", "")
+    local payloadJson = HttpService:JSONEncode({
+        allowed_mentions = { parse = {} },
+        attachments = {{ id = 0, filename = fileName }},
+        embeds = {{
+            title = tostring(caption or "📎 JSON FILE"),
+            description = "Tên file được gửi về:\n`" .. fileName .. "`",
+            color = tonumber(embedColor) or 3447003,
+            footer = { text = "DUY TARGET FIRST · JSON EXPORT" },
+        }},
+    })
+    local body = table.concat({
+        "--" .. boundary .. "\r\n",
+        'Content-Disposition: form-data; name="payload_json"\r\n',
+        "Content-Type: application/json\r\n\r\n",
+        payloadJson .. "\r\n",
+        "--" .. boundary .. "\r\n",
+        'Content-Disposition: form-data; name="files[0]"; filename="' .. fileName .. '"\r\n',
+        "Content-Type: application/json\r\n\r\n",
+        fileContent .. "\r\n",
+        "--" .. boundary .. "--\r\n",
+    })
+
+    local ok, response = pcall(function()
+        return executorRequest({
+            Url = savedWebhookUrl,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
+            Body = body,
+        })
+    end)
+    if not ok then
+        return false, "Upload request loi: " .. tostring(response)
+    end
+    local statusCode = type(response) == "table"
+        and tonumber(response.StatusCode or response.status_code or response.Status)
+        or nil
+    if statusCode and (statusCode < 200 or statusCode >= 300) then
+        return false, "Discord tra ve HTTP " .. tostring(statusCode)
+    end
+    if type(response) == "table" and response.Success == false then
+        return false, "Discord webhook tu choi tep JSON."
+    end
+    return true, "Da gui tep " .. fileName .. " len Discord."
 end
 
 -- Cac script LocalScript khac co the phat Begin/End de tam dung Auto Follow.
@@ -2170,11 +2235,7 @@ do
         local current, maximum = parseWave(instance.Text)
         if not current or maximum ~= 40 then return end
 
-        if current >= 35 then
-            self.CurrentWave = current
-            self.MaxWave = maximum
-            self.WaveSource = instance:GetFullName()
-        elseif current <= 2 and self._terminalLocked then
+        if current <= 2 and self._terminalLocked then
             -- Wave 1/40 cua tran moi xac nhan UI da chuyen sang tran moi.
             finalizeTerminal(self, self._terminalToken)
             self._terminalLocked = false
@@ -2187,11 +2248,12 @@ do
             self.WaveSource = instance:GetFullName()
             publish(self)
             return
-        elseif current <= 2 and self.CurrentWave == nil then
-            self.CurrentWave = current
-            self.MaxWave = maximum
-            self.WaveSource = instance:GetFullName()
         end
+
+        -- Cap nhat Wave lien tuc (1..40), de bao cao dung Wave tai thoi diem ket thuc.
+        self.CurrentWave = current
+        self.MaxWave = maximum
+        self.WaveSource = instance:GetFullName()
         publish(self)
     end
 
@@ -2419,6 +2481,16 @@ do
         {"chua co file                         ▼", "No file selected                         ▼"},
         {"Chưa chọn", "Not selected"},
         {"chua SAVE WEBHOOK", "Webhook not saved"},
+        {"MACRO JSON → DISCORD", "JSON MACRO → DISCORD"},
+        {"Select saved Macro                         ▼", "Chọn Macro đã lưu                         ▼"},
+        {"SEND MACRO JSON", "GỬI JSON MACRO"},
+        {"Macro export: no file selected", "Macro: chưa chọn file"},
+        {"MAP JSON → DISCORD", "JSON MAP → DISCORD"},
+        {"Select saved Map                         ▼", "Chọn Map đã lưu                         ▼"},
+        {"SEND MAP JSON", "GỬI JSON MAP"},
+        {"Map export: no file selected", "Map: chưa chọn file"},
+        {"No saved Macro files", "Chưa có file Macro đã lưu"},
+        {"No saved Map files", "Chưa có file Map đã lưu"},
         {"Không", "No"},
         {"Có", "Yes"},
         {"NGÔN NGỮ", "LANGUAGE"},
@@ -3429,15 +3501,17 @@ do
 
             -- MAIN va TARGET deu la ScrollingFrame: automation co the dai hon viewport,
             -- khong tran khoi cua so va khong de menu bi keo dai theo noi dung.
-            local frameClass = (index == 1 or index == 2) and "ScrollingFrame" or "Frame"
+            local scrollableTab = index == 1 or index == 2 or index == 4
+            local frameClass = scrollableTab and "ScrollingFrame" or "Frame"
             local frameProperties = {
                 Size = UDim2.new(1, 0, 1, 0),
                 BackgroundTransparency = 1,
                 Visible = index == 1,
                 Active = true,
             }
-            if index == 1 or index == 2 then
-                frameProperties.CanvasSize = UDim2.new(0, 0, 0, index == 1 and 560 or 540)
+            if scrollableTab then
+                local canvasHeight = index == 1 and 560 or (index == 2 and 540 or 700)
+                frameProperties.CanvasSize = UDim2.new(0, 0, 0, canvasHeight)
                 frameProperties.ScrollBarThickness = 4
                 frameProperties.ScrollBarImageColor3 = C.ACCENT
                 frameProperties.ScrollingDirection = Enum.ScrollingDirection.Y
@@ -4138,7 +4212,7 @@ do
         -- TAB 4: DISCORD WEBHOOK
         local webhookPanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
-            Size = UDim2.new(1, -24, 0, 230),
+            Size = UDim2.new(1, -24, 0, 650),
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, tabFrames[4])
@@ -4175,6 +4249,168 @@ do
             local ok, message = callbacks.onTestWebhook()
             webhookStatusLabel.Text = "Webhook: " .. tostring(message)
             webhookStatusLabel.TextColor3 = ok and C.GREEN or C.RED
+        end)
+
+        -- JSON attachment exports: select an existing library item, then upload its JSON file.
+        local selectedDiscordMacroKey = nil
+        local selectedDiscordMapKey = nil
+        local macroExportEntries, mapExportEntries = {}, {}
+
+        local function clearExportEntries(entries)
+            for index = #entries, 1, -1 do
+                local entry = entries[index]
+                if entry and entry.Parent then entry:Destroy() end
+                entries[index] = nil
+            end
+        end
+
+        local function makeExportDropdownList(parent, y)
+            local list = newInstance("ScrollingFrame", {
+                Position = UDim2.new(0, 14, 0, y),
+                Size = UDim2.new(1, -28, 0, 82),
+                BackgroundColor3 = Color3.fromRGB(12, 15, 23),
+                BorderSizePixel = 0,
+                ScrollBarThickness = 4,
+                ScrollBarImageColor3 = C.ACCENT,
+                CanvasSize = UDim2.new(0, 0, 0, 0),
+                AutomaticCanvasSize = Enum.AutomaticSize.Y,
+                Visible = false,
+                Active = true,
+                ScrollingEnabled = true,
+                ScrollingDirection = Enum.ScrollingDirection.Y,
+                ClipsDescendants = true,
+                ZIndex = 48,
+            }, parent)
+            addCorner(list, 6)
+            addStroke(list, Color3.fromRGB(54, 75, 110), 1)
+            newInstance("UIListLayout", {
+                Padding = UDim.new(0, 3),
+                SortOrder = Enum.SortOrder.LayoutOrder,
+            }, list)
+            newInstance("UIPadding", {
+                PaddingTop = UDim.new(0, 4),
+                PaddingLeft = UDim.new(0, 4),
+                PaddingRight = UDim.new(0, 4),
+                PaddingBottom = UDim.new(0, 4),
+            }, list)
+            return list
+        end
+
+        makeLabel(webhookPanel, "MACRO JSON → DISCORD", UDim2.new(0, 14, 0, 235),
+            UDim2.new(1, -28, 0, 18), { TextSize = 10, Color = C.ACCENT, Font = Enum.Font.GothamBold })
+        local macroDiscordDropdown = makeButton(webhookPanel, "Select saved Macro                         ▼",
+            UDim2.new(0, 14, 0, 257), UDim2.new(1, -28, 0, 28), {
+                Background = C.INPUT, TextSize = 10, ZIndex = 14,
+            })
+        macroDiscordDropdown.TextXAlignment = Enum.TextXAlignment.Left
+        local macroDiscordList = makeExportDropdownList(webhookPanel, 289)
+        local sendMacroDiscordButton = makeButton(webhookPanel, "SEND MACRO JSON",
+            UDim2.new(0, 14, 0, 378), UDim2.new(1, -28, 0, 29), {
+                Background = C.GREEN_DARK, TextSize = 10,
+            })
+        local macroDiscordStatus = makeLabel(webhookPanel, "Macro export: no file selected",
+            UDim2.new(0, 14, 0, 410), UDim2.new(1, -28, 0, 20), { TextSize = 9, Color = C.DIM })
+
+        makeLabel(webhookPanel, "MAP JSON → DISCORD", UDim2.new(0, 14, 0, 445),
+            UDim2.new(1, -28, 0, 18), { TextSize = 10, Color = C.ACCENT, Font = Enum.Font.GothamBold })
+        local mapDiscordDropdown = makeButton(webhookPanel, "Select saved Map                         ▼",
+            UDim2.new(0, 14, 0, 467), UDim2.new(1, -28, 0, 28), {
+                Background = C.INPUT, TextSize = 10, ZIndex = 14,
+            })
+        mapDiscordDropdown.TextXAlignment = Enum.TextXAlignment.Left
+        local mapDiscordList = makeExportDropdownList(webhookPanel, 499)
+        local sendMapDiscordButton = makeButton(webhookPanel, "SEND MAP JSON",
+            UDim2.new(0, 14, 0, 588), UDim2.new(1, -28, 0, 29), {
+                Background = C.GREEN_DARK, TextSize = 10,
+            })
+        local mapDiscordStatus = makeLabel(webhookPanel, "Map export: no file selected",
+            UDim2.new(0, 14, 0, 620), UDim2.new(1, -28, 0, 20), { TextSize = 9, Color = C.DIM })
+
+        local function refreshDiscordMacroFiles()
+            clearExportEntries(macroExportEntries)
+            local result = callbacks.getWebhookExportFiles and callbacks.getWebhookExportFiles() or {}
+            local files = result.Macros or {}
+            if #files == 0 then
+                local empty = makeLabel(macroDiscordList, "No saved Macro files",
+                    UDim2.new(0, 0, 0, 0), UDim2.new(1, -8, 0, 25), { TextSize = 9, Color = C.DIM })
+                empty.LayoutOrder = 1
+                empty.ZIndex = 49
+                table.insert(macroExportEntries, empty)
+                selectedDiscordMacroKey = nil
+                macroDiscordDropdown.Text = "No saved Macro files                         ▼"
+                return
+            end
+            for index, item in ipairs(files) do
+                local key, name = item.Key, tostring(item.Name or item.Key)
+                local entry = makeButton(macroDiscordList, name,
+                    UDim2.new(0, 0, 0, 0), UDim2.new(1, -8, 0, 24), {
+                        Background = C.BUTTON, TextSize = 9, TextColor = C.TEXT, ZIndex = 49,
+                    })
+                entry.LayoutOrder = index
+                entry.TextXAlignment = Enum.TextXAlignment.Left
+                entry.Activated:Connect(function()
+                    selectedDiscordMacroKey = key
+                    macroDiscordDropdown.Text = name .. "                         ▼"
+                    macroDiscordList.Visible = false
+                    macroDiscordStatus.Text = "Selected Macro: " .. name
+                    macroDiscordStatus.TextColor3 = C.ACCENT
+                end)
+                table.insert(macroExportEntries, entry)
+            end
+        end
+
+        local function refreshDiscordMapFiles()
+            clearExportEntries(mapExportEntries)
+            local result = callbacks.getWebhookExportFiles and callbacks.getWebhookExportFiles() or {}
+            local files = result.Maps or {}
+            if #files == 0 then
+                local empty = makeLabel(mapDiscordList, "No saved Map files",
+                    UDim2.new(0, 0, 0, 0), UDim2.new(1, -8, 0, 25), { TextSize = 9, Color = C.DIM })
+                empty.LayoutOrder = 1
+                empty.ZIndex = 49
+                table.insert(mapExportEntries, empty)
+                selectedDiscordMapKey = nil
+                mapDiscordDropdown.Text = "No saved Map files                         ▼"
+                return
+            end
+            for index, item in ipairs(files) do
+                local key, name = item.Key, tostring(item.Name or item.Key)
+                local entry = makeButton(mapDiscordList, name,
+                    UDim2.new(0, 0, 0, 0), UDim2.new(1, -8, 0, 24), {
+                        Background = C.BUTTON, TextSize = 9, TextColor = C.TEXT, ZIndex = 49,
+                    })
+                entry.LayoutOrder = index
+                entry.TextXAlignment = Enum.TextXAlignment.Left
+                entry.Activated:Connect(function()
+                    selectedDiscordMapKey = key
+                    mapDiscordDropdown.Text = name .. "                         ▼"
+                    mapDiscordList.Visible = false
+                    mapDiscordStatus.Text = "Selected Map: " .. name
+                    mapDiscordStatus.TextColor3 = C.ACCENT
+                end)
+                table.insert(mapExportEntries, entry)
+            end
+        end
+
+        macroDiscordDropdown.Activated:Connect(function()
+            mapDiscordList.Visible = false
+            macroDiscordList.Visible = not macroDiscordList.Visible
+            if macroDiscordList.Visible then refreshDiscordMacroFiles() end
+        end)
+        mapDiscordDropdown.Activated:Connect(function()
+            macroDiscordList.Visible = false
+            mapDiscordList.Visible = not mapDiscordList.Visible
+            if mapDiscordList.Visible then refreshDiscordMapFiles() end
+        end)
+        sendMacroDiscordButton.Activated:Connect(function()
+            local ok, message = callbacks.onSendMacroJSONToDiscord(selectedDiscordMacroKey)
+            macroDiscordStatus.Text = tostring(message or "")
+            macroDiscordStatus.TextColor3 = ok and C.GREEN or C.RED
+        end)
+        sendMapDiscordButton.Activated:Connect(function()
+            local ok, message = callbacks.onSendMapJSONToDiscord(selectedDiscordMapKey)
+            mapDiscordStatus.Text = tostring(message or "")
+            mapDiscordStatus.TextColor3 = ok and C.GREEN or C.RED
         end)
 
         -- TAB 5: HIỆU NĂNG
@@ -5003,18 +5239,57 @@ local antiAfkConnection = nil
 
 local function sendMatchReport(report)
     local isWin = report.Result == "WIN (VICTORY)"
+    local isLoss = report.Result == "LOSS (DEFEAT)"
+    local reportColor = isWin and 3066993 or (isLoss and 15158332 or 15105570)
     local vietnamTime = os.date("!%H:%M:%S - %d/%m/%Y", os.time() + 7 * 3600)
+
+    local function formatNumber(value)
+        local number = tonumber(value)
+        if number == nil then return "N/A" end
+        local rounded = math.floor(math.abs(number) + 0.5)
+        local digits = tostring(rounded):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+        return (number < 0 and "-" or "") .. digits
+    end
+    local function formatDelta(beforeValue, afterValue)
+        local beforeNumber, afterNumber = tonumber(beforeValue), tonumber(afterValue)
+        if beforeNumber == nil or afterNumber == nil then return "N/A" end
+        local delta = afterNumber - beforeNumber
+        if delta > 0 then return "+" .. formatNumber(delta) end
+        if delta < 0 then return "-" .. formatNumber(math.abs(delta)) end
+        return "0"
+    end
+    local function formatDuration(seconds)
+        local total = math.max(0, math.floor(tonumber(seconds) or 0))
+        local hours = math.floor(total / 3600)
+        local minutes = math.floor((total % 3600) / 60)
+        local secs = total % 60
+        if hours > 0 then return string.format("%02d:%02d:%02d", hours, minutes, secs) end
+        return string.format("%02d:%02d", minutes, secs)
+    end
+
+    local resultLabel = isWin and "💚 WIN" or (isLoss and "💔 DEFEAT" or "⚠️ UNKNOWN")
+    local seedChange = formatDelta(report.SeedsBefore, report.SeedsAfter)
     local payload = {
         embeds = {{
-            title = "GARDEN TOWER DEFENSE - MATCH REPORT",
-            color = isWin and 65280 or 16711680,
+            title = isWin and "💚 GARDEN TOWER DEFENSE · VICTORY"
+                or (isLoss and "💔 GARDEN TOWER DEFENSE · DEFEAT" or "⚠️ GARDEN TOWER DEFENSE · MATCH REPORT"),
+            description = "🎮 Trận " .. tostring(report.MatchNumber or "?")
+                .. " trong phiên Play Macro · " .. resultLabel,
+            color = reportColor,
             fields = {
-                { name = "So tran", value = "Tran thu " .. tostring(report.MatchNumber or "?"), inline = true },
-                { name = "Ket qua", value = isWin and "WIN (VICTORY)" or "LOSS (DEFEAT)", inline = true },
-                { name = "Wave ket thuc", value = tostring(report.WaveInfo or "N/A"), inline = true },
-                { name = "Gio Viet Nam (UTC+7)", value = vietnamTime, inline = true },
+                { name = "👤 Name", value = tostring(report.Name or "N/A"), inline = true },
+                { name = "🏁 Result", value = resultLabel, inline = true },
+                { name = "🌊 Wave", value = tostring(report.WaveInfo or "N/A"), inline = true },
+                { name = "⏱️ Thời gian hoàn thành", value = formatDuration(report.DurationSeconds), inline = true },
+                { name = "🌱 Seeds :", value = "Trước: " .. formatNumber(report.SeedsBefore)
+                    .. "\nSau: " .. formatNumber(report.SeedsAfter)
+                    .. "\nThay đổi: " .. seedChange, inline = false },
+                { name = "📊 Thống kê từ lúc Play Macro", value = "Số trận: " .. tostring(report.MatchNumber or 0)
+                    .. "\nThắng: " .. tostring(report.Wins or 0)
+                    .. " · Thua: " .. tostring(report.Losses or 0), inline = false },
+                { name = "🕒 Giờ Việt Nam (UTC+7)", value = vietnamTime, inline = true },
             },
-            footer = { text = "DUY TARGET FIRST - Auto Report" },
+            footer = { text = "DUY TARGET FIRST · Garden Tower Defense Auto Report" },
         }},
     }
     task.spawn(function()
@@ -6112,6 +6387,215 @@ local function readMacroCash()
     return tonumber((tostring(value):gsub("[^%d%-]", "")))
 end
 
+local function normalizeStatKey(value)
+    return string.lower(tostring(value or "")):gsub("[^%w]", "")
+end
+
+local function numericValueFromInstance(instance)
+    if not instance or not instance:IsA("ValueBase") then return nil end
+    local ok, raw = pcall(function() return instance.Value end)
+    if not ok then return nil end
+    if type(raw) == "number" then return raw end
+    local textValue = tostring(raw):lower():gsub(",", ""):gsub("%s+", "")
+    local numberText, suffix = textValue:match("^(%-?%d+%.?%d*)([kmb]?)$")
+    local number = tonumber(numberText)
+    if not number then return nil end
+    return number * (({ k = 1e3, m = 1e6, b = 1e9 })[suffix] or 1)
+end
+
+-- Doc stat theo ten chinh xac; uu tien leaderstats va PlayerData truoc khi tim sau trong Player.
+-- Ham chi duoc goi tai dau/cuoi tran, khong quet Descendants lien tuc.
+local function readPlayerNumericStat(candidateNames)
+    local wanted = {}
+    for _, name in ipairs(candidateNames) do wanted[normalizeStatKey(name)] = true end
+
+    local roots, seenRoots = {}, {}
+    local function addRoot(root)
+        if root and not seenRoots[root] then
+            seenRoots[root] = true
+            table.insert(roots, root)
+        end
+    end
+    addRoot(LP:FindFirstChild("leaderstats"))
+    for _, rootName in ipairs({ "PlayerData", "Data", "Stats", "Profile" }) do
+        addRoot(LP:FindFirstChild(rootName))
+    end
+    addRoot(LP)
+
+    -- Attributes duoc uu tien trong tung root.
+    for _, root in ipairs(roots) do
+        local ok, attributes = pcall(function() return root:GetAttributes() end)
+        if ok then
+            for name, value in pairs(attributes) do
+                if wanted[normalizeStatKey(name)] then
+                    local number = tonumber(tostring(value):gsub(",", ""))
+                    if number ~= nil then return number end
+                end
+            end
+        end
+    end
+
+    -- Tim ValueBase truc tiep trong cac root uu tien.
+    for _, root in ipairs(roots) do
+        local ok, children = pcall(function() return root:GetChildren() end)
+        if ok then
+            for _, child in ipairs(children) do
+                if wanted[normalizeStatKey(child.Name)] then
+                    local number = numericValueFromInstance(child)
+                    if number ~= nil then return number end
+                end
+            end
+        end
+    end
+
+    -- Fallback chi tim descendants trong cac container du lieu da biet;
+    -- khong quet Character/Tool de tranh lay nham Damage cua vu khi.
+    for _, root in ipairs(roots) do
+        if root ~= LP then
+            local ok, descendants = pcall(function() return root:GetDescendants() end)
+            if ok then
+                for _, child in ipairs(descendants) do
+                    if wanted[normalizeStatKey(child.Name)] then
+                        local number = numericValueFromInstance(child)
+                        if number ~= nil then return number end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function readMatchAccountStats()
+    return {
+        Cash = readMacroCash() or readPlayerNumericStat({ "Cash", "Money", "Coins" }),
+        Seeds = readPlayerNumericStat({ "Seeds", "Seed", "TotalSeeds", "TotalSeed", "AccountSeeds" }),
+        Damage = readPlayerNumericStat({ "Damage", "TotalDamage", "PlayerDamage" }),
+    }
+end
+
+local MatchStatsTracker = {
+    Enabled = false,
+    MatchNumber = 0,
+    Wins = 0,
+    Losses = 0,
+    Current = nil,
+    _reported = setmetatable({}, { __mode = "k" }),
+}
+
+function MatchStatsTracker:StartSession()
+    self.Enabled = true
+    self.MatchNumber = 0
+    self.Wins = 0
+    self.Losses = 0
+    self.Current = nil
+    self._reported = setmetatable({}, { __mode = "k" })
+    if MatchScanner then
+        MatchScanner:Reset()
+        -- UI Victory/Defeat cung la nguon ket thuc hop le, ke ca khi GameEndTime
+        -- hoac BaseHP_1 khong duoc replicate day du. Finish co co che chong gui lap.
+        MatchScanner._onReport = function(scannerReport)
+            local current = MatchStatsTracker.Current
+            if current and current.Context then
+                MatchStatsTracker:Finish(current.Context,
+                    "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal"))
+            end
+        end
+        if not MatchScanner._active then
+            MatchScanner:Start(function(snapshot)
+                if not destroyed and api and api.setScannerInfo then api.setScannerInfo(snapshot) end
+            end, MatchScanner._onReport)
+        end
+    end
+end
+
+function MatchStatsTracker:StopArming()
+    -- Match dang chay van duoc theo doi den luc ket thuc; chi ngung tinh cac tran moi.
+    self.Enabled = false
+end
+
+function MatchStatsTracker:Begin(ctx)
+    if not self.Enabled or not ctx then return false end
+    if self.Current and self.Current.Context == ctx then return true end
+    if self.Current and self.Current.Context then
+        self:Finish(self.Current.Context, "Context changed before terminal signal")
+    end
+    self.MatchNumber += 1
+    local startStamp = tonumber(ctx:GetAttribute("GameStartTime")) or 0
+    self.Current = {
+        Context = ctx,
+        MatchNumber = self.MatchNumber,
+        StartedAt = os.clock(),
+        StartStamp = startStamp,
+        Before = readMatchAccountStats(),
+    }
+    return true
+end
+
+function MatchStatsTracker:Finish(ctx, reason)
+    local current = self.Current
+    if not current or current.Context ~= ctx or self._reported[ctx] then return false end
+    self._reported[ctx] = true
+
+    local endStamp = tonumber(ctx and ctx:GetAttribute("GameEndTime")) or 0
+    local baseHP = tonumber(ctx and ctx:GetAttribute("BaseHP_1"))
+    local result
+    if MatchScanner and (MatchScanner.Result == "WIN (VICTORY)" or MatchScanner.Result == "LOSS (DEFEAT)") then
+        result = MatchScanner.Result
+    elseif baseHP ~= nil then
+        result = baseHP > 0 and "WIN (VICTORY)" or "LOSS (DEFEAT)"
+    else
+        result = "UNKNOWN"
+    end
+
+    if result == "WIN (VICTORY)" then
+        self.Wins += 1
+    elseif result == "LOSS (DEFEAT)" then
+        self.Losses += 1
+    end
+
+    local after = readMatchAccountStats()
+    local duration
+    if endStamp > current.StartStamp and current.StartStamp > 0 then
+        duration = endStamp - current.StartStamp
+    else
+        duration = math.max(0, os.clock() - current.StartedAt)
+    end
+    local wave = MatchScanner and tonumber(MatchScanner.CurrentWave) or nil
+    local report = {
+        MatchNumber = current.MatchNumber,
+        Result = result,
+        Name = LP.Name,
+        WaveInfo = wave and (tostring(wave) .. "/40") or "N/A",
+        DurationSeconds = duration,
+        CashBefore = current.Before.Cash,
+        CashAfter = after.Cash,
+        SeedsBefore = current.Before.Seeds,
+        SeedsAfter = after.Seeds,
+        DamageBefore = current.Before.Damage,
+        DamageAfter = after.Damage,
+        Wins = self.Wins,
+        Losses = self.Losses,
+        AccountSeeds = after.Seeds,
+        EndReason = tostring(reason or "GameEndTime"),
+        ReportId = HttpService:GenerateGUID(false),
+    }
+    self.Current = nil
+    sendMatchReport(report)
+    return true
+end
+
+function MatchStatsTracker:Tick()
+    local current = self.Current
+    local ctx = current and current.Context
+    if not ctx then return end
+    local endStamp = tonumber(ctx:GetAttribute("GameEndTime")) or 0
+    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+    if endStamp > 0 or (baseHP ~= nil and baseHP <= 0) or not ctx.Parent then
+        self:Finish(ctx, endStamp > 0 and "GameEndTime" or (not ctx.Parent and "Context removed" or "BaseHP_1"))
+    end
+end
+
 function AutoAbilityController:MarkUsed(gameId)
     gameId = tonumber(gameId)
     local info = gameId and self.ById[gameId]
@@ -6885,6 +7369,15 @@ function MacroEngine:_registerTrackedUnit(model, id, pos, detectedAt)
     end
 end
 
+-- Một số unit tạo Bunny/Chicken như companion/minion phụ. Chúng xuất hiện trong
+-- Entities nhưng không phải PlaceUnit của người chơi; bỏ chúng khỏi Observer fallback.
+-- Hook PlaceUnit hợp lệ vẫn được ghi theo Remote gốc, không bị ảnh hưởng bởi bộ lọc này.
+local function isKnownSummonedCompanionName(name)
+    local normalized = string.lower(tostring(name or ""))
+    return normalized:find("bunny", 1, true) ~= nil
+        or normalized:find("chicken", 1, true) ~= nil
+end
+
 --[[
   _onEntityAdded(model): callback khi Entities.ChildAdded.
   Chạy trong task.spawn để không block ChildAdded.
@@ -6938,16 +7431,19 @@ function MacroEngine:_onEntityAdded(model)
         -- Owner/ID có thể chỉ xuất hiện sau khi Hook đã nhận request; kiểm tra lại ở thời điểm
         -- đã có đủ dữ liệu để tránh tạo Place fallback trùng với request vừa replicate.
         local matchedHookPlace = self:_hasPendingPlaceMatch(model, pos)
-        local observerRecord = detectSeq ~= nil and not matchedHookPlace
-        if observerRecord and self._recordMode ~= "OBSERVER" then
-            self._hookLiveFailed = self._hookLiveFailed or {}
-            self._hookLiveFailed.PlaceUnit = true
-            self:_diag("HOOK", "PlaceUnit fallback theo Model: event này không có request Place tương ứng từ Hook; "
-                .. "ghi Observer cho riêng Unit ID " .. tostring(id) .. ".")
-            if api then
-                api.setMacroStatus("PlaceUnit Hook không bắt được event này → đã dùng Observer riêng cho Unit này. "
-                    .. self:GetHookSummary(), false)
-            end
+        local observerCandidate = detectSeq ~= nil and not matchedHookPlace
+        -- Loai Bunny/Chicken summon da biet; giu Hybrid fallback cho Model Tower that
+        -- neu Place Hook bo sot mot request rieng le.
+        local knownSummon = isKnownSummonedCompanionName(model.Name)
+        -- Giu co che Hybrid: neu Hook bo sot mot Tower that, Observer van co the
+        -- fallback cho rieng Model do; chi loai Bunny/Chicken companion da biet.
+        local observerRecord = observerCandidate and not knownSummon
+        if observerCandidate and knownSummon then
+            self:_diag("OBSERVER", "Bo qua Model ID " .. tostring(id) .. " (" .. tostring(model.Name)
+                .. "): Bunny/Chicken summon; khong ghi PlaceUnit Action.")
+        elseif observerCandidate and self._recordMode ~= "OBSERVER" then
+            self:_diag("HOOK", "PlaceUnit Hook khong khop Model ID " .. tostring(id)
+                .. "; dung Observer fallback rieng cho " .. tostring(model.Name) .. ".")
         end
         if observerRecord and not self._recordClosing then
             local info = self._trackedUnits[model]
@@ -7020,7 +7516,8 @@ function MacroEngine:_onEntityRemoved(model)
     -- OBSERVER fallback: chỉ ghi Sell khi đúng Model của Unit trong Macro biến mất
     -- VÀ có Cash tăng gần thời điểm đó. Cash tăng một mình không đủ chứng minh Sell.
     if self.Recording and not self._savingRecord
-        and info.recordedPlace and info.spawnedDuringRecord and not info.sellRecorded
+        and info.recordedPlace and info.spawnedDuringRecord
+        and not isKnownSummonedCompanionName(info.name) and not info.sellRecorded
         and not (self._sellRecordedIds and self._sellRecordedIds[info.id])
         and not info.sellPending and not info.sellHookPending then
         local ctx = self._recordContext
@@ -9766,6 +10263,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
     self._replayState = "RUNNING_MACRO"
     self._waitingNextMatch = false
     self.Playing = true
+    if MatchStatsTracker then MatchStatsTracker:Begin(ctx) end
     startMacroGameClock(ctx)
     self._playStartedAt = nil
     self._playToken += 1
@@ -9990,26 +10488,23 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
                     .. " tham chiếu ID chưa được Place trước đó: " .. tostring(action.ID)
             end
             if soldIds[id] then
-                if action.Type == "SellUnit" then
-                    -- Một SellUnit lặp cho cùng Record ID không được chặn toàn bộ Replay.
-                    -- Đánh dấu đúng Action này để scheduler bỏ qua, không gửi Sell lần hai.
-                    preflightSkipActions[index] = "SellUnit ID " .. tostring(id)
-                        .. " đã được Sell trước đó; bỏ qua thao tác trùng."
-                else
-                    return false, action.Type .. " Action " .. tostring(index)
-                        .. " tham chiếu ID " .. tostring(id) .. " đã Sell trước đó."
-                end
+                -- Sell trung hoac Upgrade/Lock/Toggle sau Sell deu la thao tac stale.
+                -- Chi bo qua Action lien quan; khong chan ca Macro nhu ban cu.
+                preflightSkipActions[index] = action.Type .. " ID " .. tostring(id)
+                    .. " đã Sell trước đó; bỏ qua Action này."
             end
             if not preflightSkipActions[index]
                 and self._remoteReplaySignatureSafe and self._remoteReplaySignatureSafe[action.Type] == false then
                 return false, action.Type .. " Remote có chữ ký tham số không tương thích JSON Type/Time/ID. Xem REMOTE ARGS trong Diagnostics."
             end
-            if action.Type == "UpgradeUnit" and not self._remote.UpgradeUnit then
-                return false, "JSON có UpgradeUnit nhưng không tìm thấy Remote UpgradeUnit trong game. " .. self:GetHookSummary()
-            elseif action.Type == "ToggleAutoUpgrade" and not self._remote.ToggleAutoUpgrade then
-                return false, "JSON có ToggleAutoUpgrade nhưng không tìm thấy Remote ToggleAutoUpgrade trong game. " .. self:GetHookSummary()
-            elseif action.Type == "LockUnit" and not self._remote.LockUnit then
-                return false, "JSON có LockUnit nhưng game không có Remote LockUnit tương thích. " .. self:GetHookSummary()
+            if not preflightSkipActions[index] then
+                if action.Type == "UpgradeUnit" and not self._remote.UpgradeUnit then
+                    return false, "JSON có UpgradeUnit nhưng không tìm thấy Remote UpgradeUnit trong game. " .. self:GetHookSummary()
+                elseif action.Type == "ToggleAutoUpgrade" and not self._remote.ToggleAutoUpgrade then
+                    return false, "JSON có ToggleAutoUpgrade nhưng không tìm thấy Remote ToggleAutoUpgrade trong game. " .. self:GetHookSummary()
+                elseif action.Type == "LockUnit" and not self._remote.LockUnit then
+                    return false, "JSON có LockUnit nhưng game không có Remote LockUnit tương thích. " .. self:GetHookSummary()
+                end
             end
             if action.Type == "SellUnit" then soldIds[id] = true end
         elseif action.Type == "UpgradeAll" or action.Type == "SellAll" or action.Type == "ActivateUnitAbility" then
@@ -10062,6 +10557,7 @@ end
 function MacroEngine:_finishReplayMatch(ctx, reason)
     if ctx and self._activeReplayContext and self._activeReplayContext ~= ctx then return false end
     if not self._activeReplayContext and not self.Playing then return false end
+    if MatchStatsTracker then MatchStatsTracker:Finish(ctx or self._activeReplayContext, reason) end
 
     self._replayState = "CLEANUP"
     self.Playing = false
@@ -10120,6 +10616,7 @@ function MacroEngine:StopPlay(reason)
     self._replayRunGeneration += 1
     self._autoRepeatArmed = false
     self._waitingNextMatch = false
+    if MatchStatsTracker then MatchStatsTracker:StopArming() end
     self._replayState = "IDLE"
     self._activeReplayContext = nil
     self.IdMap = {}
@@ -10517,8 +11014,14 @@ end
 
 callbacks.onMacroPlayChanged = function(enabled)
     if destroyed then return false, "Script đã đóng." end
-    if enabled then return MacroEngine:StartPlay() end
-    return MacroEngine:StopPlay("người dùng tắt Play Macro")
+    if enabled then
+        local ok, message = MacroEngine:StartPlay()
+        if ok and MatchStatsTracker then MatchStatsTracker:StartSession() end
+        return ok, message
+    end
+    local ok, message = MacroEngine:StopPlay("người dùng tắt Play Macro")
+    if MatchStatsTracker then MatchStatsTracker:StopArming() end
+    return ok, message
 end
 callbacks.onMacroLeadChanged = function(seconds)
     MacroEngine._replayLeadSeconds = math.clamp(tonumber(seconds) or 0, 0, 5)
@@ -10993,8 +11496,21 @@ callbacks.onAutoFollow = function(enabled)
 end
 
 callbacks.onAutoPlayScanner = function(enabled)
-    autoPlayScannerEnabled = false
-    MatchScanner:Stop()
+    autoPlayScannerEnabled = enabled == true
+    if autoPlayScannerEnabled then
+        MatchScanner:Start(function(snapshot)
+            if not destroyed and api and api.setScannerInfo then api.setScannerInfo(snapshot) end
+        end, function(scannerReport)
+            local current = MatchStatsTracker and MatchStatsTracker.Current
+            if current and current.Context then
+                MatchStatsTracker:Finish(current.Context,
+                    "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal"))
+            end
+        end)
+    else
+        MatchScanner:Stop()
+    end
+    return true, autoPlayScannerEnabled and "Match Scanner đã bật." or "Match Scanner đã tắt."
 end
 
 callbacks.onScanNow = function()
@@ -11028,6 +11544,7 @@ matchWatchConnection = RunService.Heartbeat:Connect(function(dt)
         if matchWatchConnection then matchWatchConnection:Disconnect() end
         return
     end
+    if MatchStatsTracker then MatchStatsTracker:Tick() end
     local ctx = getMacroContext()
     if not ctx then return end
     local startStamp = tonumber(ctx:GetAttribute("GameStartTime")) or 0
@@ -11142,6 +11659,51 @@ callbacks.onPerformanceChanged = function(name, enabled)
 end
 
 -- TAB WEBHOOK callbacks: client-only, URL chi giu trong RAM cua script.
+callbacks.getWebhookExportFiles = function()
+    local macros, maps = {}, {}
+    for _, key in ipairs(MacroStore:GetFileList()) do
+        local item = MacroStore:GetFile(key)
+        if item then table.insert(macros, { Key = key, Name = tostring(item.Name or key) }) end
+    end
+    for _, key in ipairs(SaveManager:GetFileList()) do
+        local item = SaveManager:GetFile(key)
+        if item then table.insert(maps, { Key = key, Name = tostring(item.MapName or key) }) end
+    end
+    return { Macros = macros, Maps = maps }
+end
+
+callbacks.onSendMacroJSONToDiscord = function(key)
+    if MacroEngine.Recording or MacroEngine._recordState == "SAVING"
+        or MacroEngine._savingRecord or MacroEngine._saveQueued then
+        return false, "Macro dang Record/Saving; hay gui sau khi luu xong."
+    end
+    local item = key and MacroStore:GetFile(key)
+    if not item then return false, "Hay chon mot Macro file da luu." end
+    local raw = item.Content or "[]"
+    local valid, decodedOrError = MacroStore:ValidateJSON(raw)
+    if not valid then return false, "Macro JSON khong hop le: " .. tostring(decodedOrError) end
+    local safeName = tostring(item.Name or "Macro"):gsub('[\\/:*?"<>|]', "_")
+    return postDiscordFile(safeName .. ".json", raw, "🟧 JSON MACRO", 15105570)
+end
+
+callbacks.onSendMapJSONToDiscord = function(key)
+    local item = key and SaveManager:GetFile(key)
+    if not item then return false, "Hay chon mot Map file da luu." end
+    local mapData = {
+        Version = "2.7",
+        Name = tostring(item.MapName or "Map"),
+        SpawnPoint = item.SpawnPoint,
+        DestinationPoint = item.DestinationPoint,
+        RoutePoints = item.RoutePoints,
+    }
+    local valid, reason = validateMapData(mapData)
+    if not valid then return false, "Map JSON chua du thong tin: " .. tostring(reason) end
+    local encodeOK, raw = pcall(function() return HttpService:JSONEncode(mapData) end)
+    if not encodeOK then return false, "Khong ma hoa duoc Map JSON: " .. tostring(raw) end
+    local safeName = tostring(item.MapName or "Map"):gsub('[\\/:*?"<>|]', "_")
+    return postDiscordFile(safeName .. ".json", raw, "🟨 JSON MAP", 15844367)
+end
+
 callbacks.onConfigureWebhook = function(url)
     url = trim(url)
     if url == "" then
@@ -11160,10 +11722,10 @@ end
 callbacks.onTestWebhook = function()
     local payload = {
         embeds = {{
-            title = "DUY TARGET FIRST - TEST",
-            description = "Ket noi Discord webhook hoat dong.",
+            title = "🔵 DUY TARGET FIRST - TEST",
+            description = "Webhook Discord đã kết nối và nhận được tin nhắn kiểm tra.",
             color = 3447003,
-            fields = {{ name = "Trang thai", value = "SEND TEST thanh cong", inline = true }},
+            fields = {{ name = "📡 Trạng thái", value = "✅ SEND TEST thành công", inline = true }},
             footer = { text = "Garden Tower Defense Auto Report" },
         }},
     }
@@ -11281,6 +11843,17 @@ else
     api.setStatus("Chua co file. CREATE FILE truoc, sau do SET SPAWN / DEST va RECORD ROUTE.", Color3.fromRGB(225, 172, 66))
 end
 
+MatchScanner:Start(function(snapshot)
+    if not destroyed and api and api.setScannerInfo then
+        api.setScannerInfo(snapshot)
+    end
+end, function(scannerReport)
+    local current = MatchStatsTracker and MatchStatsTracker.Current
+    if current and current.Context then
+        MatchStatsTracker:Finish(current.Context,
+            "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal"))
+    end
+end)
 api.setScannerInfo(MatchScanner:GetSnapshot())
 
 -- ============================================================
