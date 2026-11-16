@@ -8526,6 +8526,15 @@ function MacroEngine:StopRecord(reason)
         end
         return true, "Đã hủy trạng thái chờ Record."
     end
+    -- Record co the da tu dong chuyen sang SAVING khi tran ket thuc.
+    -- Cho phep tat cong tac UI trong luc luu, nhung khong huy tien trinh ghi JSON.
+    if self._recordState == "SAVING" or self._savingRecord or self._saveQueued then
+        if api then
+            api.setMacroRecordUI(false, true)
+            api.setMacroStatus("Record đang lưu JSON; tiến trình lưu vẫn tiếp tục.", true)
+        end
+        return true, "Record đang lưu; không cần dừng thêm."
+    end
     if not self.Recording then return false, "Record Macro chưa bật." end
     task.spawn(function() self:_saveRecord(reason or "người dùng Stop") end)
     return true, "Đang dừng Record và tự lưu JSON..."
@@ -10499,8 +10508,11 @@ end
 function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
     if destroyed or self._shuttingDown then return false, "Script đã đóng; không thể Replay." end
     if self.Playing then return false, "Macro đang chạy." end
+    if self._savingRecord or self._saveQueued or self._recordState == "SAVING" then
+        return false, "Macro Record vẫn đang lưu JSON; hãy đợi lưu xong rồi bật Play Macro."
+    end
     if self.Recording or self._recordState == "WAITING_FOR_NEXT_MATCH" then
-        return false, "Đang Record hoặc chờ Record; hãy tắt Record trước."
+        return false, "Record vẫn đang hoạt động; hãy tắt Record trước khi Replay."
     end
     if not self._remoteReady then
         -- Startup chỉ thử tìm Remote trong một khoảng thời gian hữu hạn. Retry ngay khi
@@ -11075,13 +11087,30 @@ end
 
 callbacks.onMacroRecordChanged = function(enabled)
     if destroyed then return false, "Script đã đóng." end
-    if enabled then return MacroEngine:StartRecord() end
+    if enabled then
+        -- Hai che do khong chay dong thoi. Neu Play Macro chi dang cho tran moi,
+        -- tu dong huy trang thai cho de chuyen sang Record; khong cat ngang Replay dang chay.
+        if MacroEngine._autoRepeatArmed and not MacroEngine.Playing then
+            MacroEngine:StopPlay("chuyển sang Record Macro")
+        end
+        return MacroEngine:StartRecord()
+    end
     return MacroEngine:StopRecord("người dùng tắt Record")
 end
 
 callbacks.onMacroPlayChanged = function(enabled)
     if destroyed then return false, "Script đã đóng." end
     if enabled then
+        -- Record dang cho tran chua thu Action nao: huy trang thai cho nay de Play Macro
+        -- co the bat ngay. Neu dang thu that su thi khong tu y bo Record cua nguoi dung.
+        if MacroEngine._recordState == "WAITING_FOR_NEXT_MATCH" and not MacroEngine.Recording then
+            local cancelOK, cancelMessage = MacroEngine:StopRecord("chuyển sang Play Macro")
+            if not cancelOK then return false, cancelMessage end
+        elseif MacroEngine.Recording then
+            return false, "Record đang thu Action. Hãy tắt Record để lưu Macro trước khi bật Play Macro."
+        elseif MacroEngine._savingRecord or MacroEngine._saveQueued or MacroEngine._recordState == "SAVING" then
+            return false, "Record đang lưu JSON. Hãy đợi lưu xong rồi bật Play Macro."
+        end
         local ok, message = MacroEngine:StartPlay()
         if ok and MatchStatsTracker then MatchStatsTracker:StartSession() end
         return ok, message
