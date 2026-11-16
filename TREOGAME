@@ -1,5 +1,5 @@
 --[[
-    DUY TARGET FIRST SYSTEM - V2.31 SUMMON FILTER / REPLAY PREFLIGHT / DISCORD REPORT
+    DUY TARGET FIRST SYSTEM - V2.31.5 FIFO ACTION RETRY / UPGRADEALL CONTINUE / DISCORD REPORT
     Phien ban danh cho du an Roblox do ban so huu / co quyen chinh sua.
 
     Chuc nang:
@@ -8169,6 +8169,17 @@ function MacroEngine:_saveRecord(reason)
     self._saveQueued = false
     self.Recording = false
     stopMacroGameClock(self._recordContext)
+    -- Snapshot the stable Unit/Position identity before _stopObserver clears its caches.
+    -- This is especially important when one UpgradeAll creates many per-Unit Upgrade actions.
+    for _, action in ipairs(self.Actions) do
+        local recordId = tonumber(action.ID)
+        local trackedInfo = recordId and self._trackedById and self._trackedById[recordId]
+        if trackedInfo and (action.Type == "UpgradeUnit" or action.Type == "SellUnit"
+            or action.Type == "ToggleAutoUpgrade" or action.Type == "LockUnit") then
+            action.Unit = action.Unit or trackedInfo.name
+            action.Position = action.Position or trackedInfo.posStr
+        end
+    end
     self:_stopObserver()
     -- Remote callbacks có thể trả về muộn; sắp xếp lại theo timestamp đã chụp tại lúc thao tác.
     -- EventSeq là tie-break để hai action cùng Time vẫn có thứ tự xác định.
@@ -8189,7 +8200,8 @@ function MacroEngine:_saveRecord(reason)
             nextOrder += 1
             action.Order = nextOrder
             orderByRecordId[oldId] = nextOrder
-        elseif (action.Type == "UpgradeUnit" or action.Type == "SellUnit") and oldId then
+        elseif (action.Type == "UpgradeUnit" or action.Type == "SellUnit"
+            or action.Type == "ToggleAutoUpgrade" or action.Type == "LockUnit") and oldId then
             action.Order = orderByRecordId[oldId]
         end
     end
@@ -8213,6 +8225,7 @@ function MacroEngine:_saveRecord(reason)
             local clean = { Type = action.Type, Time = math.floor((tonumber(action.Time) or 0) * 100 + 0.5) / 100 }
             if action.Type == "PlaceUnit" then
                 clean.Unit, clean.ID, clean.Position, clean.CF = action.Unit, action.ID, action.Position, action.CF
+                clean.Order = tonumber(action.Order)
                 clean.Rotation, clean.Valid = action.Rotation, action.Valid
                 if action.PathIndex ~= nil and action.DistanceAlongPath ~= nil then
                     clean.PathIndex = decodeMacroValue(action.PathIndex)
@@ -8231,6 +8244,22 @@ function MacroEngine:_saveRecord(reason)
                 end
             elseif action.ID ~= nil then
                 clean.ID = action.ID
+                if action.Type == "UpgradeUnit" or action.Type == "SellUnit"
+                    or action.Type == "ToggleAutoUpgrade" or action.Type == "LockUnit" then
+                    -- Preserve a stable placement fingerprint. If the first PlaceUnit
+                    -- Model lookup misses a replication frame, Replay can still map the
+                    -- old Record ID to the unique runtime Model by Unit + position.
+                    local linkedInfo = self._trackedById and self._trackedById[tonumber(action.ID)]
+                    clean.Order = tonumber(action.Order)
+                    clean.Unit = action.Unit or (linkedInfo and linkedInfo.name) or nil
+                    clean.Position = action.Position or (linkedInfo and linkedInfo.posStr) or nil
+                    clean.CF = action.CF or (linkedInfo and linkedInfo.cfString) or nil
+                    if action.Type == "UpgradeUnit" then
+                        clean.FromLevel = tonumber(action.FromLevel)
+                        clean.ToLevel = tonumber(action.ToLevel)
+                        clean.UpgradeCost = tonumber(action.UpgradeCost)
+                    end
+                end
                 if action.Type == "SellUnit" then
                     -- Store provenance so Replay can distinguish explicit Sell requests
                     -- from older JSON created by the unsafe ModelRemoved+Cash heuristic.
@@ -9863,18 +9892,70 @@ function MacroEngine:_resolveReplayRuntimeId(action)
 
     local pendingKey = order or recordId
     local pending = pendingKey and self._pendingOrderMappings[pendingKey]
+
+    -- First try a direct, unique match in the active match by the recorded Unit + position.
+    -- This avoids an unnecessary 8-second wait when PlaceUnit spawned successfully but its
+    -- first ID correlation was missed during replication.
+    local unitName = type(action.Unit) == "string" and action.Unit or (pending and pending.Unit)
+    local desiredPosition = parseVectorString(action.Position or (pending and pending.Position))
+    local desiredCF = parseCFrameString(action.CF or (pending and pending.CF))
+    if not desiredPosition and desiredCF then desiredPosition = desiredCF.Position end
+    if unitName and desiredPosition then
+        local entities = getMacroEntities(self._activeReplayContext)
+        if entities then
+            local bestId, bestDistance
+            local ambiguous = false
+            local tolerance = macroPositionTolerance(unitName)
+            for _, model in ipairs(entities:GetChildren()) do
+                if model:IsA("Model") and model.Name == unitName then
+                    local candidateId = tonumber(getMacroEntityId(model))
+                    local owned = macroModelBelongsToPlayer(model)
+                    if candidateId and not self._runtimeIdClaimed[candidateId] and owned ~= false then
+                        local distance = getMacroCandidateDistance(model, desiredPosition)
+                        if distance and distance <= tolerance then
+                            if not bestDistance or distance < bestDistance - 0.2 then
+                                bestId, bestDistance, ambiguous = candidateId, distance, false
+                            elseif math.abs(distance - bestDistance) <= 0.2 then
+                                ambiguous = true
+                            end
+                        end
+                    end
+                end
+            end
+            if bestId and not ambiguous then
+                self._runtimeIdClaimed[bestId] = true
+                if recordId then self.IdMap[recordId] = bestId end
+                if order then self.OrderMap[order] = bestId end
+                if pendingKey then self._pendingOrderMappings[pendingKey] = nil end
+                self:_diag("ID_MAP_RECOVERY", string.format(
+                    "Recovered %s RecordID=%s Order=%s -> RuntimeID=%s by Unit+Position (%.2f studs).",
+                    unitName, tostring(recordId), tostring(order), tostring(bestId), bestDistance))
+                return bestId
+            elseif ambiguous then
+                self:_diag("ID_MAP_RECOVERY", "Không ánh xạ " .. tostring(unitName)
+                    .. " RecordID=" .. tostring(recordId)
+                    .. ": có nhiều Model cùng gần vị trí đã Record; không đoán ID.")
+            end
+        end
+    end
+
+    -- Không chờ block 2.5s tại đây. Mỗi lượt FIFO chỉ thử ánh xạ nhanh một lần;
+    -- nếu Model chưa replicate, scheduler sẽ gọi lại sau 1.5s.
     if pending and pending.Snapshot then
         local pendingAction = {
-            Unit = pending.Unit,
-            Position = pending.Position,
-            CF = pending.CF,
+            Unit = pending.Unit or action.Unit,
+            Position = pending.Position or action.Position,
+            CF = pending.CF or action.CF,
         }
-        local runtimeId = waitMacroEntity(pendingAction, pending.Snapshot, self._playToken, self._activeReplayContext)
+        local runtimeId = waitMacroEntity(pendingAction, pending.Snapshot,
+            self._playToken, self._activeReplayContext, 0.12)
         if runtimeId then
             self._runtimeIdClaimed[runtimeId] = true
             if order then self.OrderMap[order] = runtimeId end
             if recordId then self.IdMap[recordId] = runtimeId end
             self._pendingOrderMappings[pendingKey] = nil
+            self:_diag("ID_MAP_RECOVERY", "Recovered pending Place mapping for RecordID="
+                .. tostring(recordId) .. " -> RuntimeID=" .. tostring(runtimeId))
             return runtimeId
         end
     end
@@ -9952,7 +10033,32 @@ function MacroEngine:_runAction(action, token, ctx)
             params.DistanceAlongPath = decodeMacroValue(action.DistanceAlongPath)
         end
 
-        local snapshot = snapshotMacroEntities(action.Unit, ctx)
+        -- Giữ snapshot đầu tiên cho Action này xuyên suốt các lần retry. Nếu Server đã tạo
+        -- Tower nhưng Model replicate chậm, lần retry sẽ nhận ra Tower đó trước khi gửi lại,
+        -- tránh tạo Tower trùng.
+        self._placeRetryStates = self._placeRetryStates or setmetatable({}, { __mode = "k" })
+        local placeState = self._placeRetryStates[action]
+        if not placeState then
+            placeState = { Snapshot = snapshotMacroEntities(action.Unit, ctx), Attempts = 0 }
+            self._placeRetryStates[action] = placeState
+        else
+            local lateId, lateModel, lateError = waitMacroEntity(action, placeState.Snapshot, token, ctx, 0.15)
+            if lateId then
+                local oldId = tonumber(action.ID)
+                local order = tonumber(action.Order)
+                self._runtimeIdClaimed[lateId] = true
+                if oldId then self.IdMap[oldId] = lateId end
+                if order then self.OrderMap[order] = lateId end
+                local key = order or oldId
+                if key then self._pendingOrderMappings[key] = nil end
+                self._placeRetryStates[action] = nil
+                return true, string.format("Đã nhận Model replicate trễ cho %s · runtime ID %s",
+                    tostring(action.Unit), tostring(lateId)), { Model = lateModel, RecoveredLateModel = true }
+            end
+        end
+        local snapshot = placeState.Snapshot
+        placeState.Attempts += 1
+
         local callOK, response = pcall(function()
             if remoteValues and remoteArgCount and remoteArgCount >= 2 then
                 remoteValues[1] = action.Unit or remoteValues[1]
@@ -9961,26 +10067,24 @@ function MacroEngine:_runAction(action, token, ctx)
             end
             return callMacroRemote(rf.PlaceUnit, action.Unit, params)
         end)
-        if not callOK then return false, "PlaceUnit Remote lỗi trước khi gửi hoàn tất: " .. tostring(response) end
+        if not callOK then
+            return false, "PlaceUnit Remote lỗi: " .. tostring(response)
+        end
         if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
             return false, "PlaceUnit trả phản hồi muộn từ trận cũ; không đưa ID vào Mapping của trận mới."
         end
         if isMacroRemoteRejected(response) then
             local rejectionText = macroResponseText(response)
-            local recordId = tonumber(action.ID)
-            if recordId then
-                self._failedPlaceRecordIds[recordId] = rejectionText ~= "" and rejectionText or "Server rejected PlaceUnit"
-            end
             self:_diag("PLACE", "Server từ chối PlaceUnit " .. tostring(action.Unit)
-                .. " tại Macro Time " .. tostring(action.Time) .. "; không chờ Cash và không retry để giữ FIFO. "
+                .. " tại Macro Time " .. tostring(action.Time) .. "; sẽ thử lại sau 1.5s. "
                 .. tostring(rejectionText))
-            return false, "Server từ chối PlaceUnit tại đúng Macro Time; không chờ Cash: "
-                .. tostring(rejectionText)
+            return false, "Server từ chối PlaceUnit; sẽ thử lại sau 1.5s: " .. tostring(rejectionText),
+                { Retryable = true, RemoteSent = true, ServerRejected = true }
         end
 
-        -- Place Remote chỉ gửi một lần. Chờ Model tối đa 8 giây; hết hạn thì dừng an toàn,
-        -- không gửi lại Place vì server có thể đã tạo Unit nhưng replication bị trễ.
-        local newId, model, detectError = waitMacroEntity(action, snapshot, token, ctx, 8)
+        -- Chờ ngắn để nhận Model. Nếu chưa thấy, scheduler sẽ thử lại sau 1.5s; mọi lần
+        -- retry đều kiểm tra snapshot đầu tiên trước khi gửi Remote lần nữa.
+        local newId, model, detectError = waitMacroEntity(action, snapshot, token, ctx, 0.12)
         if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
             return false, "Replay đã chuyển trận trong lúc xác nhận Model; bỏ kết quả của trận cũ."
         end
@@ -9991,7 +10095,9 @@ function MacroEngine:_runAction(action, token, ctx)
                 Snapshot = snapshot, Order = tonumber(action.Order), RecordID = tonumber(action.ID),
                 SentAt = getMacroElapsed(), Error = detectError,
             }
-            return false, "PlaceUnit đã gửi một lần nhưng chưa ánh xạ được Model: " .. tostring(detectError)
+            return false, "Chưa thấy Model của " .. tostring(action.Unit)
+                .. "; sẽ kiểm tra lại và thử đặt sau 1.5s: " .. tostring(detectError),
+                { Retryable = true, RemoteSent = true, RetrySafe = true }
         end
 
         self._runtimeIdClaimed[newId] = true
@@ -10001,6 +10107,7 @@ function MacroEngine:_runAction(action, token, ctx)
         if order then self.OrderMap[order] = newId end
         local key = order or oldId
         if key then self._pendingOrderMappings[key] = nil end
+        self._placeRetryStates[action] = nil
         return true, string.format("Đã xác nhận %s · runtime ID %s", tostring(action.Unit), tostring(newId)), {
             CashWait = cashWait or 0, Model = model,
         }
@@ -10066,10 +10173,20 @@ function MacroEngine:_runAction(action, token, ctx)
             return false, "Bỏ qua UpgradeUnit ID " .. tostring(oldId) .. " vì PlaceUnit trước đó bị Server từ chối."
         end
         local newId = self:_resolveReplayRuntimeId(action)
-        if not newId then return false, "Chưa có Runtime ID Mapping cho UpgradeUnit Order=" .. tostring(action.Order or "?"), { Retryable = true, RemoteSent = false } end
+        if not newId then
+            return false, "Chưa có Runtime ID Mapping cho UpgradeUnit"
+                .. " · Order=" .. tostring(action.Order or "?")
+                .. " · RecordID=" .. tostring(oldId or "?")
+                .. " · Unit=" .. tostring(action.Unit or "?")
+                .. ". Sẽ thử ánh xạ lại sau 1.5s; không gửi nhầm Upgrade sang Tower khác.",
+                { Retryable = true, RemoteSent = false }
+        end
         if not rf.UpgradeUnit then return false, "Remote UpgradeUnit không tồn tại." end
         local model = findMacroModelById(newId, action.Unit, ctx)
-        if not model then return false, "Runtime ID đã map nhưng không tìm thấy Model để xác nhận Upgrade.", { Retryable = true, RemoteSent = false } end
+        if not model then
+            return false, "Runtime ID đã map nhưng Model chưa sẵn sàng; sẽ thử lại sau 1.5s.",
+                { Retryable = true, RemoteSent = false }
+        end
 
         local fromLevel, toLevel = tonumber(action.FromLevel), tonumber(action.ToLevel)
         if toLevel then
@@ -10091,55 +10208,17 @@ function MacroEngine:_runAction(action, token, ctx)
             end
         end
 
-        local requiredUpgradeCash = tonumber(action.UpgradeCost)
-        if not requiredUpgradeCash then
-            -- Tương thích JSON cũ: nếu thiếu UpgradeCost nhưng có CashBefore/CashAfter,
-            -- suy ra chi phí từ số tiền thực tế đã trừ ở lần Record đó.
-            local recordedBefore = tonumber(action.CashBefore)
-            local recordedAfter = tonumber(action.CashAfter)
-            if recordedBefore and recordedAfter and recordedBefore > recordedAfter then
-                requiredUpgradeCash = recordedBefore - recordedAfter
-            end
-        end
-        if requiredUpgradeCash and requiredUpgradeCash > 0 then
-            local moneyReady, moneyError = waitForMacroCash(requiredUpgradeCash, token, ctx)
-            if not moneyReady then return false, moneyError or "Không đủ Cash để Upgrade." end
-        end
+        -- Không dùng Cash cục bộ để chặn Upgrade: HUD/leaderstats có thể lệch hoặc compact.
+        -- Gửi theo Time của Macro; nếu Server từ chối rõ ràng, scheduler retry sau 1.5s.
         if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
             return false, "Replay đã chuyển trận trước khi UpgradeUnit."
         end
         local callOK, response = pcall(function() return callMacroRemote(rf.UpgradeUnit, newId) end)
         if not callOK then return false, "UpgradeUnit Remote lỗi: " .. tostring(response) end
         if isMacroRemoteRejected(response) then
-            if not isMacroCashRejection(response) then
-                return false, "Server từ chối UpgradeUnit: " .. tostring(macroResponseText(response))
-            end
-            if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
-                return false, "Replay đã chuyển trận sau phản hồi Upgrade; không tiếp tục retry."
-            end
-            -- Chỉ thử lại khi Cash thực sự thay đổi; không spam Remote theo vòng lặp thời gian.
-            local oldCash = readMacroCash()
-            if oldCash == nil then
-                return false, "Server từ chối Upgrade và không đọc được Cash; FIFO giữ nguyên tại Action này, không thể retry an toàn."
-            end
-            while self.Playing and token == self._playToken and isMacroRemoteRejected(response)
-                and (type(response) ~= "table" or isMacroCashRejection(response)) do
-                if isMacroContextEnded(ctx) then return false, "Trận kết thúc khi chờ Cash cho Upgrade." end
-                local currentCash = readMacroCash()
-                if currentCash and currentCash > oldCash then
-                    if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
-                        return false, "Replay đã chuyển trận trong lúc chờ Cash; không retry Upgrade của trận cũ."
-                    end
-                    oldCash = currentCash
-                    callOK, response = pcall(function() return callMacroRemote(rf.UpgradeUnit, newId) end)
-                    if not callOK then return false, "UpgradeUnit Remote lỗi khi thử lại: " .. tostring(response) end
-                else
-                    task.wait(0.2)
-                end
-            end
-            if isMacroRemoteRejected(response) then
-                return false, "Replay dừng khi Upgrade còn đang chờ Cash: " .. tostring(macroResponseText(response))
-            end
+            local rejectionText = macroResponseText(response)
+            return false, "Server từ chối UpgradeUnit; sẽ thử lại sau 1.5s: " .. tostring(rejectionText),
+                { Retryable = true, RemoteSent = true, ServerRejected = true }
         end
 
         if toLevel then
@@ -10196,12 +10275,44 @@ function MacroEngine:_runAction(action, token, ctx)
     elseif actionType == "UpgradeAll" then
         if not rf.UpgradeAll then return false, "JSON có UpgradeAll nhưng game không cung cấp Remote UpgradeAll; chưa thể chạy action này." end
         local ok, result = pcall(function() return callMacroRemote(rf.UpgradeAll) end)
-        if not ok or isMacroRemoteRejected(result) then
-            return false, "UpgradeAll lỗi/server từ chối: " .. tostring(macroResponseText(result))
+        if not ok then
+            return false, "UpgradeAll Remote lỗi: " .. tostring(result)
         end
+        if isMacroRemoteRejected(result) then
+            return false, "Server từ chối UpgradeAll; sẽ thử lại sau 1.5s: "
+                .. tostring(macroResponseText(result)),
+                { Retryable = true, RemoteSent = true, ServerRejected = true }
+        end
+        -- Mỗi Action UpgradeAll trong JSON được gửi đúng một lần khi Server không từ chối.
+        -- Không gộp các lần bấm UpgradeAll ở những Time khác nhau.
         return true, "Đã gửi UpgradeAll; phản hồi Remote không báo từ chối."
     end
     return false, "Action Type chưa hỗ trợ: " .. actionType
+end
+
+local function hydrateReplayPlacementMetadata(actions)
+    if type(actions) ~= "table" then return end
+    local placementByRecordId = {}
+    local nextOrder = 0
+    for _, action in ipairs(actions) do
+        if type(action) == "table" then
+            if action.Type == "PlaceUnit" then
+                nextOrder += 1
+                if tonumber(action.Order) == nil then action.Order = nextOrder end
+                local recordId = tonumber(action.ID)
+                if recordId then placementByRecordId[recordId] = action end
+            elseif action.Type == "UpgradeUnit" or action.Type == "SellUnit"
+                or action.Type == "ToggleAutoUpgrade" or action.Type == "LockUnit" then
+                local place = placementByRecordId[tonumber(action.ID)]
+                if place then
+                    action.Order = tonumber(action.Order) or tonumber(place.Order)
+                    action.Unit = action.Unit or place.Unit
+                    action.Position = action.Position or place.Position
+                    action.CF = action.CF or place.CF
+                end
+            end
+        end
+    end
 end
 
 function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
@@ -10214,7 +10325,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
     if not okDecode or type(actions) ~= "table" or #actions == 0 then
         return false, "Macro JSON trống hoặc không hợp lệ."
     end
-
+    hydrateReplayPlacementMetadata(actions)
 
     local startStamp = getMacroStartStamp(ctx)
     local leadSeconds = math.clamp(tonumber(self._replayLeadSeconds) or 0, 0, 5)
@@ -10241,6 +10352,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
     self._replayScheduleOffset = 0
     self._replayFailedActions = {}
     self._failedPlaceRecordIds = {}
+    self._placeRetryStates = setmetatable({}, { __mode = "k" })
     self._sellSentRuntimeIds = {}
     self.IdMap = {}
     self.OrderMap = {}
@@ -10253,7 +10365,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
     if api and api.notify then api.notify("Macro started · replay", Color3.fromRGB(50, 200, 110), "ChenFuWei") end
     if api then
         api.setMacroPlayUI(true, true)
-        api.setMacroStatus(string.format("Macro started · %d actions · run ahead %.1fs (TickSpeed %.1fx) · FIFO.",
+        api.setMacroStatus(string.format("Macro started · %d actions · run ahead %.1fs (TickSpeed %.1fx) · FIFO / retry 1.5s.",
             #actions, leadSeconds, tickSpeed), true)
     end
 
@@ -10302,9 +10414,13 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
             end
 
             local actualStart = getMacroElapsed(ctx)
-            -- Retry chỉ dành cho lỗi xảy ra TRƯỚC khi gửi Remote (ví dụ Runtime ID
-            -- chưa được ánh xạ). Tuyệt đối không tự gửi lại Place/Sell/Upgrade đã gửi,
-            -- vì Client có thể chưa nhận replication dù Server đã xử lý thành công.
+            -- Chỉ retry các Action có thể xác nhận an toàn: chưa gửi Remote (thiếu ID/Model),
+            -- Server trả lời từ chối rõ ràng, hoặc Place đã gửi nhưng chưa thấy Model mới.
+            -- Remote đã được chấp nhận thì không gửi lại để tránh đặt/nâng cấp trùng.
+            local RETRYABLE_ACTION_TYPES = { PlaceUnit = true, UpgradeUnit = true, UpgradeAll = true }
+            local MAX_ACTION_RETRIES = 10
+            local ACTION_RETRY_INTERVAL = 1.5
+            local retryCount = 0
             local actionCallOK, actionOK, message, details
             repeat
                 actionCallOK, actionOK, message, details = pcall(function()
@@ -10318,10 +10434,16 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
                 end
                 actionOK = actionOK == true
                 message = tostring(message or (actionOK and "Hoàn tất" or "Action chưa hoàn tất"))
-                if actionOK or not (type(details) == "table" and details.Retryable == true
-                    and details.RemoteSent == false) then
-                    break
-                end
+
+                local retryInfo = type(details) == "table" and details.Retryable == true
+                local retryIsSafe = type(details) == "table" and (
+                    details.RemoteSent == false or details.ServerRejected == true or details.RetrySafe == true
+                )
+                local canRetry = not actionOK and RETRYABLE_ACTION_TYPES[action.Type] == true
+                    and retryInfo and retryIsSafe and retryCount < MAX_ACTION_RETRIES
+                if not canRetry then break end
+
+                retryCount += 1
                 self._replayState = "WAITING_FOR_ACTION"
                 self._replayBlockedIndex = index
                 self._waitingQueue = {}
@@ -10329,10 +10451,11 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
                     self._waitingQueue[#self._waitingQueue + 1] = actions[queuedIndex]
                 end
                 if api then
-                    api.setMacroStatus(string.format("FIFO WAITING · Action %d/%d · %s · thử lại an toàn sau 0.25s",
-                        index, #actions, message), false)
+                    api.setMacroStatus(string.format(
+                        "FIFO RETRY · Action %d/%d · %s · lần thử lại %d/%d sau 1.5s",
+                        index, #actions, tostring(action.Type), retryCount, MAX_ACTION_RETRIES), false)
                 end
-                task.wait(0.25)
+                task.wait(ACTION_RETRY_INTERVAL)
             until not self.Playing or token ~= self._playToken
                 or runGeneration ~= self._replayRunGeneration or isMacroContextEnded(ctx)
             if not self.Playing or token ~= self._playToken
@@ -10341,11 +10464,11 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
                 self:_finishReplayMatch(ctx, "Trận kết thúc sau Action " .. tostring(index))
                 break
             end
-            if actionOK then
-                self._replayState = "RUNNING_MACRO"
-                self._replayBlockedIndex = nil
-                self._waitingQueue = {}
-            end
+            -- Dù Action thành công hay đã hết số lần retry, trả scheduler về trạng thái chạy
+            -- để Action tiếp theo được xử lý; không giữ FIFO WAITING cũ sau khi đã bỏ qua lỗi.
+            self._replayState = "RUNNING_MACRO"
+            self._replayBlockedIndex = nil
+            self._waitingQueue = {}
 
             attempted += 1
             local actualFinish = getMacroElapsed(ctx)
@@ -10361,17 +10484,23 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
                 end
             else
                 failedCount += 1
+                if action.Type == "PlaceUnit" then
+                    local recordId = tonumber(action.ID)
+                    if recordId then self._failedPlaceRecordIds[recordId] = tostring(message) end
+                    if self._placeRetryStates then self._placeRetryStates[action] = nil end
+                end
                 table.insert(self._replayFailedActions, {
                     Index = index, Type = tostring(action.Type), TargetTime = targetTime,
                     ActualTime = actualStart, Delay = delayNow, Reason = tostring(message),
+                    Attempts = retryCount + 1,
                 })
-                warn(string.format("[DUY MACRO] Action %d (%s) không thể tiếp tục an toàn: %s",
-                    index, tostring(action.Type), tostring(message)))
-                -- V2.27: bỏ qua Action lỗi và chạy tiếp (không gửi lại Remote); lý do nằm trong
-                -- status và _replayFailedActions để dễ xem.
+                warn(string.format("[DUY MACRO] Action %d (%s) không thể tiếp tục sau %d lần thử: %s",
+                    index, tostring(action.Type), retryCount + 1, tostring(message)))
+                -- Sau tối đa 10 lần retry, bỏ qua riêng Action lỗi và tiếp tục FIFO.
                 if api then
-                    api.setMacroStatus(string.format("BỎ QUA Action %d/%d (%s) · %s · Macro vẫn chạy tiếp",
-                        index, #actions, tostring(action.Type), tostring(message)), false)
+                    api.setMacroStatus(string.format(
+                        "BỎ QUA Action %d/%d (%s) · %d lần thử · %s · Macro tiếp tục",
+                        index, #actions, tostring(action.Type), retryCount + 1, tostring(message)), false)
                 end
             end
             task.wait() -- nhường scheduler; không tạo vòng lặp dồn dập
@@ -10420,6 +10549,7 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
     if not key or not item then return false, "Chưa có Macro file. Hãy tạo hoặc chọn file trước." end
     local okDecode, actions = pcall(function() return HttpService:JSONDecode(item.Content or "[]") end)
     if not okDecode or type(actions) ~= "table" or #actions == 0 then return false, "Macro JSON trống hoặc không hợp lệ." end
+    hydrateReplayPlacementMetadata(actions)
 
     -- Preflight theo schema ID + Action + Time. Mỗi ID chỉ được dùng sau PlaceUnit tương ứng.
     local recordedIds = {}
@@ -10606,6 +10736,7 @@ function MacroEngine:StopPlay(reason)
     self._runtimeIdClaimed = {}
     self._pendingOrderMappings = {}
     self._failedPlaceRecordIds = {}
+    self._placeRetryStates = setmetatable({}, { __mode = "k" })
     self._sellSentRuntimeIds = {}
     self._preflightSkipActions = {}
     self._replayScheduleOffset = 0
