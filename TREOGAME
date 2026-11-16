@@ -9664,30 +9664,6 @@ local function waitMacroTime(targetTime, ctx, token)
     return MacroEngine.Playing and token == MacroEngine._playToken, ""
 end
 
-local function waitForMacroCash(cost, token, ctx)
-    cost = tonumber(cost)
-    if not cost or cost <= 0 then return true, nil, 0 end
-    local initialCash = readMacroCash()
-    if initialCash == nil then return true, "Không đọc được Cash; sẽ để Server xác nhận.", 0 end
-    if initialCash >= cost then return true, nil, 0 end
-
-    -- Một Place chỉ được gửi đúng một lần. Trong lúc thiếu tiền chỉ chờ Cash thay đổi,
-    -- không spam Remote và không tạo bản sao Unit.
-    local startedAt = os.clock()
-    local lastStatusAt = 0
-    while MacroEngine.Playing and token == MacroEngine._playToken do
-        if isMacroContextEnded(ctx) then return false, "Trận kết thúc trong lúc chờ đủ tiền.", os.clock() - startedAt end
-        local cash = readMacroCash()
-        if cash and cash >= cost then return true, nil, os.clock() - startedAt end
-        if api and os.clock() - lastStatusAt >= 1 then
-            lastStatusAt = os.clock()
-            api.setMacroStatus("Đang chờ tiền · cần " .. tostring(math.floor(cost)) .. ", hiện có " .. tostring(cash or "?"), false)
-        end
-        task.wait(0.2)
-    end
-    return false, "Replay đã dừng hoặc trận kết thúc trong lúc chờ đủ tiền.", os.clock() - startedAt
-end
-
 local function macroResponseText(response)
     if type(response) ~= "table" then return tostring(response or ""):lower() end
     return table.concat({
@@ -9904,11 +9880,9 @@ function MacroEngine:_runAction(action, token, ctx)
         if not cframe then cframe = CFrame.new(position) end
 
         local cost = getUnitCostForMacro(action.Unit)
-        local cashOK, cashMessage, cashWait = waitForMacroCash(cost, token, ctx)
-        if not cashOK then return false, cashMessage, { CashWait = cashWait } end
-        if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
-            return false, "Replay đã chuyển trận trong lúc chờ tiền; hủy PlaceUnit của Context cũ."
-        end
+        -- Đã bỏ pre-check chờ Cash cục bộ: gửi PlaceUnit đúng theo Time của Macro.
+        -- Nếu Server thực sự từ chối vì thiếu tiền, nhánh xử lý phản hồi Server bên dưới vẫn hoạt động.
+        local cashWait = 0
 
         local decodedArgs = decodeMacroValue(action.RemoteArgs)
         local remoteValues = type(decodedArgs) == "table" and type(decodedArgs.Values) == "table" and decodedArgs.Values or nil
