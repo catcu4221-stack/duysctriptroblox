@@ -18,7 +18,7 @@
       - Record Sell xác nhận bằng Remote + Model removal; Observer fallback cần Model removal + Cash tăng gần thời điểm đó.
       - Record tuyen duong bang vi tri nguoi choi; KHONG phat lai chuyen dong.
       - Boss scanner theo MaxHP; chi gui thong bao khi HP ve 0 duoc xac nhan.
-      - Tab WEBHOOK: URL chi giu trong RAM; gui Macro/Map JSON va bao cao WIN/DEFEAT.
+      - Tab WEBHOOK: URL duoc luu cuc bo de tu nap lai; co nut RESET DISCORD LINK.
       - Match report: dem tran trong phien Play Macro, WIN/LOSS, thoi gian, Cash/Seeds/Damage.
 
     LUU Y QUAN TRONG:
@@ -77,14 +77,17 @@ local destroyed = false
 
 local PlayerGui = LP:WaitForChild("PlayerGui")
 
--- Discord webhook client-only: URL chi ton tai trong bo nho cua script hien tai.
--- Khong gan token vao source code va khong luu URL vao file save cua game.
+-- Discord webhook client-only. URL duoc luu trong file rieng tren may cua ban
+-- de tu nap lai sau khi chay lai script; khong luu vao file Map/Macro.
+-- LUU Y: file nay chua webhook URL dang plain text, chi su dung tren may tin cay.
 local executorRequest = (syn and syn.request)
     or (http and http.request)
     or http_request
     or (fluxus and fluxus.request)
     or request
 local savedWebhookUrl = nil
+local WEBHOOK_SAVE_FILE = "duy_discord_webhook.txt"
+local webhookFileStorageAvailable = type(writefile) == "function" and type(readfile) == "function"
 
 local function isValidDiscordWebhook(url)
     url = tostring(url or ""):match("^%s*(.-)%s*$")
@@ -92,6 +95,59 @@ local function isValidDiscordWebhook(url)
         and #url <= 300
         and url:match("^https://discord%.com/api/webhooks/%d+/[%w_-]+$") ~= nil
 end
+
+local function loadPersistedWebhookUrl()
+    if not webhookFileStorageAvailable then
+        return false, "Executor khong ho tro doc file; Webhook chi co the luu trong phien."
+    end
+    local readOK, raw = pcall(readfile, WEBHOOK_SAVE_FILE)
+    if not readOK or type(raw) ~= "string" then
+        return false, "Chua co Discord link duoc luu."
+    end
+    local url = raw:match("^%s*(.-)%s*$")
+    if url == "" then
+        return false, "Chua co Discord link duoc luu."
+    end
+    if not isValidDiscordWebhook(url) then
+        return false, "Discord link trong file luu khong hop le; hay RESET va nhap lai."
+    end
+    savedWebhookUrl = url
+    return true, "Da tu nap Discord link da luu tren may."
+end
+
+local function persistWebhookUrl(url)
+    if not webhookFileStorageAvailable then
+        return false, "Executor khong ho tro readfile/writefile; link chi duoc giu trong phien nay."
+    end
+    local ok, err = pcall(writefile, WEBHOOK_SAVE_FILE, tostring(url or ""))
+    if not ok then
+        return false, "Khong luu duoc Discord link: " .. tostring(err)
+    end
+    return true, "Da luu Discord link tren may."
+end
+
+local function clearPersistedWebhookUrl()
+    if not webhookFileStorageAvailable then
+        return false, "Executor khong ho tro file; link da xoa trong phien nay nhung khong the xoa ban luu."
+    end
+
+    local cleared = false
+    if type(delfile) == "function" then
+        local deleteOK, deleteResult = pcall(delfile, WEBHOOK_SAVE_FILE)
+        cleared = deleteOK and deleteResult ~= false
+    end
+    if not cleared then
+        local writeOK = pcall(writefile, WEBHOOK_SAVE_FILE, "")
+        cleared = writeOK
+    end
+    if not cleared then
+        return false, "Khong the xoa file Discord link tren may."
+    end
+    return true, "Da RESET Discord link. Hay nhap link moi va bam SAVE WEBHOOK."
+end
+
+-- Tu nap link da luu tu lan chay truoc (neu co).
+local webhookLoadedAtStartup, webhookStartupMessage = loadPersistedWebhookUrl()
 
 local function postDiscordPayload(payload)
     if not savedWebhookUrl then
@@ -4212,7 +4268,7 @@ do
         -- TAB 4: DISCORD WEBHOOK
         local webhookPanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
-            Size = UDim2.new(1, -24, 0, 650),
+            Size = UDim2.new(1, -24, 0, 690),
             BackgroundColor3 = C.PANEL,
             BorderSizePixel = 0,
         }, tabFrames[4])
@@ -4220,7 +4276,7 @@ do
         makeLabel(webhookPanel, "WEBHOOK DISCORD", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
-        makeLabel(webhookPanel, "Nhap webhook cua ban. URL chi giu trong bo nho script hien tai; dong script se mat URL.",
+        makeLabel(webhookPanel, "Discord link se tu luu tren may va tu nap khi bat lai script. Bam RESET DISCORD LINK neu muon doi link.",
             UDim2.new(0, 14, 0, 40), UDim2.new(1, -28, 0, 34), {
                 TextSize = 10, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
             })
@@ -4230,9 +4286,10 @@ do
             UDim2.new(0, 14, 0, 124), UDim2.new(0.48, -5, 0, 30), { Background = C.GREEN_DARK })
         local testWebhookButton = makeButton(webhookPanel, "SEND TEST",
             UDim2.new(0.52, 5, 0, 124), UDim2.new(0.48, -19, 0, 30), { Background = C.BUTTON })
-        local webhookStatusLabel = makeLabel(webhookPanel, "Webhook: chua cau hinh",
+        local webhookStatusLabel = makeLabel(webhookPanel,
+            savedWebhookUrl and "Webhook: Da tu nap link da luu tren may." or "Webhook: chua cau hinh",
             UDim2.new(0, 14, 0, 165), UDim2.new(1, -28, 0, 24), {
-                TextSize = 10, Color = C.DIM,
+                TextSize = 10, Color = savedWebhookUrl and C.GREEN or C.DIM,
             })
         makeLabel(webhookPanel, "Bao cao ket qua tran va Boss khi duoc xac nhan bi ha.",
             UDim2.new(0, 14, 0, 190), UDim2.new(1, -28, 0, 32), {
@@ -4325,6 +4382,16 @@ do
             })
         local mapDiscordStatus = makeLabel(webhookPanel, "Map export: no file selected",
             UDim2.new(0, 14, 0, 620), UDim2.new(1, -28, 0, 20), { TextSize = 9, Color = C.DIM })
+        local resetWebhookButton = makeButton(webhookPanel, "RESET DISCORD LINK",
+            UDim2.new(0, 14, 0, 655), UDim2.new(1, -28, 0, 28), {
+                Background = C.RED, TextSize = 10,
+            })
+        resetWebhookButton.Activated:Connect(function()
+            local ok, message = callbacks.onResetWebhook()
+            webhookBox.Text = ""
+            webhookStatusLabel.Text = "Webhook: " .. tostring(message)
+            webhookStatusLabel.TextColor3 = ok and C.GREEN or C.RED
+        end)
 
         local function refreshDiscordMacroFiles()
             clearExportEntries(macroExportEntries)
@@ -8459,6 +8526,15 @@ function MacroEngine:StopRecord(reason)
         end
         return true, "Đã hủy trạng thái chờ Record."
     end
+    -- Record co the da tu dong chuyen sang SAVING khi tran ket thuc.
+    -- Cho phep tat cong tac UI trong luc luu, nhung khong huy tien trinh ghi JSON.
+    if self._recordState == "SAVING" or self._savingRecord or self._saveQueued then
+        if api then
+            api.setMacroRecordUI(false, true)
+            api.setMacroStatus("Record đang lưu JSON; tiến trình lưu vẫn tiếp tục.", true)
+        end
+        return true, "Record đang lưu; không cần dừng thêm."
+    end
     if not self.Recording then return false, "Record Macro chưa bật." end
     task.spawn(function() self:_saveRecord(reason or "người dùng Stop") end)
     return true, "Đang dừng Record và tự lưu JSON..."
@@ -10432,8 +10508,11 @@ end
 function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
     if destroyed or self._shuttingDown then return false, "Script đã đóng; không thể Replay." end
     if self.Playing then return false, "Macro đang chạy." end
+    if self._savingRecord or self._saveQueued or self._recordState == "SAVING" then
+        return false, "Macro Record vẫn đang lưu JSON; hãy đợi lưu xong rồi bật Play Macro."
+    end
     if self.Recording or self._recordState == "WAITING_FOR_NEXT_MATCH" then
-        return false, "Đang Record hoặc chờ Record; hãy tắt Record trước."
+        return false, "Record vẫn đang hoạt động; hãy tắt Record trước khi Replay."
     end
     if not self._remoteReady then
         -- Startup chỉ thử tìm Remote trong một khoảng thời gian hữu hạn. Retry ngay khi
@@ -11008,13 +11087,30 @@ end
 
 callbacks.onMacroRecordChanged = function(enabled)
     if destroyed then return false, "Script đã đóng." end
-    if enabled then return MacroEngine:StartRecord() end
+    if enabled then
+        -- Hai che do khong chay dong thoi. Neu Play Macro chi dang cho tran moi,
+        -- tu dong huy trang thai cho de chuyen sang Record; khong cat ngang Replay dang chay.
+        if MacroEngine._autoRepeatArmed and not MacroEngine.Playing then
+            MacroEngine:StopPlay("chuyển sang Record Macro")
+        end
+        return MacroEngine:StartRecord()
+    end
     return MacroEngine:StopRecord("người dùng tắt Record")
 end
 
 callbacks.onMacroPlayChanged = function(enabled)
     if destroyed then return false, "Script đã đóng." end
     if enabled then
+        -- Record dang cho tran chua thu Action nao: huy trang thai cho nay de Play Macro
+        -- co the bat ngay. Neu dang thu that su thi khong tu y bo Record cua nguoi dung.
+        if MacroEngine._recordState == "WAITING_FOR_NEXT_MATCH" and not MacroEngine.Recording then
+            local cancelOK, cancelMessage = MacroEngine:StopRecord("chuyển sang Play Macro")
+            if not cancelOK then return false, cancelMessage end
+        elseif MacroEngine.Recording then
+            return false, "Record đang thu Action. Hãy tắt Record để lưu Macro trước khi bật Play Macro."
+        elseif MacroEngine._savingRecord or MacroEngine._saveQueued or MacroEngine._recordState == "SAVING" then
+            return false, "Record đang lưu JSON. Hãy đợi lưu xong rồi bật Play Macro."
+        end
         local ok, message = MacroEngine:StartPlay()
         if ok and MatchStatsTracker then MatchStatsTracker:StartSession() end
         return ok, message
@@ -11658,7 +11754,7 @@ callbacks.onPerformanceChanged = function(name, enabled)
     return ok, message
 end
 
--- TAB WEBHOOK callbacks: client-only, URL chi giu trong RAM cua script.
+-- TAB WEBHOOK callbacks: URL duoc luu cuc bo va co the RESET trong GUI.
 callbacks.getWebhookExportFiles = function()
     local macros, maps = {}, {}
     for _, key in ipairs(MacroStore:GetFileList()) do
@@ -11715,8 +11811,22 @@ callbacks.onConfigureWebhook = function(url)
     if type(executorRequest) ~= "function" then
         return false, "Executor khong ho tro HTTP request."
     end
+
+    if webhookFileStorageAvailable then
+        local saveOK, saveMessage = persistWebhookUrl(url)
+        if not saveOK then return false, saveMessage end
+        savedWebhookUrl = url
+        return true, "Da luu Discord link tren may; lan sau se tu nap lai."
+    end
+
     savedWebhookUrl = url
-    return true, "Da luu webhook trong bo nho script."
+    return true, "Da luu trong phien nay; executor khong ho tro luu link qua lan chay sau."
+end
+
+callbacks.onResetWebhook = function()
+    savedWebhookUrl = nil
+    local cleared, message = clearPersistedWebhookUrl()
+    return cleared, message
 end
 
 callbacks.onTestWebhook = function()
@@ -11740,7 +11850,11 @@ MacroStore:Init()
 api = GUI:Build(callbacks)
 
 api.setMacroStatus("Đang khởi tạo Macro Engine...", true)
-api.setWebhookStatus("chua SAVE WEBHOOK", false)
+api.setWebhookStatus(
+    savedWebhookUrl and "Da tu nap Discord link da luu tren may."
+        or (webhookStartupMessage or "chua SAVE WEBHOOK"),
+    savedWebhookUrl ~= nil
+)
 -- Tach khoi luong khoi dong Macro khoi frame khoi tao GUI de giam khung hinh bi dung.
 task.defer(function()
     if destroyed then return end
