@@ -1,5 +1,5 @@
 --[[
-    TREOST EVADE HYBRID - V1.1
+    TREOST EVADE HYBRID - V1.2
     TREOST remains the base for the original Smart Evade engine and persistent ObstacleMemory.
     Selected CFW components are integrated without replacing the TREOST evade algorithms.
 
@@ -21,6 +21,10 @@
       - Waypoint mode reads TREOST's event-driven BillboardGui/HP enemy records only. It does not
         run Smart Evade dodging, obstacle-memory routing, or pathfinding while moving between points.
       - Wave parsing is based on UI object text-change events, not pixel scanning/OCR.
+      - Macro replay is event-order FIFO: first PlaceUnit retries every 20 seconds until confirmed;
+        each following action runs 2 seconds apart with up to 10 retries every 2 seconds.
+      - Macro JSON uses Sequence only; Replay never schedules actions from recorded Time.
+      - Match results are based only on participants' alive/dead state; Base HP is not consulted.
       - X1.5 is sent as a fractional ChangeTickSpeed request; actual support depends on the server.
       - Executor file/HTTP APIs are environment-dependent and are not available in Roblox Studio.
 ]]
@@ -640,9 +644,18 @@ do
             if not allowedTypes[action.Type] then
                 return false, "Unsupported Action type at index " .. tostring(key) .. ": " .. tostring(action.Type)
             end
-            local eventTime = tonumber(action.Time)
-            if not eventTime or eventTime ~= eventTime or eventTime < 0 or eventTime == math.huge then
-                return false, "Invalid or missing Time at Action " .. tostring(key) .. "."
+            -- Time is optional legacy metadata only; the new Replay scheduler never reads it.
+            if action.Time ~= nil then
+                local eventTime = tonumber(action.Time)
+                if not eventTime or eventTime ~= eventTime or eventTime < 0 or eventTime == math.huge then
+                    return false, "Invalid legacy Time metadata at Action " .. tostring(key) .. "."
+                end
+            end
+            if action.Sequence ~= nil then
+                local sequence = tonumber(action.Sequence)
+                if not sequence or sequence < 1 or sequence % 1 ~= 0 then
+                    return false, "Invalid Sequence at Action " .. tostring(key) .. "."
+                end
             end
             local needsId = action.Type == "PlaceUnit" or action.Type == "UpgradeUnit"
                 or action.Type == "SellUnit" or action.Type == "LockUnit"
@@ -5800,23 +5813,23 @@ do
     end
 
     local C = {
-        BG = Color3.fromRGB(26, 28, 34),
-        PANEL = Color3.fromRGB(24, 29, 39),
-        SIDEBAR = Color3.fromRGB(29, 31, 37),
-        HEADER = Color3.fromRGB(26, 28, 34),
-        INPUT = Color3.fromRGB(31, 36, 46),
-        BUTTON = Color3.fromRGB(45, 48, 56),
-        BUTTON_HOVER = Color3.fromRGB(57, 61, 70),
-        ACCENT = Color3.fromRGB(85, 175, 255),
-        TEXT = Color3.fromRGB(240, 240, 245),
-        DIM = Color3.fromRGB(218, 222, 230),
+        BG = Color3.fromRGB(22, 6, 11),
+        PANEL = Color3.fromRGB(37, 8, 16),
+        SIDEBAR = Color3.fromRGB(58, 8, 20),
+        HEADER = Color3.fromRGB(82, 9, 25),
+        INPUT = Color3.fromRGB(56, 12, 25),
+        BUTTON = Color3.fromRGB(83, 13, 31),
+        BUTTON_HOVER = Color3.fromRGB(126, 18, 40),
+        ACCENT = Color3.fromRGB(255, 45, 72),
+        TEXT = Color3.fromRGB(255, 242, 245),
+        DIM = Color3.fromRGB(231, 190, 199),
         GREEN = Color3.fromRGB(50, 200, 110),
         GREEN_DARK = Color3.fromRGB(39, 76, 59),
-        RED = Color3.fromRGB(235, 65, 65),
-        RED_DARK = Color3.fromRGB(83, 42, 44),
+        RED = Color3.fromRGB(255, 40, 66),
+        RED_DARK = Color3.fromRGB(132, 12, 34),
         YELLOW = Color3.fromRGB(255, 200, 50),
-        TRACK = Color3.fromRGB(65, 68, 76),
-        ACTIVE_FILE = Color3.fromRGB(43, 58, 75),
+        TRACK = Color3.fromRGB(103, 15, 36),
+        ACTIVE_FILE = Color3.fromRGB(145, 16, 43),
     }
 
     local function newInstance(className, properties, parent)
@@ -5839,7 +5852,7 @@ do
 
     local function addStroke(parent, color, thickness)
         return newInstance("UIStroke", {
-            Color = color or Color3.fromRGB(48, 66, 96),
+            Color = color or Color3.fromRGB(145, 24, 48),
             Thickness = thickness or 1,
         }, parent)
     end
@@ -6200,7 +6213,7 @@ do
             BorderSizePixel = 0,
         }, screen)
         addCorner(window, 11)
-        addStroke(window, Color3.fromRGB(55, 82, 122), 1)
+        addStroke(window, Color3.fromRGB(210, 26, 58), 1.4)
 
         -- Native pixel sizing: avoid fractional UIScale blur. Start compact; all four corners resize the window.
         local responsiveScale = newInstance("UIScale", { Scale = 1 }, window)
@@ -6311,7 +6324,7 @@ do
                 ZIndex = 80,
             }, window)
             addCorner(handle, 5)
-            addStroke(handle, Color3.fromRGB(77, 110, 151), 1)
+            addStroke(handle, Color3.fromRGB(145, 24, 48), 1)
             handle.InputBegan:Connect(function(input)
                 if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
                     resizeActive = true
@@ -6733,7 +6746,7 @@ do
             BorderSizePixel = 0,
         }, globalMain)
         addCorner(globalPanel, 11)
-        addStroke(globalPanel, Color3.fromRGB(57, 78, 110), 1)
+        addStroke(globalPanel, Color3.fromRGB(145, 24, 48), 1)
         makeLabel(globalPanel, "MAIN CONTROL", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
@@ -6749,7 +6762,7 @@ do
             BorderSizePixel = 0,
         }, globalPanel)
         addCorner(speedPanel, 9)
-        addStroke(speedPanel, Color3.fromRGB(52, 70, 98), 1)
+        addStroke(speedPanel, Color3.fromRGB(145, 24, 48), 1)
         makeLabel(speedPanel, "GAME SPEED", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 10, Color = C.ACCENT,
         })
@@ -6767,7 +6780,7 @@ do
             BorderSizePixel = 0,
         }, globalPanel)
         addCorner(automationPanel, 9)
-        addStroke(automationPanel, Color3.fromRGB(52, 70, 98), 1)
+        addStroke(automationPanel, Color3.fromRGB(145, 24, 48), 1)
         makeLabel(automationPanel, "AUTOMATION", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 10, Color = C.ACCENT,
         })
@@ -6794,7 +6807,7 @@ do
         local difficultyList = newInstance("ScrollingFrame", {
             Position = UDim2.new(0, 10, 0, 84),
             Size = UDim2.new(1, -20, 0, 112),
-            BackgroundColor3 = Color3.fromRGB(12, 15, 23),
+            BackgroundColor3 = Color3.fromRGB(24, 11, 16),
             BorderSizePixel = 0,
             ScrollBarThickness = 3,
             ScrollBarImageColor3 = C.ACCENT,
@@ -6869,7 +6882,7 @@ do
                 and (uiLanguage == "VI"
                     and "Auto Ability đã bật: Ability sẽ tự kích hoạt khi hồi xong; bỏ qua Ability theo Time trong JSON."
                     or "Auto Ability enabled: abilities trigger when cooldown ends; timed ability actions in JSON are skipped.")
-                or (uiLanguage == "VI" and "Auto Ability đã tắt: Macro Ability sẽ chạy theo Time trong JSON."
+                or (uiLanguage == "VI" and "Auto Ability đã tắt: ActivateUnitAbility không được lưu trong Macro JSON."
                     or "Auto Ability disabled: ability actions follow their JSON timestamps.")
             if callbacks.onAutoAbilityChanged then
                 ok, message = callbacks.onAutoAbilityChanged(enabled)
@@ -6927,7 +6940,7 @@ do
             BorderSizePixel = 0,
         }, macroTab)
         addCorner(macroPanel, 11)
-        addStroke(macroPanel, Color3.fromRGB(57, 78, 110), 1)
+        addStroke(macroPanel, Color3.fromRGB(145, 24, 48), 1)
         makeLabel(macroPanel, "MACRO FILE MANAGER", UDim2.new(0, 12, 0, 8), UDim2.new(1, -24, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT,
         })
@@ -6979,7 +6992,7 @@ do
             ZIndex = 35,
         }, macroScroll)
         addCorner(macroDropdownList, 6)
-        addStroke(macroDropdownList, Color3.fromRGB(54, 75, 110), 1)
+        addStroke(macroDropdownList, Color3.fromRGB(127, 38, 54), 1)
         newInstance("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, macroDropdownList)
         newInstance("UIPadding", {
             PaddingTop = UDim.new(0, 3), PaddingLeft = UDim.new(0, 3),
@@ -6991,7 +7004,7 @@ do
             BackgroundColor3 = C.INPUT, BorderSizePixel = 0,
         }, macroScroll)
         addCorner(macroStatusCard, 8)
-        addStroke(macroStatusCard, Color3.fromRGB(48, 66, 96), 1)
+        addStroke(macroStatusCard, Color3.fromRGB(145, 24, 48), 1)
         local macroFileStatus = makeLabel(macroStatusCard, "MACRO FILE: NONE · ACTIONS: --",
             UDim2.new(0, 10, 0, 6), UDim2.new(1, -20, 0, 18), { TextSize = 11, Color = C.ACCENT })
         local macroProgressStatus = makeLabel(macroStatusCard, "STATUS: READY",
@@ -7023,29 +7036,12 @@ do
             setStatus(message, ok and C.GREEN or C.YELLOW)
         end)
 
-        -- Bù độ trễ phát hiện trận / khởi động Replay: trừ khỏi deadline của từng Action.
-        -- Đây là offset lịch chạy, không sửa Time trong JSON.
-        local macroLeadSeconds = 0
-        makeLabel(macroScroll, "CHẠY SỚM HƠN", UDim2.new(0, 6, 0, 289), UDim2.new(0.58, -6, 0, 28), {
-            TextSize = 10, Color = C.TEXT,
-        })
-        local macroLeadButton = makeButton(macroScroll, "0 GIÂY  ▼", UDim2.new(0.62, 0, 0, 289), UDim2.new(0.38, -6, 0, 28), {
-            Background = C.INPUT, TextSize = 10,
-        })
-        macroLeadButton.Activated:Connect(function()
-            macroLeadSeconds = (macroLeadSeconds + 1) % 6
-            macroLeadButton.Text = tostring(macroLeadSeconds) .. " GIÂY  ▼"
-            if callbacks.onMacroLeadChanged then
-                local ok, message = callbacks.onMacroLeadChanged(macroLeadSeconds)
-                if ok == false then
-                    setStatus(message or "Không cập nhật được thời gian chạy sớm.", C.RED)
-                    return
-                end
-            end
-            setStatus("Macro sẽ chạy sớm " .. tostring(macroLeadSeconds) .. " giây thực (đã tính TickSpeed).", C.GREEN)
-        end)
-
-        -- Không sửa Time trong JSON; Replay chỉ điều chỉnh deadline khi chạy.
+        local macroFifoInfo = makeLabel(macroScroll,
+            "FIFO: PLACE ĐẦU THỬ LẠI MỖI 20s · ACTION SAU CÁCH 2s · TỐI ĐA 10 LẦN THỬ LẠI",
+            UDim2.new(0, 6, 0, 289), UDim2.new(1, -12, 0, 28), {
+                TextSize = 9, Color = C.ACCENT, Wrapped = true,
+            })
+        macroFifoInfo.TextYAlignment = Enum.TextYAlignment.Center
         macroScroll.CanvasSize = UDim2.new(0, 0, 0, 364)
 
         local selectedMacroKey = nil
@@ -7225,7 +7221,7 @@ do
             BorderSizePixel = 0,
         }, evadeTab)
         addCorner(evadeLeft, 10)
-        addStroke(evadeLeft, Color3.fromRGB(57, 78, 110), 1)
+        addStroke(evadeLeft, Color3.fromRGB(145, 24, 48), 1)
         newInstance("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, evadeLeft)
         makeLabel(evadeLeft, "EVADE FILE MANAGER", UDim2.new(0, 0, 0, 8), UDim2.new(1, 0, 0, 21), {
             Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT, Align = Enum.TextXAlignment.Center,
@@ -7245,7 +7241,7 @@ do
             ScrollingDirection = Enum.ScrollingDirection.Y, ClipsDescendants = true, ZIndex = 30,
         }, evadeLeft)
         addCorner(evadeDropdownList, 6)
-        addStroke(evadeDropdownList, Color3.fromRGB(54, 75, 110), 1)
+        addStroke(evadeDropdownList, Color3.fromRGB(145, 24, 48), 1)
         newInstance("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, evadeDropdownList)
         newInstance("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4) }, evadeDropdownList)
         local evadeRenameBox = makeTextBox(evadeLeft, "Nhập tên mới để đổi tên...",
@@ -7270,7 +7266,7 @@ do
             BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
         }, evadeTab)
         addCorner(evadeRight, 10)
-        addStroke(evadeRight, Color3.fromRGB(57, 78, 110), 1)
+        addStroke(evadeRight, Color3.fromRGB(145, 24, 48), 1)
         makeLabel(evadeRight, "AUTO EVADE", UDim2.new(0, 10, 0, 9), UDim2.new(1, -20, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT, Align = Enum.TextXAlignment.Center,
         })
@@ -7415,33 +7411,68 @@ do
         end)
 
         -- Màn hình biên tập waypoint độc lập; menu chính được ẩn trong lúc đặt điểm.
+        -- Floating editor: no full-screen dim layer and no modal input blocker.
+        -- Only this compact panel receives input; the player can keep moving freely.
         local editorOverlay = newInstance("Frame", {
             Name = "EvadeWaypointEditor", Size = UDim2.fromScale(1, 1),
-            BackgroundColor3 = Color3.fromRGB(3, 5, 10), BackgroundTransparency = 0.18,
-            BorderSizePixel = 0, Visible = false, Active = true, ZIndex = 180,
+            BackgroundTransparency = 1, BorderSizePixel = 0,
+            Visible = false, Active = false, ZIndex = 180,
         }, screen)
         local editorCard = newInstance("Frame", {
-            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-            Size = UDim2.new(isMobileLayout and 0.90 or 0.48, 0, 0, 270),
+            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.78, 0.52),
+            Size = UDim2.fromOffset(224, 216),
             BackgroundColor3 = C.PANEL, BorderSizePixel = 0, ZIndex = 181,
+            Active = true,
         }, editorOverlay)
         addCorner(editorCard, 12)
-        addStroke(editorCard, C.ACCENT, 1)
-        local editorTitle = makeLabel(editorCard, "EVADE WAYPOINT EDITOR", UDim2.new(0, 16, 0, 13), UDim2.new(1, -55, 0, 24), {
-            Font = Enum.Font.GothamBold, TextSize = 13, Color = C.ACCENT,
+        addStroke(editorCard, C.ACCENT, 1.5)
+        local editorHeader = newInstance("Frame", {
+            Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(1, 0, 0, 34),
+            BackgroundColor3 = C.HEADER, BorderSizePixel = 0,
+            Active = true, ZIndex = 182,
+        }, editorCard)
+        addCorner(editorHeader, 10)
+        local editorTitle = makeLabel(editorHeader, "EVADE · SET POINTS", UDim2.new(0, 10, 0, 0), UDim2.new(1, -84, 1, 0), {
+            Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT,
         })
-        editorTitle.ZIndex = 182
-        local editorClose = makeButton(editorCard, "X", UDim2.new(1, -42, 0, 10), UDim2.new(0, 28, 0, 27), { Background = C.RED_DARK, TextSize = 11, ZIndex = 183 })
+        editorTitle.ZIndex = 183
+        local editorMinimize = makeButton(editorHeader, "−", UDim2.new(1, -68, 0.5, -12), UDim2.fromOffset(24, 24), {
+            Background = C.HEADER, TextSize = 18, ZIndex = 184,
+        })
+        local editorClose = makeButton(editorHeader, "X", UDim2.new(1, -36, 0.5, -12), UDim2.fromOffset(24, 24), {
+            Background = C.RED_DARK, TextSize = 10, ZIndex = 184,
+        })
         editorClose.Activated:Connect(function()
             if callbacks.onClose then callbacks.onClose() end
         end)
-        local editorFileLabel = makeLabel(editorCard, "FILE: --", UDim2.new(0, 16, 0, 48), UDim2.new(1, -32, 0, 20), { TextSize = 10, Color = C.DIM })
+        makeDraggable(editorHeader, editorCard)
+
+        local editorSetLogo = newInstance("TextButton", {
+            Name = "EvadeSetRestore", AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.new(0, 18, 0.5, 0), Size = UDim2.fromOffset(46, 46),
+            BackgroundColor3 = Color3.fromRGB(92, 20, 34), BorderSizePixel = 0,
+            Text = "SET", TextColor3 = Color3.fromRGB(255, 235, 239),
+            Font = Enum.Font.GothamBlack, TextSize = 13,
+            AutoButtonColor = false, Visible = false, Active = true, ZIndex = 185,
+        }, screen)
+        addCorner(editorSetLogo, 23)
+        addStroke(editorSetLogo, C.ACCENT, 1.5)
+        editorSetLogo.Activated:Connect(function()
+            editorSetLogo.Visible = false
+            editorOverlay.Visible = true
+        end)
+        editorMinimize.Activated:Connect(function()
+            editorOverlay.Visible = false
+            editorSetLogo.Visible = true
+        end)
+
+        local editorFileLabel = makeLabel(editorCard, "FILE: --", UDim2.new(0, 12, 0, 40), UDim2.new(1, -24, 0, 18), { TextSize = 9, Color = C.DIM })
         editorFileLabel.ZIndex = 182
-        local editorPointCount = makeLabel(editorCard, "Đã lưu: 0 điểm", UDim2.new(0, 16, 0, 75), UDim2.new(1, -32, 0, 20), { TextSize = 10, Color = C.TEXT })
+        local editorPointCount = makeLabel(editorCard, "Đã lưu: 0 điểm", UDim2.new(0, 12, 0, 61), UDim2.new(1, -24, 0, 18), { TextSize = 9, Color = C.TEXT })
         editorPointCount.ZIndex = 182
-        local setPointButton = makeButton(editorCard, "SET POINT 1", UDim2.new(0, 16, 0, 108), UDim2.new(1, -32, 0, 40), { Background = C.GREEN_DARK, TextSize = 12, ZIndex = 183 })
-        local deletePointButton = makeButton(editorCard, "DELETE POINT 1", UDim2.new(0, 16, 0, 155), UDim2.new(1, -32, 0, 34), { Background = C.RED_DARK, TextSize = 10, ZIndex = 183 })
-        local donePointButton = makeButton(editorCard, "XONG", UDim2.new(0, 16, 0, 204), UDim2.new(1, -32, 0, 40), { Background = C.GREEN, TextSize = 12, ZIndex = 183 })
+        local setPointButton = makeButton(editorCard, "SET POINT 1", UDim2.new(0, 12, 0, 87), UDim2.new(1, -24, 0, 34), { Background = C.GREEN_DARK, TextSize = 11, ZIndex = 183 })
+        local deletePointButton = makeButton(editorCard, "DELETE POINT 1", UDim2.new(0, 12, 0, 128), UDim2.new(1, -24, 0, 29), { Background = C.RED_DARK, TextSize = 9, ZIndex = 183 })
+        local donePointButton = makeButton(editorCard, "XONG", UDim2.new(0, 12, 0, 166), UDim2.new(1, -24, 0, 34), { Background = C.GREEN, TextSize = 11, ZIndex = 183 })
 
         local function getCurrentSavedPoints()
             local _, data = SaveManager:GetActiveFile()
@@ -7481,8 +7512,9 @@ do
             refreshEditorPointButtons()
             window.Visible = false
             logo.Visible = false
+            editorSetLogo.Visible = false
             editorOverlay.Visible = true
-            evadeFileOperationLabel.Text = "Đã tạo file. Hãy đặt các waypoint."
+            evadeFileOperationLabel.Text = "Menu chính đã ẩn. Di chuyển tự do; kéo khung này sang mép rồi SET POINT."
             evadeFileOperationLabel.TextColor3 = C.GREEN
         end)
 
@@ -7510,6 +7542,7 @@ do
         end)
         donePointButton.Activated:Connect(function()
             editorOverlay.Visible = false
+            editorSetLogo.Visible = false
             window.Visible = true
             logo.Visible = false
             refreshEvadeDropdown()
@@ -7737,7 +7770,7 @@ do
                 ZIndex = 48,
             }, parent)
             addCorner(list, 6)
-            addStroke(list, Color3.fromRGB(54, 75, 110), 1)
+            addStroke(list, Color3.fromRGB(145, 24, 48), 1)
             newInstance("UIListLayout", {
                 Padding = UDim.new(0, 3),
                 SortOrder = Enum.SortOrder.LayoutOrder,
@@ -7886,7 +7919,7 @@ do
             BorderSizePixel = 0,
         }, tabFrames[5])
         addCorner(performancePanel, 11)
-        addStroke(performancePanel, Color3.fromRGB(57, 78, 110), 1)
+        addStroke(performancePanel, Color3.fromRGB(145, 24, 48), 1)
         makeLabel(performancePanel, "TỐI ƯU HIỆU NĂNG", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
@@ -8183,6 +8216,8 @@ local function sendMatchReport(report)
                 { name = "🌱 Seeds :", value = "Trước: " .. formatNumber(report.SeedsBefore)
                     .. "\nSau: " .. formatNumber(report.SeedsAfter)
                     .. "\nThay đổi: " .. seedChange, inline = false },
+                { name = "👥 Người chơi sống sót", value = tostring(report.SurvivorSummary or "N/A")
+                    .. "\n" .. tostring(report.ParticipantDetails or ""), inline = false },
                 { name = "📊 Thống kê từ lúc Play Macro", value = "Số trận: " .. tostring(report.MatchNumber or 0)
                     .. "\nThắng: " .. tostring(report.Wins or 0)
                     .. " · Thua: " .. tostring(report.Losses or 0), inline = false },
@@ -8495,7 +8530,7 @@ end
 -- ============================================================
 -- ============================================================
 -- GTD MACRO ENGINE + AUTO ABILITY + AUTO DIFFICULTY
--- Macro JSON lưu PlaceUnit / UpgradeUnit / SellUnit theo Time và thứ tự sự kiện.
+-- Macro JSON lưu Action theo Sequence/FIFO; metadata thời gian nội bộ không được xuất.
 -- Ability hoạt động độc lập; giao diện Macro không có bảng cài lịch phát riêng.
 -- ============================================================
 local MacroEngine = {
@@ -8505,7 +8540,7 @@ local MacroEngine = {
     IdMap = {},
     _recordContext = nil,
     _recordEndConnection = nil,
-    _recordBaseHPConnection = nil,
+    _recordLegacyTerminalConnection = nil,
     _recordState = "OFF",
     _recordOriginContext = nil,
     _recordOriginStartStamp = nil,
@@ -8576,7 +8611,6 @@ local MacroEngine = {
     _lastReplayStartStamp = nil,
     _replayRunGeneration = 0,
     _replayScheduleOffset = 0,
-    _replayLeadSeconds = 0, -- số giây thực chạy sớm; chuyển đổi theo TickSpeed khi Replay
     _replayFailedActions = {},
     _preflightSkipActions = {}, -- Action khong an toan/bi lap duoc bo qua rieng, khong chan ca Macro
     _failedPlaceRecordIds = {}, -- PlaceUnit bị Server từ chối; bỏ qua các Action phụ thuộc ID đó, không treo FIFO
@@ -8654,8 +8688,7 @@ local function getMacroContext()
         local voteEnd = tonumber(ctx:GetAttribute("DifficultyVoteEnd")) or 0
         score = math.max(score, gst, voteEnd)
         local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-        local hp = tonumber(ctx:GetAttribute("BaseHP_1"))
-        if endTime <= 0 and (hp == nil or hp > 0) then score += 10000000000 end
+        if endTime <= 0 then score += 10000000000 end
         if score > bestScore then best, bestScore = ctx, score end
     end
     return best
@@ -8682,8 +8715,7 @@ local function isMacroMatchActive(ctx)
     if not ctx or not ctx.Parent then return false end
     local startStamp = getMacroStartStamp(ctx)
     local endStamp = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-    if startStamp <= 0 or endStamp > 0 or (baseHP ~= nil and baseHP <= 0) then
+    if startStamp <= 0 or endStamp > 0 then
         return false
     end
     return getMacroEntities(ctx) ~= nil
@@ -8713,8 +8745,7 @@ local function getCurrentMacroMatchContext()
     for _, ctx in ipairs(contexts:GetChildren()) do
         local stamp = getMacroStartStamp(ctx)
         local ended = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-        if stamp > 0 and ended <= 0 and (baseHP == nil or baseHP > 0) and stamp > bestStamp then
+        if stamp > 0 and ended <= 0 and stamp > bestStamp then
             best, bestStamp = ctx, stamp
         end
     end
@@ -8947,6 +8978,9 @@ end
 
 function MacroEngine:_queueAction(action, eventTime, reservedSeq)
     if type(action) ~= "table" then return nil end
+    -- EventSeq is the authoritative FIFO order captured at the original input event.
+    -- Time remains internal recorder metadata only for correlating delayed observer updates;
+    -- it is stripped from JSON and is never read by the Replay scheduler.
     local elapsed = tonumber(eventTime) or tonumber(action.Time) or getMacroElapsed()
     local seq = tonumber(reservedSeq) or self:_reserveEventSeq()
     if seq > (tonumber(self._eventSeq) or 0) then self._eventSeq = seq end
@@ -8966,13 +9000,14 @@ function MacroEngine:_queueAction(action, eventTime, reservedSeq)
     table.insert(self.Actions, insertAt, action)
     if self.Recording and self._recordKey and api and api.setMacroRecordPreview then
         local cleanActions = {}
-        for _, source in ipairs(self.Actions) do
+        for sequence, source in ipairs(self.Actions) do
             local clean = {}
             for field, value in pairs(source) do
-                if type(field) ~= "string" or field:sub(1, 1) ~= "_" then
+                if type(field) ~= "string" or (field:sub(1, 1) ~= "_" and field ~= "Time" and field ~= "EventSeq") then
                     clean[field] = value
                 end
             end
+            clean.Sequence = sequence
             cleanActions[#cleanActions + 1] = clean
         end
         local previewOK, previewJSON = pcall(function()
@@ -8983,7 +9018,7 @@ function MacroEngine:_queueAction(action, eventTime, reservedSeq)
         end
     end
     if self.Recording and api and api.setMacroStatus then
-        api.setMacroStatus(string.format("RECORDING · %d Action · Game Time %.2fs", #self.Actions, getMacroElapsed(self._recordContext)), true)
+        api.setMacroStatus(string.format("RECORDING · %d Action · FIFO sequence captured", #self.Actions), true)
     end
     return action
 end
@@ -9450,8 +9485,161 @@ local MatchStatsTracker = {
     Wins = 0,
     Losses = 0,
     Current = nil,
+    LastResult = "UNKNOWN",
+    LastResultContext = nil,
+    LastSurvivorSummary = "N/A",
     _reported = setmetatable({}, { __mode = "k" }),
 }
+
+local function disconnectPlayerMatchWatchers(current)
+    if not current then return end
+    for _, connection in ipairs({ current.PlayerAddedConnection, current.PlayerRemovingConnection }) do
+        if connection then pcall(function() connection:Disconnect() end) end
+    end
+    for _, participant in ipairs(current.Participants or {}) do
+        for _, connection in ipairs(participant.Connections or {}) do
+            pcall(function() connection:Disconnect() end)
+        end
+        for _, connection in ipairs(participant.HumanoidConnections or {}) do
+            pcall(function() connection:Disconnect() end)
+        end
+        table.clear(participant.Connections or {})
+        table.clear(participant.HumanoidConnections or {})
+    end
+end
+
+local function isAliveHumanoid(humanoid)
+    if not humanoid or not humanoid.Parent then return nil end
+    local stateOK, state = pcall(function() return humanoid:GetState() end)
+    return humanoid.Health > 0 and (not stateOK or state ~= Enum.HumanoidStateType.Dead)
+end
+
+function MatchStatsTracker:_captureParticipants(current)
+    current.Participants = {}
+    current.ParticipantByPlayer = {}
+
+    local function capturePlayer(player)
+        if not player or current.ParticipantByPlayer[player] then return end
+        local participant = {
+            Player = player,
+            Alive = nil,
+            Known = false,
+            Character = nil,
+            Humanoid = nil,
+            Connections = {},
+            HumanoidConnections = {},
+        }
+        current.ParticipantByPlayer[player] = participant
+        table.insert(current.Participants, participant)
+
+        local function clearHumanoidConnections()
+            for _, connection in ipairs(participant.HumanoidConnections) do
+                pcall(function() connection:Disconnect() end)
+            end
+            table.clear(participant.HumanoidConnections)
+        end
+
+        local function bindCharacter(character)
+            if self.Current ~= current or not character then return end
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+                or character:WaitForChild("Humanoid", 5)
+            if self.Current ~= current or not humanoid or not humanoid:IsA("Humanoid") then return end
+
+            clearHumanoidConnections()
+            participant.Character = character
+            participant.Humanoid = humanoid
+            local alive = isAliveHumanoid(humanoid)
+            if alive ~= nil then
+                participant.Alive = alive
+                participant.Known = true
+            end
+
+            table.insert(participant.HumanoidConnections, humanoid.Died:Connect(function()
+                if self.Current == current and participant.Humanoid == humanoid then
+                    participant.Alive = false
+                    participant.Known = true
+                end
+            end))
+            table.insert(participant.HumanoidConnections, humanoid.HealthChanged:Connect(function(health)
+                if self.Current == current and participant.Humanoid == humanoid and health <= 0 then
+                    participant.Alive = false
+                    participant.Known = true
+                end
+            end))
+        end
+
+        if player.Character then task.spawn(bindCharacter, player.Character) end
+        table.insert(participant.Connections, player.CharacterAdded:Connect(function(character)
+            task.spawn(bindCharacter, character)
+        end))
+        table.insert(participant.Connections, player.CharacterRemoving:Connect(function(character)
+            if participant.Character ~= character then return end
+            local humanoid = participant.Humanoid
+            local health = humanoid and tonumber(humanoid.Health) or nil
+            if health ~= nil and health <= 0 then
+                participant.Alive = false
+                participant.Known = true
+            elseif health ~= nil and health > 0 then
+                -- A living avatar may be removed during victory/lobby cleanup; preserve its
+                -- last confirmed living state instead of misclassifying cleanup as death.
+                participant.Alive = true
+                participant.Known = true
+            end
+        end))
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do capturePlayer(player) end
+    current.PlayerAddedConnection = Players.PlayerAdded:Connect(function(player)
+        if self.Current == current then capturePlayer(player) end
+    end)
+    current.PlayerRemovingConnection = Players.PlayerRemoving:Connect(function(player)
+        if self.Current ~= current then return end
+        local participant = current.ParticipantByPlayer[player]
+        if participant then
+            participant.Alive = false
+            participant.Known = true
+        end
+    end)
+end
+
+function MatchStatsTracker:_evaluateSurvivors(current)
+    local survivors, knownCount, total = 0, 0, #(current and current.Participants or {})
+    local details = {}
+    for _, participant in ipairs(current and current.Participants or {}) do
+        local player = participant.Player
+        if player and player.Parent == Players then
+            local character = player.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            if humanoid then
+                local alive = isAliveHumanoid(humanoid)
+                if alive ~= nil then
+                    participant.Character = character
+                    participant.Humanoid = humanoid
+                    participant.Alive = alive
+                    participant.Known = true
+                end
+            end
+            -- A missing Character alone is not evidence of death. Died/HealthChanged
+            -- and CharacterRemoving (when Health <= 0) record a confirmed death.
+        end
+
+        if participant.Known then
+            knownCount += 1
+            if participant.Alive == true then survivors += 1 end
+        end
+        details[#details + 1] = tostring(player and player.Name or "Player") .. ": "
+            .. (participant.Known and (participant.Alive and "ALIVE" or "DEAD") or "UNKNOWN")
+    end
+
+    local result = "UNKNOWN"
+    if total > 0 and survivors > 0 then
+        result = "WIN (VICTORY)"
+    elseif total > 0 and knownCount == total then
+        result = "LOSS (DEFEAT)"
+    end
+    local summary = tostring(survivors) .. "/" .. tostring(total) .. " alive"
+    return result, survivors, total, summary, table.concat(details, "\n")
+end
 
 function MatchStatsTracker:StartSession()
     self.Enabled = true
@@ -9459,16 +9647,19 @@ function MatchStatsTracker:StartSession()
     self.Wins = 0
     self.Losses = 0
     self.Current = nil
+    self.LastResult = "UNKNOWN"
+    self.LastResultContext = nil
+    self.LastSurvivorSummary = "N/A"
     self._reported = setmetatable({}, { __mode = "k" })
     if MatchScanner then
         MatchScanner:Reset()
-        -- UI Victory/Defeat cung la nguon ket thuc hop le, ke ca khi GameEndTime
-        -- hoac BaseHP_1 khong duoc replicate day du. Finish co co che chong gui lap.
         MatchScanner._onReport = function(scannerReport)
             local current = MatchStatsTracker.Current
             if current and current.Context then
-                MatchStatsTracker:Finish(current.Context,
-                    "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal"))
+                local ctx = current.Context
+                local reason = "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal")
+                MatchStatsTracker:Finish(ctx, reason)
+                if MacroEngine then MacroEngine:_onMacroMatchEnded(ctx, reason) end
             end
         end
         if not MatchScanner._active then
@@ -9480,7 +9671,7 @@ function MatchStatsTracker:StartSession()
 end
 
 function MatchStatsTracker:StopArming()
-    -- Match dang chay van duoc theo doi den luc ket thuc; chi ngung tinh cac tran moi.
+    -- A match already being tracked continues to its terminal signal; only future matches stop.
     self.Enabled = false
 end
 
@@ -9498,7 +9689,9 @@ function MatchStatsTracker:Begin(ctx)
         StartedAt = os.clock(),
         StartStamp = startStamp,
         Before = readMatchAccountStats(),
+        Participants = {},
     }
+    self:_captureParticipants(self.Current)
     return true
 end
 
@@ -9507,23 +9700,14 @@ function MatchStatsTracker:Finish(ctx, reason)
     if not current or current.Context ~= ctx or self._reported[ctx] then return false end
     self._reported[ctx] = true
 
-    local endStamp = tonumber(ctx and ctx:GetAttribute("GameEndTime")) or 0
-    local baseHP = tonumber(ctx and ctx:GetAttribute("BaseHP_1"))
-    local result
-    if MatchScanner and (MatchScanner.Result == "WIN (VICTORY)" or MatchScanner.Result == "LOSS (DEFEAT)") then
-        result = MatchScanner.Result
-    elseif baseHP ~= nil then
-        result = baseHP > 0 and "WIN (VICTORY)" or "LOSS (DEFEAT)"
-    else
-        result = "UNKNOWN"
-    end
-
+    local result, survivors, participantCount, survivorSummary, participantDetails = self:_evaluateSurvivors(current)
     if result == "WIN (VICTORY)" then
         self.Wins += 1
     elseif result == "LOSS (DEFEAT)" then
         self.Losses += 1
     end
 
+    local endStamp = tonumber(ctx and ctx:GetAttribute("GameEndTime")) or 0
     local after = readMatchAccountStats()
     local duration
     if endStamp > current.StartStamp and current.StartStamp > 0 then
@@ -9536,7 +9720,7 @@ function MatchStatsTracker:Finish(ctx, reason)
         MatchNumber = current.MatchNumber,
         Result = result,
         Name = LP.Name,
-        WaveInfo = wave and (tostring(wave) .. "/40") or "N/A",
+        WaveInfo = wave and (tostring(wave) .. "/" .. tostring(MatchScanner.MaxWave or 40)) or "N/A",
         DurationSeconds = duration,
         CashBefore = current.Before.Cash,
         CashAfter = after.Cash,
@@ -9547,10 +9731,18 @@ function MatchStatsTracker:Finish(ctx, reason)
         Wins = self.Wins,
         Losses = self.Losses,
         AccountSeeds = after.Seeds,
+        SurvivorCount = survivors,
+        ParticipantCount = participantCount,
+        SurvivorSummary = survivorSummary,
+        ParticipantDetails = participantDetails,
         EndReason = tostring(reason or "GameEndTime"),
         ReportId = HttpService:GenerateGUID(false),
     }
+    self.LastResult = result
+    self.LastResultContext = ctx
+    self.LastSurvivorSummary = survivorSummary
     self.Current = nil
+    disconnectPlayerMatchWatchers(current)
     sendMatchReport(report)
     return true
 end
@@ -9560,9 +9752,8 @@ function MatchStatsTracker:Tick()
     local ctx = current and current.Context
     if not ctx then return end
     local endStamp = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-    if endStamp > 0 or (baseHP ~= nil and baseHP <= 0) or not ctx.Parent then
-        self:Finish(ctx, endStamp > 0 and "GameEndTime" or (not ctx.Parent and "Context removed" or "BaseHP_1"))
+    if endStamp > 0 or not ctx.Parent then
+        self:Finish(ctx, endStamp > 0 and "GameEndTime" or "Context removed")
     end
 end
 
@@ -10827,9 +11018,8 @@ function MacroEngine:_bindMacroLifecycleContext(ctx)
                 self:_tryStartWaitingRecord(ctx)
             end
             local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-            local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-            if endTime > 0 or (baseHP ~= nil and baseHP <= 0) then
-                self:_onMacroMatchEnded(ctx, endTime > 0 and "GameEndTime" or "BaseHP_1")
+            if endTime > 0 or not ctx.Parent then
+                self:_onMacroMatchEnded(ctx, endTime > 0 and "GameEndTime" or "Context removed")
             elseif self._autoRepeatArmed and self._waitingNextMatch then
                 self:_onNewMatchStarted(ctx)
             end
@@ -10843,7 +11033,6 @@ function MacroEngine:_bindMacroLifecycleContext(ctx)
     end
     addConnection(ctx:GetAttributeChangedSignal("GameStartTime"):Connect(evaluate))
     addConnection(ctx:GetAttributeChangedSignal("GameEndTime"):Connect(evaluate))
-    addConnection(ctx:GetAttributeChangedSignal("BaseHP_1"):Connect(evaluate))
     addConnection(ctx.DescendantAdded:Connect(function(descendant)
         if descendant.Name == "Entities" then evaluate() end
     end))
@@ -10915,8 +11104,7 @@ function MacroEngine:_tryStartWaitingRecord(ctx)
             and getMacroStartStamp(ctx) ~= self._recordOriginStartStamp
         if not sameContextRestarted then
             local originEnd = tonumber(origin:GetAttribute("GameEndTime")) or 0
-            local originHP = tonumber(origin:GetAttribute("BaseHP_1"))
-            local originEnded = self._recordOriginEnded or originEnd > 0 or (originHP ~= nil and originHP <= 0)
+            local originEnded = self._recordOriginEnded or originEnd > 0 or not origin.Parent
             if not originEnded then return false end
             if ctx == origin then return false end
         end
@@ -10964,24 +11152,14 @@ function MacroEngine:_activateRecordForContext(ctx)
     self:_startObserver(ctx)
 
     if self._recordEndConnection then pcall(function() self._recordEndConnection:Disconnect() end) end
-    if self._recordBaseHPConnection then pcall(function() self._recordBaseHPConnection:Disconnect() end) end
+    if self._recordLegacyTerminalConnection then
+        pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
+        self._recordLegacyTerminalConnection = nil
+    end
     self._recordEndConnection = ctx:GetAttributeChangedSignal("GameEndTime"):Connect(function()
         local ended = tonumber(ctx:GetAttribute("GameEndTime")) or 0
         if ended > 0 and self._recordState == "RECORDING" and self._recordContext == ctx then
             task.spawn(function() self:_saveRecord("trận kết thúc") end)
-        end
-    end)
-    self._recordBaseHPConnection = ctx:GetAttributeChangedSignal("BaseHP_1"):Connect(function()
-        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-        if baseHP and baseHP <= 0 and self._recordState == "RECORDING" and self._recordContext == ctx then
-            task.delay(0.35, function()
-                if self._recordState == "RECORDING" and self._recordContext == ctx then
-                    local ended = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-                    if ended > 0 or (tonumber(ctx:GetAttribute("BaseHP_1")) or 1) <= 0 then
-                        self:_saveRecord("Base HP về 0 / trận kết thúc")
-                    end
-                end
-            end)
         end
     end)
 
@@ -11045,7 +11223,7 @@ function MacroEngine:_saveRecord(reason)
         self._saveQueued = false
         self:_stopObserver()
         if self._recordEndConnection then pcall(function() self._recordEndConnection:Disconnect() end); self._recordEndConnection = nil end
-        if self._recordBaseHPConnection then pcall(function() self._recordBaseHPConnection:Disconnect() end); self._recordBaseHPConnection = nil end
+        if self._recordLegacyTerminalConnection then pcall(function() self._recordLegacyTerminalConnection:Disconnect() end); self._recordLegacyTerminalConnection = nil end
         if not self._autoRepeatArmed then self:_disconnectMacroLifecycleWatchers() end
         if api then api.setMacroRecordUI(false, true) end
         return false, "Không còn Macro file đang chọn để lưu."
@@ -11082,15 +11260,8 @@ function MacroEngine:_saveRecord(reason)
         end
     end
     self:_stopObserver()
-    -- Remote callbacks có thể trả về muộn; sắp xếp lại theo timestamp đã chụp tại lúc thao tác.
-    -- EventSeq là tie-break để hai action cùng Time vẫn có thứ tự xác định.
-    table.sort(self.Actions, function(a, b)
-        local ta, tb = tonumber(a.Time) or 0, tonumber(b.Time) or 0
-        if ta == tb then
-            return (tonumber(a._EventSeq or a.EventSeq) or 0) < (tonumber(b._EventSeq or b.EventSeq) or 0)
-        end
-        return ta < tb
-    end)
+    -- _queueAction inserts by the reserved EventSeq captured at the original input event.
+    -- Keep that exact FIFO order; do not sort or pace saved actions by timestamps.
 
     -- Gán Order theo thứ tự PlaceUnit thật trong trận; Upgrade/Sell tham chiếu cùng Order.
     local orderByRecordId = {}
@@ -11121,9 +11292,9 @@ function MacroEngine:_saveRecord(reason)
             -- ActivateUnitAbility và mọi Action ngoài schema yêu cầu không được ghi vào JSON.
             discardedUnsupportedActions += 1
         else
-            -- Schema mục tiêu: Place có tọa độ/CF; Unit action chỉ Type+Time+ID;
-            -- UpgradeAll/SellAll chỉ Type+Time. Không lưu Ability.
-            local clean = { Type = action.Type, Time = math.floor((tonumber(action.Time) or 0) * 100 + 0.5) / 100 }
+            -- Schema mục tiêu: Place có tọa độ/CF; Unit action có Type+Sequence+ID;
+            -- UpgradeAll/SellAll dùng Type+Sequence. Không lưu thời điểm chạy.
+            local clean = { Type = action.Type, Sequence = #cleanActions + 1 }
             if action.Type == "PlaceUnit" then
                 clean.Unit, clean.ID, clean.Position, clean.CF = action.Unit, action.ID, action.Position, action.CF
                 clean.Order = tonumber(action.Order)
@@ -11226,9 +11397,9 @@ function MacroEngine:_saveRecord(reason)
         pcall(function() self._recordEndConnection:Disconnect() end)
         self._recordEndConnection = nil
     end
-    if self._recordBaseHPConnection then
-        pcall(function() self._recordBaseHPConnection:Disconnect() end)
-        self._recordBaseHPConnection = nil
+    if self._recordLegacyTerminalConnection then
+        pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
+        self._recordLegacyTerminalConnection = nil
     end
     if not self._autoRepeatArmed then self:_disconnectMacroLifecycleWatchers() end
     if api then
@@ -12583,8 +12754,7 @@ end
 local function isMacroContextEnded(ctx)
     if not ctx then return false end
     local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-    return endTime > 0 or (baseHP ~= nil and baseHP <= 0) or not ctx.Parent
+    return endTime > 0 or not ctx.Parent
 end
 
 local function waitMacroTime(targetTime, ctx, token)
@@ -12841,7 +13011,7 @@ function MacroEngine:_resolveReplayRuntimeId(action)
     end
 
     -- Không chờ block 2.5s tại đây. Mỗi lượt FIFO chỉ thử ánh xạ nhanh một lần;
-    -- nếu Model chưa replicate, scheduler sẽ gọi lại sau 1.5s.
+    -- nếu Model chưa replicate, scheduler sẽ gọi lại theo chu kỳ FIFO 2 giây.
     if pending and pending.Snapshot then
         local pendingAction = {
             Unit = pending.Unit or action.Unit,
@@ -12899,7 +13069,7 @@ function MacroEngine:_runAction(action, token, ctx)
         local cashWait = 0
         if not localCashLooksEnough then
             self:_diag("CASH", string.format(
-                "PlaceUnit %s gửi đúng Macro Time; bỏ qua local cash gate (đọc được %s, Cost %s).",
+                "PlaceUnit %s đang ở lượt FIFO Sequence; bỏ qua local cash gate (đọc được %s, Cost %s).",
                 tostring(action.Unit), tostring(cashAtPlaceTime), tostring(cost)))
         end
 
@@ -12977,27 +13147,27 @@ function MacroEngine:_runAction(action, token, ctx)
         if isMacroRemoteRejected(response) then
             local rejectionText = macroResponseText(response)
             self:_diag("PLACE", "Server từ chối PlaceUnit " .. tostring(action.Unit)
-                .. " tại Macro Time " .. tostring(action.Time) .. "; sẽ thử lại sau 1.5s. "
+                .. " tại Sequence " .. tostring(action.Sequence or "?") .. "; đang chờ retry. "
                 .. tostring(rejectionText))
-            return false, "Server từ chối PlaceUnit; sẽ thử lại sau 1.5s: " .. tostring(rejectionText),
+            return false, "Server từ chối PlaceUnit; scheduler sẽ thử lại theo FIFO: " .. tostring(rejectionText),
                 { Retryable = true, RemoteSent = true, ServerRejected = true }
         end
 
-        -- Chờ ngắn để nhận Model. Nếu chưa thấy, scheduler sẽ thử lại sau 1.5s; mọi lần
+        -- Chờ ngắn để nhận Model. Nếu chưa thấy, scheduler sẽ thử lại; mọi lần
         -- retry đều kiểm tra snapshot đầu tiên trước khi gửi Remote lần nữa.
         local newId, model, detectError = waitMacroEntity(action, snapshot, token, ctx, 0.12)
         if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
             return false, "Replay đã chuyển trận trong lúc xác nhận Model; bỏ kết quả của trận cũ."
         end
         if not newId then
-            local key = tonumber(action.Order) or tonumber(action.ID) or tostring(action.Time)
+            local key = tonumber(action.Order) or tonumber(action.ID) or tostring(action.Sequence or "?")
             self._pendingOrderMappings[key] = {
                 Unit = action.Unit, Position = action.Position, CF = action.CF,
                 Snapshot = snapshot, Order = tonumber(action.Order), RecordID = tonumber(action.ID),
                 SentAt = getMacroElapsed(), Error = detectError,
             }
             return false, "Chưa thấy Model của " .. tostring(action.Unit)
-                .. "; sẽ kiểm tra lại và thử đặt sau 1.5s: " .. tostring(detectError),
+                .. "; sẽ kiểm tra lại và thử đặt theo FIFO: " .. tostring(detectError),
                 { Retryable = true, RemoteSent = true, RetrySafe = true }
         end
 
@@ -13079,13 +13249,13 @@ function MacroEngine:_runAction(action, token, ctx)
                 .. " · Order=" .. tostring(action.Order or "?")
                 .. " · RecordID=" .. tostring(oldId or "?")
                 .. " · Unit=" .. tostring(action.Unit or "?")
-                .. ". Sẽ thử ánh xạ lại sau 1.5s; không gửi nhầm Upgrade sang Tower khác.",
+                .. ". Sẽ thử ánh xạ lại theo FIFO; không gửi nhầm Upgrade sang Tower khác.",
                 { Retryable = true, RemoteSent = false }
         end
         if not rf.UpgradeUnit then return false, "Remote UpgradeUnit không tồn tại." end
         local model = findMacroModelById(newId, action.Unit, ctx)
         if not model then
-            return false, "Runtime ID đã map nhưng Model chưa sẵn sàng; sẽ thử lại sau 1.5s.",
+            return false, "Runtime ID đã map nhưng Model chưa sẵn sàng; scheduler sẽ thử lại theo FIFO 2 giây.",
                 { Retryable = true, RemoteSent = false }
         end
 
@@ -13110,7 +13280,7 @@ function MacroEngine:_runAction(action, token, ctx)
         end
 
         -- Không dùng Cash cục bộ để chặn Upgrade: HUD/leaderstats có thể lệch hoặc compact.
-        -- Gửi theo Time của Macro; nếu Server từ chối rõ ràng, scheduler retry sau 1.5s.
+        -- Gửi đúng Action tại vị trí FIFO hiện tại; scheduler quản lý retry.
         if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
             return false, "Replay đã chuyển trận trước khi UpgradeUnit."
         end
@@ -13118,7 +13288,7 @@ function MacroEngine:_runAction(action, token, ctx)
         if not callOK then return false, "UpgradeUnit Remote lỗi: " .. tostring(response) end
         if isMacroRemoteRejected(response) then
             local rejectionText = macroResponseText(response)
-            return false, "Server từ chối UpgradeUnit; sẽ thử lại sau 1.5s: " .. tostring(rejectionText),
+            return false, "Server từ chối UpgradeUnit; scheduler sẽ thử lại theo FIFO: " .. tostring(rejectionText),
                 { Retryable = true, RemoteSent = true, ServerRejected = true }
         end
 
@@ -13180,7 +13350,7 @@ function MacroEngine:_runAction(action, token, ctx)
             return false, "UpgradeAll Remote lỗi: " .. tostring(result)
         end
         if isMacroRemoteRejected(result) then
-            return false, "Server từ chối UpgradeAll; sẽ thử lại sau 1.5s: "
+            return false, "Server từ chối UpgradeAll; sẽ thử lại theo FIFO: "
                 .. tostring(macroResponseText(result)),
                 { Retryable = true, RemoteSent = true, ServerRejected = true }
         end
@@ -13229,11 +13399,13 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
     hydrateReplayPlacementMetadata(actions)
 
     local startStamp = getMacroStartStamp(ctx)
-    local leadSeconds = math.clamp(tonumber(self._replayLeadSeconds) or 0, 0, 5)
-    local tickSpeed = tonumber(ctx:GetAttribute("TickSpeed"))
-        or tonumber(workspace:GetAttribute("TickSpeed")) or 1
-    tickSpeed = math.clamp(tickSpeed, 0, 5)
-    local leadGameTime = leadSeconds * tickSpeed
+    local firstPlaceIndex = nil
+    for index, action in ipairs(actions) do
+        if action.Type == "PlaceUnit" then
+            firstPlaceIndex = index
+            break
+        end
+    end
     if self._lastReplayContext == ctx and self._lastReplayStartStamp == startStamp then
         return false, "Macro đã được khởi chạy ở Context/StartTime này; chặn Replay trùng."
     end
@@ -13266,8 +13438,9 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
     if api and api.notify then api.notify("Macro started · replay", Color3.fromRGB(50, 200, 110), "ChenFuWei") end
     if api then
         api.setMacroPlayUI(true, true)
-        api.setMacroStatus(string.format("Macro started · %d actions · run ahead %.1fs (TickSpeed %.1fx) · FIFO / retry 1.5s.",
-            #actions, leadSeconds, tickSpeed), true)
+        api.setMacroStatus(string.format(
+            "MACRO STARTED · %d ACTIONS · FIRST PLACE every 20s until confirmed · NEXT ACTIONS FIFO every 2s / max 10 retries",
+            #actions), true)
     end
 
     task.spawn(function()
@@ -13275,6 +13448,22 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
         local failedCount = 0
         local completedCount = 0
         local blockedOnAction = false
+
+        local function waitReplayDelay(seconds)
+            local deadline = os.clock() + seconds
+            while os.clock() < deadline do
+                if not self.Playing or token ~= self._playToken
+                    or runGeneration ~= self._replayRunGeneration then
+                    return false
+                end
+                if isMacroContextEnded(ctx) then return false end
+                task.wait(math.min(0.10, math.max(0, deadline - os.clock())))
+            end
+            return self.Playing and token == self._playToken
+                and runGeneration == self._replayRunGeneration
+                and not isMacroContextEnded(ctx)
+        end
+
         for index, action in ipairs(actions) do
             if not self.Playing or token ~= self._playToken
                 or runGeneration ~= self._replayRunGeneration then break end
@@ -13283,105 +13472,105 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
                 break
             end
 
+            -- Every action after the first slot is separated by a real 2-second interval.
+            if index > 1 then
+                if not waitReplayDelay(2) then
+                    if self.Playing and token == self._playToken and isMacroContextEnded(ctx) then
+                        self:_finishReplayMatch(ctx, "Trận kết thúc trước Action " .. tostring(index))
+                    end
+                    break
+                end
+            end
+
             local skipReason = preflightSkipActions[index]
             if skipReason then
                 attempted += 1
                 failedCount += 1
                 table.insert(self._replayFailedActions, {
                     Index = index, Type = tostring(action.Type),
-                    TargetTime = math.max(0, tonumber(action.Time) or 0),
-                    ActualTime = getMacroElapsed(ctx), Delay = 0,
+                    Sequence = tonumber(action.Sequence) or index,
                     Reason = skipReason, SkippedBeforeReplay = true,
                 })
                 if api then
                     api.setMacroStatus(string.format(
-                        "SKIPPED ACTION %d/%d · %s · các Action tiếp theo vẫn tiếp tục FIFO",
+                        "SKIPPED ACTION %d/%d · %s · FIFO continues",
                         index, #actions, skipReason), false)
                 end
-                task.wait()
                 continue
             end
 
-            local recordedTargetTime = math.max(0, tonumber(action.Time) or 0)
-            -- leadSeconds là giây thực; quy đổi sang Game Clock theo TickSpeed x1/x2/x3.
-            -- Chỉ đổi deadline chạy, tuyệt đối không sửa Time gốc trong JSON.
-            local targetTime = math.max(0, recordedTargetTime - leadGameTime)
-            local timeReady, timeError = waitMacroTime(targetTime, ctx, token)
-            if not timeReady then
-                if self.Playing and token == self._playToken and isMacroContextEnded(ctx) then
-                    self:_finishReplayMatch(ctx, "Trận kết thúc trước Action " .. tostring(index))
-                end
-                break
-            end
-
-            local actualStart = getMacroElapsed(ctx)
-            -- Chỉ retry các Action có thể xác nhận an toàn: chưa gửi Remote (thiếu ID/Model),
-            -- Server trả lời từ chối rõ ràng, hoặc Place đã gửi nhưng chưa thấy Model mới.
-            -- Remote đã được chấp nhận thì không gửi lại để tránh đặt/nâng cấp trùng.
-            local RETRYABLE_ACTION_TYPES = { PlaceUnit = true, UpgradeUnit = true, UpgradeAll = true }
-            local MAX_ACTION_RETRIES = 10
-            local ACTION_RETRY_INTERVAL = 1.5
+            local isFirstPlacement = firstPlaceIndex ~= nil and index == firstPlaceIndex
             local retryCount = 0
-            local actionCallOK, actionOK, message, details
-            repeat
-                actionCallOK, actionOK, message, details = pcall(function()
+            local actionOK, message = false, "Action chưa hoàn tất"
+            local actionStart = os.clock()
+            local attemptNumber = 0
+
+            while self.Playing and token == self._playToken
+                and runGeneration == self._replayRunGeneration do
+                if isMacroContextEnded(ctx) then break end
+                attemptNumber += 1
+                local actionCallOK, resultOK, resultMessage = pcall(function()
                     return self:_runAction(action, token, ctx)
                 end)
                 if not actionCallOK then
-                    local thrownError = actionOK
                     actionOK = false
-                    message = "Lỗi nội bộ khi xử lý Action: " .. tostring(thrownError)
-                    details = nil
+                    message = "Lỗi nội bộ khi xử lý Action: " .. tostring(resultOK)
+                else
+                    actionOK = resultOK == true
+                    message = tostring(resultMessage or (actionOK and "Hoàn tất" or "Action chưa hoàn tất"))
                 end
-                actionOK = actionOK == true
-                message = tostring(message or (actionOK and "Hoàn tất" or "Action chưa hoàn tất"))
 
-                local retryInfo = type(details) == "table" and details.Retryable == true
-                local retryIsSafe = type(details) == "table" and (
-                    details.RemoteSent == false or details.ServerRejected == true or details.RetrySafe == true
-                )
-                local canRetry = not actionOK and RETRYABLE_ACTION_TYPES[action.Type] == true
-                    and retryInfo and retryIsSafe and retryCount < MAX_ACTION_RETRIES
-                if not canRetry then break end
+                if actionOK then break end
 
-                retryCount += 1
-                self._replayState = "WAITING_FOR_ACTION"
-                self._replayBlockedIndex = index
-                self._waitingQueue = {}
-                for queuedIndex = index, #actions do
-                    self._waitingQueue[#self._waitingQueue + 1] = actions[queuedIndex]
+                local retryDelay
+                if isFirstPlacement then
+                    -- The first PlaceUnit is the gate: retry indefinitely every 20 seconds
+                    -- until the game confirms the unit/model mapping or the match/script stops.
+                    retryCount += 1
+                    retryDelay = 20
+                    self._replayState = "WAITING_FOR_FIRST_PLACE"
+                    if api then
+                        api.setMacroStatus(string.format(
+                            "FIRST PLACE WAIT · action %d/%d · attempt %d failed · retry in 20s · %s",
+                            index, #actions, attemptNumber, message), false)
+                    end
+                else
+                    if retryCount >= 10 then break end
+                    retryCount += 1
+                    retryDelay = 2
+                    self._replayState = "WAITING_FOR_ACTION"
+                    self._replayBlockedIndex = index
+                    self._waitingQueue = {}
+                    for queuedIndex = index, #actions do
+                        self._waitingQueue[#self._waitingQueue + 1] = actions[queuedIndex]
+                    end
+                    if api then
+                        api.setMacroStatus(string.format(
+                            "FIFO RETRY · Action %d/%d · attempt %d/11 · retry in 2s · %s",
+                            index, #actions, retryCount + 1, message), false)
+                    end
                 end
-                if api then
-                    api.setMacroStatus(string.format(
-                        "FIFO RETRY · Action %d/%d · %s · lần thử lại %d/%d sau 1.5s",
-                        index, #actions, tostring(action.Type), retryCount, MAX_ACTION_RETRIES), false)
-                end
-                task.wait(ACTION_RETRY_INTERVAL)
-            until not self.Playing or token ~= self._playToken
-                or runGeneration ~= self._replayRunGeneration or isMacroContextEnded(ctx)
+
+                if not waitReplayDelay(retryDelay) then break end
+            end
+
             if not self.Playing or token ~= self._playToken
                 or runGeneration ~= self._replayRunGeneration then break end
             if isMacroContextEnded(ctx) then
                 self:_finishReplayMatch(ctx, "Trận kết thúc sau Action " .. tostring(index))
                 break
             end
-            -- Dù Action thành công hay đã hết số lần retry, trả scheduler về trạng thái chạy
-            -- để Action tiếp theo được xử lý; không giữ FIFO WAITING cũ sau khi đã bỏ qua lỗi.
+
             self._replayState = "RUNNING_MACRO"
             self._replayBlockedIndex = nil
             self._waitingQueue = {}
-
             attempted += 1
-            local actualFinish = getMacroElapsed(ctx)
-            -- Không cộng offset: phần tử đã đến hạn được lấy tuần tự từ FIFO; hết backlog
-            -- thì scheduler tự chờ tới Target Time tiếp theo.
-            local delayNow = math.max(0, actualFinish - targetTime)
 
             if actionOK then
                 completedCount += 1
                 if api then
-                    api.setMacroStatus(string.format("ACTION %d/%d · due %.2fs · late %.2fs · %s",
-                        index, #actions, targetTime, delayNow, tostring(message)), true)
+                    api.setMacroStatus(string.format("ACTION %d/%d · %s",
+                        index, #actions, tostring(message)), true)
                 end
             else
                 failedCount += 1
@@ -13391,20 +13580,20 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
                     if self._placeRetryStates then self._placeRetryStates[action] = nil end
                 end
                 table.insert(self._replayFailedActions, {
-                    Index = index, Type = tostring(action.Type), TargetTime = targetTime,
-                    ActualTime = actualStart, Delay = delayNow, Reason = tostring(message),
-                    Attempts = retryCount + 1,
+                    Index = index, Type = tostring(action.Type),
+                    Sequence = tonumber(action.Sequence) or index,
+                    ActualElapsed = os.clock() - actionStart,
+                    Reason = tostring(message), Attempts = attemptNumber,
                 })
-                warn(string.format("[DUY MACRO] Action %d (%s) không thể tiếp tục sau %d lần thử: %s",
-                    index, tostring(action.Type), retryCount + 1, tostring(message)))
-                -- Sau tối đa 10 lần retry, bỏ qua riêng Action lỗi và tiếp tục FIFO.
+                warn(string.format("[DUY MACRO] Action %d (%s) skipped after %d attempts: %s",
+                    index, tostring(action.Type), attemptNumber, tostring(message)))
                 if api then
                     api.setMacroStatus(string.format(
-                        "BỎ QUA Action %d/%d (%s) · %d lần thử · %s · Macro tiếp tục",
-                        index, #actions, tostring(action.Type), retryCount + 1, tostring(message)), false)
+                        "BỎ QUA ACTION %d/%d (%s) · %d attempts · FIFO continues · %s",
+                        index, #actions, tostring(action.Type), attemptNumber, tostring(message)), false)
                 end
             end
-            task.wait() -- nhường scheduler; không tạo vòng lặp dồn dập
+            task.wait()
         end
 
         if token == self._playToken and self.Playing and not blockedOnAction then
@@ -13425,7 +13614,7 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
             end
         end
     end)
-    return true, "Macro đã bắt đầu. FIFO đang chạy theo Game Time và giữ đúng thứ tự JSON."
+    return true, "Macro đã bắt đầu. FIFO chạy theo thứ tự JSON: PlaceUnit đầu retry 20 giây; các Action sau cách nhau 2 giây."
 end
 
 function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
@@ -13452,7 +13641,7 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
     if not okDecode or type(actions) ~= "table" or #actions == 0 then return false, "Macro JSON trống hoặc không hợp lệ." end
     hydrateReplayPlacementMetadata(actions)
 
-    -- Preflight theo schema ID + Action + Time. Mỗi ID chỉ được dùng sau PlaceUnit tương ứng.
+    -- Preflight theo FIFO Sequence + ID. Legacy Time fields are ignored during replay.
     local recordedIds = {}
     local soldIds = {}
     local preflightSkipActions = {}
@@ -13460,9 +13649,6 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
     for index, action in ipairs(actions) do
         if type(action) ~= "table" or type(action.Type) ~= "string" then
             return false, "Action " .. tostring(index) .. " không hợp lệ: thiếu Type."
-        end
-        if tonumber(action.Time) == nil then
-            return false, "Action " .. tostring(index) .. " thiếu Time dạng số."
         end
         if action.Type == "PlaceUnit" then
             local id = tonumber(action.ID)
@@ -13665,8 +13851,7 @@ function MacroEngine:_onNewMatchStarted(ctx)
     local origin = self._playOriginContext
     if origin then
         local originEnd = tonumber(origin:GetAttribute("GameEndTime")) or 0
-        local originHP = tonumber(origin:GetAttribute("BaseHP_1"))
-        local originEnded = self._playOriginEnded or originEnd > 0 or (originHP ~= nil and originHP <= 0) or not origin.Parent
+        local originEnded = self._playOriginEnded or originEnd > 0 or not origin.Parent
         local sameOriginRun = ctx == origin and startStamp == self._playOriginStartStamp
         if sameOriginRun or not originEnded then return end
     end
@@ -13688,11 +13873,10 @@ function MacroEngine:_onNewMatchStarted(ctx)
     end)
 end
 
-function MacroEngine:_queueAutoRestart(ctx, allowBaseZero)
+function MacroEngine:_queueAutoRestart(ctx)
     if not self.AutoPlayAgainEnabled or not ctx or self._restartRequested[ctx] then return end
     local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-    if endTime <= 0 and not (allowBaseZero and baseHP and baseHP <= 0) then return end
+    if endTime <= 0 then return end
     self._restartRequested[ctx] = true
 
     -- Match lifecycle cleanup is independent of the optional RestartGame request.
@@ -13781,21 +13965,10 @@ function MacroEngine:_bindRestartContext(ctx)
     local startConnection = ctx:GetAttributeChangedSignal("GameStartTime"):Connect(function()
         task.defer(function() self:_onNewMatchStarted(ctx) end)
     end)
-    local baseConnection = ctx:GetAttributeChangedSignal("BaseHP_1"):Connect(function()
-        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-        if baseHP and baseHP <= 0 then
-            task.delay(0.35, function()
-                if self.AutoPlayAgainEnabled and ctx.Parent then self:_queueAutoRestart(ctx, true) end
-            end)
-        end
-    end)
     table.insert(self._restartWatchConnections, endConnection)
     table.insert(self._restartWatchConnections, startConnection)
-    table.insert(self._restartWatchConnections, baseConnection)
     if (tonumber(ctx:GetAttribute("GameEndTime")) or 0) > 0 then
         self:_queueAutoRestart(ctx)
-    elseif (tonumber(ctx:GetAttribute("BaseHP_1")) or math.huge) <= 0 then
-        self:_queueAutoRestart(ctx, true)
     elseif self._waitingNextMatch then
         self:_onNewMatchStarted(ctx)
     end
@@ -13849,12 +14022,7 @@ function MacroEngine:SetAutoPlayAgain(enabled)
     end
     if activeContext then
         local ended = tonumber(activeContext:GetAttribute("GameEndTime")) or 0
-        local baseHP = tonumber(activeContext:GetAttribute("BaseHP_1"))
-        if ended > 0 then
-            self:_queueAutoRestart(activeContext)
-        elseif baseHP and baseHP <= 0 then
-            self:_queueAutoRestart(activeContext, true)
-        end
+        if ended > 0 then self:_queueAutoRestart(activeContext) end
     end
     return true, "Auto Play Again đã bật để yêu cầu trận mới. Macro Repeat tự quản lý việc chạy lại khi phát hiện trận mới."
 end
@@ -13992,9 +14160,9 @@ function MacroEngine:Destroy()
         pcall(function() self._recordEndConnection:Disconnect() end)
         self._recordEndConnection = nil
     end
-    if self._recordBaseHPConnection then
-        pcall(function() self._recordBaseHPConnection:Disconnect() end)
-        self._recordBaseHPConnection = nil
+    if self._recordLegacyTerminalConnection then
+        pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
+        self._recordLegacyTerminalConnection = nil
     end
 
     if self.Recording and not self._savingRecord and not self._saveQueued then
@@ -14054,10 +14222,6 @@ callbacks.onMacroPlayChanged = function(enabled)
     local ok, message = MacroEngine:StopPlay("người dùng tắt Play Macro")
     if MatchStatsTracker then MatchStatsTracker:StopArming() end
     return ok, message
-end
-callbacks.onMacroLeadChanged = function(seconds)
-    MacroEngine._replayLeadSeconds = math.clamp(tonumber(seconds) or 0, 0, 5)
-    return true, "Đã cập nhật mức chạy sớm " .. tostring(MacroEngine._replayLeadSeconds) .. " giây."
 end
 
 callbacks.onMacroDeleteFile = function(key)
@@ -14511,8 +14675,7 @@ callbacks.onResetScanner = function()
     end
 end
 
--- Thong bao bat dau/ket thuc tran dua tren Context attributes da co trong game.
--- Ket qua uu tien BaseHP_1; neu khong co du lieu thi hien UNKNOWN, khong doan.
+-- Match-end notification uses the same player/partner survival result as the Discord report.
 local matchWatchContext, matchWatchStart, matchWatchEnded = nil, 0, false
 local matchWatchElapsed = 0
 local matchWatchConnection
@@ -14537,12 +14700,16 @@ matchWatchConnection = RunService.Heartbeat:Connect(function(dt)
     end
     if startStamp > 0 and endStamp > 0 and not matchWatchEnded then
         matchWatchEnded = true
-        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-        local result = baseHP and (baseHP > 0 and "THẮNG" or "THUA") or "CHƯA XÁC ĐỊNH"
+        local result = MatchStatsTracker and MatchStatsTracker.LastResultContext == ctx
+            and MatchStatsTracker.LastResult or "UNKNOWN"
+        local resultText = result == "WIN (VICTORY)" and "THẮNG"
+            or (result == "LOSS (DEFEAT)" and "THUA" or "CHƯA XÁC ĐỊNH")
+        local summary = MatchStatsTracker and MatchStatsTracker.LastResultContext == ctx
+            and MatchStatsTracker.LastSurvivorSummary or "Không có dữ liệu người chơi"
         if api and api.notify then
-            local color = result == "THẮNG" and Color3.fromRGB(47, 163, 100)
-                or (result == "THUA" and Color3.fromRGB(225, 90, 90) or Color3.fromRGB(225, 172, 66))
-            api.notify("TRẬN ĐẤU KẾT THÚC · " .. result, color)
+            local color = resultText == "THẮNG" and Color3.fromRGB(47, 163, 100)
+                or (resultText == "THUA" and Color3.fromRGB(225, 90, 90) or Color3.fromRGB(225, 172, 66))
+            api.notify("TRẬN ĐẤU KẾT THÚC · " .. resultText .. " · " .. tostring(summary), color)
         end
     end
 end)
