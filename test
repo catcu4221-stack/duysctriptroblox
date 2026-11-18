@@ -23,6 +23,7 @@
       - writefile/readfile/HTTP là API executor; Roblox Studio LocalScript không có sẵn.
 ]]
 
+print("[BOOT] 1/4 script da bien dich va dang chay (neu khong thay dong nay: loi bien dich/tai file)")
 -- ============================================================
 -- CONFIG
 -- ============================================================
@@ -15468,7 +15469,7 @@ if not macroStoreInitOK then
     warn("[BOOT] MacroStore initialization failed: " .. tostring(macroStoreInitError))
 end
 
-print("[BOOT] Building CFW GUI...")
+print("[BOOT] 2/4 khoi tao xong, dang dung GUI...")
 local guiBuildOK, guiBuildResult = xpcall(function()
     return GUI:Build(callbacks)
 end, function(err)
@@ -15477,7 +15478,7 @@ end, function(err)
 end)
 if guiBuildOK and type(guiBuildResult) == "table" then
     api = guiBuildResult
-    print("[BOOT] CFW GUI built successfully.")
+    print("[BOOT] 3/4 GUI da dung xong. Menu o giua man hinh.")
 else
     local guiErrorText = tostring(guiBuildResult or "GUI:Build returned no API")
     warn("[BOOT] GUI:Build failed:\n" .. guiErrorText)
