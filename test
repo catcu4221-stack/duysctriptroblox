@@ -1,5 +1,5 @@
 --[[
-    DUY EVADE SYSTEM - CFW BASE + TREOST SMART EVADE + FIFO REPLAY - V1.3
+    DUY EVADE SYSTEM - CFW BASE + TREOST SMART EVADE + FIFO REPLAY - V1.4 BOOTSTRAP REPAIR
 
     KIẾN TRÚC:
       - CFW là nền tảng: GUI shell, Main, Macro, Webhook, Performance, Info,
@@ -18,6 +18,8 @@
         không trộn Pathfinding/ObstacleMemory/Smart Evade vào lúc đi waypoint.
       - Chạm ngưỡng Wave thì dừng Waypoint trước khi bật Smart Evade gốc (25 studs).
       - Manual touch/keyboard/gamepad input tạm nhường quyền movement automation.
+      - GUI CFW được dựng trước; TREOST khởi tạo sau trong task.defer để lỗi lõi không chặn menu.
+      - Nếu GUI:Build lỗi, một màn hình báo lỗi khởi động sẽ hiển thị traceback.
       - writefile/readfile/HTTP là API executor; Roblox Studio LocalScript không có sẵn.
 ]]
 
@@ -5764,7 +5766,25 @@ end))
     }
 end
 
-Treost = initializeTreostCore()
+-- Keep the CFW GUI bootable even if Smart Evade has an initialization error.
+-- The real TREOST engine is started only after the menu has been built.
+local treostCoreReady = false
+local treostCoreError = nil
+Treost = {
+    AppState = { IsActive = false },
+    EnemyDetector = EnemyDetector,
+    WaypointRuntime = {
+        Enabled = false, AutoEvadeEnabled = false, AutoSwitchedToOriginal = false,
+        Points = {}, CurrentIndex = 1, TargetIndex = nil, PausedTargetIndex = nil,
+        Moving = false, ManualOverride = false, ScanRadius = 60, WaveThreshold = 0,
+    },
+    setLabels = function() end,
+    updateMemoryLabel = function() end,
+    startWaypointMode = function() return false, "Smart Evade is still initializing." end,
+    stopAllEvadeModes = function() end,
+    switchToOriginalSmartEvade = function() return false end,
+    shutdown = function() end,
+}
 
 -- ============================================================
 -- GUI HELPERS
@@ -8924,6 +8944,10 @@ local callbacks = {}
 
 callbacks.onAutoEvadeChanged = function(enabled)
     if destroyed then return false, "Script đã đóng." end
+    if enabled and not treostCoreReady then
+        return false, treostCoreError and ("Smart Evade lỗi khởi tạo: " .. treostCoreError)
+            or "Smart Evade đang khởi tạo; menu đã mở, vui lòng thử lại sau khi trạng thái READY xuất hiện."
+    end
     enabled = enabled == true
     if not enabled then
         Treost.WaypointRuntime.AutoEvadeEnabled = false
@@ -15426,12 +15450,117 @@ end
 -- ============================================================
 -- STARTUP / RESTORE
 -- ============================================================
-SaveManager:Init()
-SaveManager:EnsureActiveEvadeFile()
-MacroStore:Init()
-api = GUI:Build(callbacks)
-Treost.setLabels(api.getEvadeLabels())
-Treost.updateMemoryLabel()
+-- Storage and GUI startup are isolated so one bad file/API cannot suppress the menu.
+local saveInitOK, saveInitError = pcall(function()
+    SaveManager:Init()
+    SaveManager:EnsureActiveEvadeFile()
+end)
+if not saveInitOK then
+    warn("[BOOT] SaveManager initialization failed: " .. tostring(saveInitError))
+end
+local macroStoreInitOK, macroStoreInitError = pcall(function() MacroStore:Init() end)
+if not macroStoreInitOK then
+    warn("[BOOT] MacroStore initialization failed: " .. tostring(macroStoreInitError))
+end
+
+print("[BOOT] Building CFW GUI...")
+local guiBuildOK, guiBuildResult = xpcall(function()
+    return GUI:Build(callbacks)
+end, function(err)
+    if debug and debug.traceback then return debug.traceback(tostring(err), 2) end
+    return tostring(err)
+end)
+if guiBuildOK and type(guiBuildResult) == "table" then
+    api = guiBuildResult
+    print("[BOOT] CFW GUI built successfully.")
+else
+    local guiErrorText = tostring(guiBuildResult or "GUI:Build returned no API")
+    warn("[BOOT] GUI:Build failed:\n" .. guiErrorText)
+    -- Make the failure visible in-game instead of leaving the player with no UI.
+    pcall(function()
+        local oldGui = PlayerGui:FindFirstChild("ChenFuWei")
+        if oldGui then oldGui:Destroy() end
+        local errorGui = Instance.new("ScreenGui")
+        errorGui.Name = "ChenFuWei_BootError"
+        errorGui.ResetOnSpawn = false
+        errorGui.DisplayOrder = 999999
+        errorGui.Parent = PlayerGui
+        local panel = Instance.new("Frame")
+        panel.Size = UDim2.new(0, 340, 0, 170)
+        panel.Position = UDim2.new(0.5, -170, 0.5, -85)
+        panel.BackgroundColor3 = Color3.fromRGB(38, 8, 16)
+        panel.BorderSizePixel = 0
+        panel.Parent = errorGui
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = panel
+        local title = Instance.new("TextLabel")
+        title.BackgroundTransparency = 1
+        title.Position = UDim2.new(0, 12, 0, 10)
+        title.Size = UDim2.new(1, -24, 0, 25)
+        title.Font = Enum.Font.GothamBold
+        title.TextSize = 14
+        title.TextColor3 = Color3.fromRGB(255, 55, 85)
+        title.Text = "CFW MENU BOOT ERROR"
+        title.Parent = panel
+        local detail = Instance.new("TextLabel")
+        detail.BackgroundTransparency = 1
+        detail.Position = UDim2.new(0, 12, 0, 40)
+        detail.Size = UDim2.new(1, -24, 1, -50)
+        detail.Font = Enum.Font.Code
+        detail.TextSize = 10
+        detail.TextWrapped = true
+        detail.TextXAlignment = Enum.TextXAlignment.Left
+        detail.TextYAlignment = Enum.TextYAlignment.Top
+        detail.TextColor3 = Color3.fromRGB(255, 230, 235)
+        detail.Text = string.sub(guiErrorText, 1, 1800)
+        detail.Parent = panel
+    end)
+    local function noop() end
+    api = {
+        setMacroStatus = noop, setWebhookStatus = noop, setStatus = noop, notify = noop,
+        getEvadeLabels = function() return nil, nil end,
+        setEvadeStatus = noop, setEvadeFileStatus = noop, setEvadeAutoUI = noop,
+        refreshEvadeDropdown = noop, setSelectedKey = noop, setScannerInfo = noop,
+        setPerformanceUI = noop, setPerformanceModeUI = noop, setSpeedUI = noop,
+        setNoclipUI = noop, setFollowUI = noop, setScannerUI = noop, setSpeedModeUI = noop,
+        setSpawnLabel = noop, setDestinationLabel = noop, updateCreateButton = noop,
+        setRouteStatus = noop, setBossInfo = noop, setMacroRecordUI = noop,
+        setMacroPlayUI = noop, setMacroRecordPreview = noop, setMacroJson = noop,
+        refreshMacroDropdown = noop, selectMacroFile = function() return false end,
+        setAntiAFKUI = noop, getMainControlSettings = function() return {} end,
+        setMapOperationStatus = noop, getLanguage = function() return "EN" end,
+    }
+end
+
+-- Build the CFW window first. Defer TREOST until after this script yields to the UI scheduler.
+task.defer(function()
+    local coreOK, coreResult = xpcall(initializeTreostCore, function(err)
+        if debug and debug.traceback then return debug.traceback(tostring(err), 2) end
+        return tostring(err)
+    end)
+    if destroyed then return end
+    if coreOK and type(coreResult) == "table" then
+        Treost = coreResult
+        treostCoreReady = true
+        if api and api.getEvadeLabels then
+            local statusLabel, memoryLabel = api.getEvadeLabels()
+            Treost.setLabels(statusLabel, memoryLabel)
+        end
+        Treost.updateMemoryLabel()
+        if api and api.setEvadeStatus then
+            api.setEvadeStatus("SMART EVADE READY · WAYPOINT/ESCAPE AVAILABLE", Color3.fromRGB(100, 255, 140))
+        end
+        if api and api.refreshEvadeDropdown then api.refreshEvadeDropdown() end
+        print("[BOOT] TREOST Smart Evade initialized after GUI.")
+    else
+        treostCoreError = tostring(coreResult or "Unknown Smart Evade initialization error")
+        warn("[BOOT] TREOST Smart Evade initialization failed:\n" .. treostCoreError)
+        if api and api.setEvadeStatus then
+            api.setEvadeStatus("SMART EVADE INIT ERROR · see executor console", Color3.fromRGB(255, 80, 80))
+        end
+    end
+end)
 
 api.setMacroStatus("Đang khởi tạo Macro Engine...", true)
 api.setWebhookStatus(
