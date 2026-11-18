@@ -1,34 +1,24 @@
 --[[
-    TREOST EVADE HYBRID - V1.7
-    AutoDifficulty controller and UI callback are transplanted verbatim from the user-supplied cfw(1).txt.
-    Startup isolation prevents TREOST/Auto Ability setup errors from suppressing the CFW watcher.
-    TREOST remains the base for the original Smart Evade engine and persistent ObstacleMemory.
-    Selected CFW components are integrated without replacing the TREOST evade algorithms.
+    DUY EVADE SYSTEM - CFW BASE + TREOST SMART EVADE + FIFO REPLAY - V1.3
 
-    UI TABS:
-      1. MAIN    - CFW match controls, difficulty dropdown, Auto Difficulty/Play Again/Skip/Ability,
-                   and Game Speed X1 / X1.5 / X2.
-      2. EVADE   - saved waypoint files, direct waypoint movement, enemy-radius trigger,
-                   and one-way Wave handoff to original TREOST Smart Evade (25 studs).
-      3. MACRO   - CFW Macro UI and FIFO record/replay backend.
-      4. WEBHOOK - CFW webhook workflow with Macro JSON and Evade JSON exports.
-      5. PERF    - CFW performance options and presets.
+    KIẾN TRÚC:
+      - CFW là nền tảng: GUI shell, Main, Macro, Webhook, Performance, Info,
+        SaveManager, MatchScanner, EnemyDetector, hooks và toàn bộ Record pipeline.
+      - Tab Target được thay bằng tab EVADE: Waypoint Editor + Waypoint movement
+        tách biệt + một chiều chuyển sang lõi Smart Evade gốc của TREOST.
+      - Smart Evade dùng chung EnemyDetector event-driven của CFW; không tạo scanner
+        HP trùng lặp. Lõi TREOST giữ obstacle memory, Spherecast, dự đoán và movement.
+      - Theme giao diện chuyển sang đỏ; Webhook gửi Macro JSON và Evade JSON.
+      - Record, serializer, hooks, và cách lưu Macro giữ nguyên từ CFW.
+      - Replay dùng FIFO theo thứ tự Action của JSON; trường Time chỉ là metadata,
+        không điều khiển lịch chạy. PlaceUnit đầu retry 20 giây; action sau retry 2 giây.
 
-    LIFECYCLE:
-      - Minimize hides the main window and displays the round EVADE logo.
-      - Close runs a full shutdown, restores local visual/player settings, and destroys the GUI.
-      - GUI dragging is limited to the header/sidebar tabs; tab content remains scrollable.
-
-    NOTES:
-      - Waypoint mode reads TREOST's event-driven BillboardGui/HP enemy records only. It does not
-        run Smart Evade dodging, obstacle-memory routing, or pathfinding while moving between points.
-      - Wave parsing is based on UI object text-change events, not pixel scanning/OCR.
-      - Macro replay is event-order FIFO: first PlaceUnit retries every 20 seconds until confirmed;
-        each following action runs 2 seconds apart with up to 10 retries every 2 seconds.
-      - Macro JSON uses Sequence only; Replay never schedules actions from recorded Time.
-      - Match results are based only on participants' alive/dead state; Base HP is not consulted.
-      - X1.5 is sent as a fractional ChangeTickSpeed request; actual support depends on the server.
-      - Executor file/HTTP APIs are environment-dependent and are not available in Roblox Studio.
+    LƯU Ý:
+      - Waypoint mode chỉ dùng enemy detection radius rồi MoveTo trực tiếp;
+        không trộn Pathfinding/ObstacleMemory/Smart Evade vào lúc đi waypoint.
+      - Chạm ngưỡng Wave thì dừng Waypoint trước khi bật Smart Evade gốc (25 studs).
+      - Manual touch/keyboard/gamepad input tạm nhường quyền movement automation.
+      - writefile/readfile/HTTP là API executor; Roblox Studio LocalScript không có sẵn.
 ]]
 
 -- ============================================================
@@ -387,10 +377,11 @@ do
         return saveDB()
     end
 
-    function SaveManager:NameExists(name, exceptKey)
+    function SaveManager:NameExists(name, exceptKey, fileType)
         local normalized = normalizedName(name)
         for key, data in pairs(db.files) do
-            if key ~= exceptKey and type(data) == "table"
+            local sameNamespace = fileType ~= "EVADE" or self:IsEvadeFile(key)
+            if key ~= exceptKey and sameNamespace and type(data) == "table"
                 and normalizedName(data.MapName) == normalized then
                 return true
             end
@@ -401,7 +392,7 @@ do
     function SaveManager:CreateFile(name)
         name = trim(name)
         if name == "" then return false, "Ten file khong duoc de trong." end
-        if self:NameExists(name) then return false, "Ten file da ton tai." end
+        if self:NameExists(name, nil, "EVADE") then return false, "Ten file Evade da ton tai." end
 
         local key = makeKey(name)
         local suffix = 1
@@ -411,6 +402,7 @@ do
         end
 
         db.files[key] = {
+            FileType = "EVADE",
             MapName = name,
             SpawnPoint = nil,
             DestinationPoint = nil,
@@ -449,6 +441,44 @@ do
         return copy
     end
 
+    -- A CFW Map file is not automatically an Evade file. Preserve legacy Map records,
+    -- but only show files explicitly marked EVADE or containing imported Hybrid waypoints.
+    function SaveManager:IsEvadeFile(key)
+        local item = type(key) == "table" and key or db.files[key]
+        if type(item) ~= "table" then return false end
+        if item.FileType == "EVADE" then return true end
+        return type(item.EvadePoints) == "table" and #item.EvadePoints > 0
+    end
+
+    function SaveManager:GetEvadeFileList()
+        local result = {}
+        for _, key in ipairs(db.fileList) do
+            if self:IsEvadeFile(key) then
+                table.insert(result, key)
+            end
+        end
+        return result
+    end
+
+    function SaveManager:EnsureActiveEvadeFile()
+        local activeKey = self._activeKey
+        if activeKey and self:IsEvadeFile(activeKey) then
+            return true, activeKey
+        end
+        local evadeKeys = self:GetEvadeFileList()
+        if evadeKeys[1] then
+            self._activeKey = evadeKeys[1]
+            db.lastKey = evadeKeys[1]
+            saveDB()
+            return true, evadeKeys[1]
+        end
+        -- Do not leave a legacy Map selected as if it were an Evade route.
+        self._activeKey = nil
+        db.lastKey = nil
+        saveDB()
+        return false, nil
+    end
+
     function SaveManager:SelectFile(key)
         if not db.files[key] then
             return false, "Khong tim thay file."
@@ -469,7 +499,8 @@ do
         newName = trim(newName)
         if not db.files[oldKey] then return false, "Khong tim thay file." end
         if newName == "" then return false, "Ten moi khong duoc de trong." end
-        if self:NameExists(newName, oldKey) then return false, "Ten moi da ton tai." end
+        local namespace = self:IsEvadeFile(oldKey) and "EVADE" or nil
+        if self:NameExists(newName, oldKey, namespace) then return false, "Ten moi da ton tai." end
 
         local newKey = makeKey(newName)
         local suffix = 1
@@ -563,15 +594,29 @@ do
 
     function SaveManager:UpdateActiveEvadePoints(points)
         local _, data = self:GetActiveFile()
-        if not data then return false, "Chua chon file." end
-        data.EvadePoints = {}
-        for _, point in ipairs(points or {}) do
-            local x, y, z = tonumber(point.X), tonumber(point.Y), tonumber(point.Z)
-            if x and y and z and x == x and y == y and z == z then
-                table.insert(data.EvadePoints, { X = x, Y = y, Z = z })
+        if not data then return false, "Chưa chọn file Evade." end
+        if type(points) ~= "table" then return false, "Danh sách waypoint không hợp lệ." end
+        if #points > 1500 then return false, "Waypoints vượt giới hạn 1500 điểm." end
+
+        local staged = {}
+        for index, point in ipairs(points) do
+            if type(point) ~= "table" then
+                return false, "Waypoint không hợp lệ tại điểm " .. tostring(index) .. "."
             end
+            local x, y, z = tonumber(point.X), tonumber(point.Y), tonumber(point.Z)
+            if not x or not y or not z
+                or x ~= x or y ~= y or z ~= z
+                or math.abs(x) >= 1e7 or math.abs(y) >= 1e7 or math.abs(z) >= 1e7 then
+                return false, "Tọa độ không hợp lệ tại waypoint " .. tostring(index) .. "."
+            end
+            staged[index] = { X = x, Y = y, Z = z }
         end
-        saveDB()
+
+        data.EvadePoints = staged
+        local ok, err = saveDB()
+        if not ok and HAS_FILE_IO then
+            return false, tostring(err or "Không lưu được waypoint.")
+        end
         return true
     end
 end
@@ -646,18 +691,9 @@ do
             if not allowedTypes[action.Type] then
                 return false, "Unsupported Action type at index " .. tostring(key) .. ": " .. tostring(action.Type)
             end
-            -- Time is optional legacy metadata only; the new Replay scheduler never reads it.
-            if action.Time ~= nil then
-                local eventTime = tonumber(action.Time)
-                if not eventTime or eventTime ~= eventTime or eventTime < 0 or eventTime == math.huge then
-                    return false, "Invalid legacy Time metadata at Action " .. tostring(key) .. "."
-                end
-            end
-            if action.Sequence ~= nil then
-                local sequence = tonumber(action.Sequence)
-                if not sequence or sequence < 1 or sequence % 1 ~= 0 then
-                    return false, "Invalid Sequence at Action " .. tostring(key) .. "."
-                end
+            local eventTime = tonumber(action.Time)
+            if not eventTime or eventTime ~= eventTime or eventTime < 0 or eventTime == math.huge then
+                return false, "Invalid or missing Time at Action " .. tostring(key) .. "."
             end
             local needsId = action.Type == "PlaceUnit" or action.Type == "UpgradeUnit"
                 or action.Type == "SellUnit" or action.Type == "LockUnit"
@@ -1010,6 +1046,214 @@ local Treost = {}
 local EvadeUI = {}
 
 -- ============================================================
+-- ENEMY DETECTOR (EVENT-DRIVEN CACHE, KHONG QUET LAI TOAN BO BILLBOARD MOI LAN)
+-- ============================================================
+local EnemyDetector = {}
+do
+    local tracked = {}
+    local records = {}
+    local workspaceAdded
+    local workspaceRemoving
+
+    local function stripRichText(text)
+        return tostring(text or ""):gsub("<[^>]+>", "")
+    end
+
+    local function compactHPNumber(numberText, suffix)
+        local value = tonumber(numberText)
+        if not value then return nil end
+        suffix = (suffix or ""):lower()
+        local multiplier = ({ k = 1e3, m = 1e6, b = 1e9 })[suffix] or 1
+        return value * multiplier
+    end
+
+    local function parseHP(text)
+        local clean = stripRichText(text):lower():gsub(",", "")
+        local c, cs, m, ms = clean:match("(%d+%.?%d*)([kmb]?)%s*/%s*(%d+%.?%d*)([kmb]?)")
+        local current = compactHPNumber(c, cs)
+        local maximum = compactHPNumber(m, ms)
+        if not current or not maximum then return false end
+        if current < 0 or maximum <= 0 then return false end
+        if maximum == CONFIG.DESTINATION_MAX_HP then return false end
+        return true, current, maximum
+    end
+
+    local function firstPartInModel(model)
+        local root = model:FindFirstChild("HumanoidRootPart")
+        if root and root:IsA("BasePart") then return root end
+        if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+            return model.PrimaryPart
+        end
+        return model:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local function getPositionPart(billboard)
+        local adornee = billboard.Adornee
+        if adornee then
+            if adornee:IsA("BasePart") then return adornee end
+            if adornee:IsA("Attachment") and adornee.Parent and adornee.Parent:IsA("BasePart") then
+                return adornee.Parent
+            end
+        end
+        local node = billboard.Parent
+        while node and node ~= workspace do
+            if node:IsA("BasePart") then return node end
+            if node:IsA("Model") then
+                local part = firstPartInModel(node)
+                if part then return part end
+            end
+            node = node.Parent
+        end
+        return nil
+    end
+
+    local function refreshBillboard(billboard)
+        local info = tracked[billboard]
+        if not info or not billboard.Parent or not billboard.Enabled then
+            records[billboard] = nil
+            return
+        end
+
+        local currentHP, maxHP
+        for label in pairs(info.labels) do
+            if label and label.Parent then
+                local valid, current, maximum = parseHP(label.Text)
+                if valid then
+                    currentHP, maxHP = current, maximum
+                    break
+                end
+            end
+        end
+
+        if not currentHP then
+            records[billboard] = nil
+            return
+        end
+
+        local part = getPositionPart(billboard)
+        if not part or not part.Parent then
+            records[billboard] = nil
+            return
+        end
+
+        records[billboard] = {
+            Billboard = billboard,
+            Part = part,
+            Position = part.Position,
+            CurrentHP = currentHP,
+            MaxHP = maxHP,
+        }
+    end
+
+    local function addLabel(billboard, label)
+        if not label:IsA("TextLabel") and not label:IsA("TextButton") then return end
+        local info = tracked[billboard]
+        if not info or info.labels[label] then return end
+        info.labels[label] = true
+        table.insert(info.connections, label:GetPropertyChangedSignal("Text"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+        refreshBillboard(billboard)
+    end
+
+    local function unregister(billboard)
+        local info = tracked[billboard]
+        if info then
+            for _, connection in ipairs(info.connections) do
+                pcall(function() connection:Disconnect() end)
+            end
+        end
+        tracked[billboard] = nil
+        records[billboard] = nil
+    end
+
+    local function register(billboard)
+        if not billboard:IsA("BillboardGui") or tracked[billboard] then return end
+        local info = { labels = {}, connections = {} }
+        tracked[billboard] = info
+
+        for _, child in ipairs(billboard:GetDescendants()) do
+            addLabel(billboard, child)
+        end
+
+        table.insert(info.connections, billboard.DescendantAdded:Connect(function(child)
+            addLabel(billboard, child)
+        end))
+        table.insert(info.connections, billboard.DescendantRemoving:Connect(function(child)
+            if info.labels[child] then
+                info.labels[child] = nil
+                refreshBillboard(billboard)
+            end
+        end))
+        table.insert(info.connections, billboard:GetPropertyChangedSignal("Adornee"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+        table.insert(info.connections, billboard:GetPropertyChangedSignal("Enabled"):Connect(function()
+            refreshBillboard(billboard)
+        end))
+        refreshBillboard(billboard)
+    end
+
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        if instance:IsA("BillboardGui") then register(instance) end
+    end
+
+    workspaceAdded = workspace.DescendantAdded:Connect(function(instance)
+        if instance:IsA("BillboardGui") then register(instance) end
+    end)
+    workspaceRemoving = workspace.DescendantRemoving:Connect(function(instance)
+        if instance:IsA("BillboardGui") then unregister(instance) end
+    end)
+
+    function EnemyDetector:ScanAll()
+        local results = {}
+        for billboard, record in pairs(records) do
+            if billboard and billboard.Parent and record.Part and record.Part.Parent then
+                record.Position = record.Part.Position
+                table.insert(results, record)
+            else
+                records[billboard] = nil
+            end
+        end
+        return results
+    end
+
+    function EnemyDetector:IsAlive(enemy)
+        if not enemy or not enemy.Billboard then return false end
+        local record = records[enemy.Billboard]
+        return record ~= nil and enemy.Billboard.Parent ~= nil
+            and record.CurrentHP > 0 and record.MaxHP ~= CONFIG.DESTINATION_MAX_HP
+    end
+
+    function EnemyDetector:GetTrackedModels()
+        local models, seen = {}, {}
+        for _, record in pairs(records) do
+            local node = record.Part
+            while node and node ~= workspace do
+                if node:IsA("Model") then
+                    if not seen[node] then
+                        seen[node] = true
+                        table.insert(models, node)
+                    end
+                    break
+                end
+                node = node.Parent
+            end
+        end
+        return models
+    end
+
+    function EnemyDetector:Destroy()
+        if workspaceAdded then workspaceAdded:Disconnect() end
+        if workspaceRemoving then workspaceRemoving:Disconnect() end
+        local billboards = {}
+        for billboard in pairs(tracked) do table.insert(billboards, billboard) end
+        for _, billboard in ipairs(billboards) do unregister(billboard) end
+        table.clear(records)
+    end
+end
+
+-- ============================================================
 -- PERFORMANCE MANAGER (LOCAL VISUALS ONLY, CO THE KHOI PHUC)
 -- ============================================================
 local PerformanceManager = {}
@@ -1309,7 +1553,7 @@ do
 
     function PerformanceManager:RefreshEnemyModels(models)
         if not options.HideEnemyModels then return end
-        models = models or Treost.EnemyDetector:GetTrackedModels()
+        models = models or EnemyDetector:GetTrackedModels()
         for _, model in ipairs(models) do
             hideEnemyModel(model)
         end
@@ -2005,7 +2249,7 @@ do
         local clean = stripRichText(text)
         local current, maximum = clean:match("[Ww]ave%s*:?%s*(%d+)%s*/%s*(%d+)")
         current, maximum = tonumber(current), tonumber(maximum)
-        if not current or not maximum or maximum < 1 or maximum > 50 or current < 1 or current > maximum then
+        if not current or maximum ~= 40 or current < 1 or current > 40 then
             return nil, nil
         end
         return current, maximum
@@ -2038,7 +2282,7 @@ do
             MatchNumber = self.CurrentMatch,
             ReportId = HttpService:GenerateGUID(false),
             Result = self.Result,
-            WaveInfo = self.CurrentWave and (tostring(self.CurrentWave) .. "/" .. tostring(self.MaxWave or 0)) or "N/A",
+            WaveInfo = self.CurrentWave and (tostring(self.CurrentWave) .. "/40") or "N/A",
         }
         self._reportedTerminal = true
         self.CurrentMatch += 1
@@ -2055,7 +2299,7 @@ do
         for instance in pairs(self._watchedText) do
             if instance and instance.Parent and isTextObject(instance) and isVisible(instance) then
                 local current, maximum = parseWave(instance.Text)
-                if current and maximum and maximum <= 50 then
+                if current and maximum == 40 then
                     fallbackCurrent, fallbackMaximum = current, maximum
                     if string.find(string.lower(instance.Name), "wave", 1, true) then
                         self.CurrentWave = current
@@ -2116,7 +2360,7 @@ do
     local function handleWave(self, instance)
         if not isVisible(instance) then return end
         local current, maximum = parseWave(instance.Text)
-        if not current or not maximum or maximum > 50 then return end
+        if not current or maximum ~= 40 then return end
 
         if current <= 2 and self._terminalLocked then
             -- Wave 1/40 cua tran moi xac nhan UI da chuyen sang tran moi.
@@ -2271,7 +2515,7 @@ do
             if isTextObject(instance) and isVisible(instance) then
                 local raw = stripRichText(instance.Text)
                 local wave, maximum = parseWave(raw)
-                if wave and maximum and maximum <= 50 then
+                if wave and maximum == 40 then
                     print("[WAVE CANDIDATE]", instance:GetFullName(), "Text=", raw)
                 end
                 if isDefeatText(raw) then
@@ -2298,7 +2542,10 @@ do
     end
 end
 
--- TREOST core chạy trong scope riêng để tránh vượt giới hạn local của Luau.
+-- ============================================================
+-- TREOST SMART EVADE CORE (CFW AS BASE)
+-- Uses CFW's shared event-driven EnemyDetector; no duplicate enemy scanner.
+-- ============================================================
 local function initializeTreostCore()
 local LocalPlayer = LP
 local DEST_MAX_HP = CONFIG.DESTINATION_MAX_HP
@@ -2310,6 +2557,8 @@ local AppState = {
     InForbiddenZone = false,
     ManualOverride = false, -- V8: true khi người chơi đang kéo joystick/bấm phím di chuyển
     UrgentThreat = false,   -- V8: quái đang áp sát -> vòng lặp chạy nhanh hơn
+    WaypointMoveExpected = false,
+    WaypointGoalPosition = nil,
 }
 
 -- Cấu hình dò vật cản và ghi nhớ đường thất bại
@@ -2411,193 +2660,6 @@ end
 _G.EvadeConnections = {}
 local function addConn(c)
     table.insert(_G.EvadeConnections, c)
-end
-
--- ==========================================
--- 1. LÕI NHẬN DIỆN QUÁI TỪ "DUY TARGET FIRST"
--- ==========================================
-local EnemyDetector = {}
-do
-    local tracked = {}
-    local records = {}
-
-    local function stripRichText(text)
-        return tostring(text or ""):gsub("<[^>]+>", "")
-    end
-
-    local function parseHP(text)
-        local clean = stripRichText(text)
-        local current, maximum = clean:match("(%d+)%s*/%s*(%d+)")
-        current, maximum = tonumber(current), tonumber(maximum)
-        if not current or not maximum then return false end
-        if current <= 0 or maximum <= 0 then return false end
-        if maximum == DEST_MAX_HP then return false end
-        return true, current, maximum
-    end
-
-    local function firstPartInModel(model)
-        local root = model:FindFirstChild("HumanoidRootPart")
-        if root and root:IsA("BasePart") then return root end
-        if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
-            return model.PrimaryPart
-        end
-        return model:FindFirstChildWhichIsA("BasePart", true)
-    end
-
-    local function getPositionPart(billboard)
-        local adornee = billboard.Adornee
-        if adornee then
-            if adornee:IsA("BasePart") then return adornee end
-            if adornee:IsA("Attachment") and adornee.Parent and adornee.Parent:IsA("BasePart") then
-                return adornee.Parent
-            end
-        end
-
-        local node = billboard.Parent
-        while node and node ~= workspace do
-            if node:IsA("BasePart") then return node end
-            if node:IsA("Model") then
-                local part = firstPartInModel(node)
-                if part then return part end
-            end
-            node = node.Parent
-        end
-        return nil
-    end
-
-    local function refreshBillboard(billboard)
-        local info = tracked[billboard]
-        if not info or not billboard.Parent or not billboard.Enabled then
-            records[billboard] = nil
-            return
-        end
-
-        local currentHP, maxHP
-        for label in pairs(info.labels) do
-            if label and label.Parent then
-                local valid, current, maximum = parseHP(label.Text)
-                if valid then
-                    currentHP, maxHP = current, maximum
-                    break
-                end
-            end
-        end
-
-        if not currentHP then
-            records[billboard] = nil
-            return
-        end
-
-        local part = getPositionPart(billboard)
-        if not part or not part.Parent then
-            records[billboard] = nil
-            return
-        end
-
-        records[billboard] = {
-            Billboard = billboard,
-            Part = part,
-            Position = part.Position,
-            CurrentHP = currentHP,
-            MaxHP = maxHP,
-        }
-    end
-
-    local function addLabel(billboard, label)
-        if not label:IsA("TextLabel") and not label:IsA("TextButton") then return end
-        local info = tracked[billboard]
-        if not info or info.labels[label] then return end
-
-        info.labels[label] = true
-        table.insert(info.connections, label:GetPropertyChangedSignal("Text"):Connect(function()
-            refreshBillboard(billboard)
-        end))
-        refreshBillboard(billboard)
-    end
-
-    local function register(billboard)
-        if not billboard:IsA("BillboardGui") or tracked[billboard] then return end
-
-        local info = { labels = {}, connections = {} }
-        tracked[billboard] = info
-
-        for _, child in ipairs(billboard:GetDescendants()) do
-            addLabel(billboard, child)
-        end
-
-        table.insert(info.connections, billboard.DescendantAdded:Connect(function(child)
-            addLabel(billboard, child)
-        end))
-
-        table.insert(info.connections, billboard.DescendantRemoving:Connect(function(child)
-            if info.labels[child] then
-                info.labels[child] = nil
-                refreshBillboard(billboard)
-            end
-        end))
-
-        table.insert(info.connections, billboard:GetPropertyChangedSignal("Adornee"):Connect(function()
-            refreshBillboard(billboard)
-        end))
-
-        table.insert(info.connections, billboard:GetPropertyChangedSignal("Enabled"):Connect(function()
-            refreshBillboard(billboard)
-        end))
-
-        refreshBillboard(billboard)
-    end
-
-    for _, instance in ipairs(workspace:GetDescendants()) do
-        if instance:IsA("BillboardGui") then
-            register(instance)
-        end
-    end
-
-    addConn(workspace.DescendantAdded:Connect(function(instance)
-        if instance:IsA("BillboardGui") then
-            register(instance)
-        end
-    end))
-
-    function EnemyDetector:ScanAll()
-        local results = {}
-        for billboard, record in pairs(records) do
-            if billboard and billboard.Parent and record.Part and record.Part.Parent then
-                record.Position = record.Part.Position
-                table.insert(results, record)
-            else
-                records[billboard] = nil
-            end
-        end
-        return results
-    end
-
-    -- Adapter for CFW PerformanceManager: return unique live enemy Models.
-    -- This reuses TREOST's existing Billboard/HP event tracker; no second scanner is created.
-    function EnemyDetector:GetTrackedModels()
-        local result, seen = {}, {}
-        for _, record in pairs(records) do
-            local part = record and record.Part
-            local model = part and part.Parent and part:FindFirstAncestorOfClass("Model")
-            if model and model.Parent and not seen[model] then
-                seen[model] = true
-                table.insert(result, model)
-            end
-        end
-        return result
-    end
-
-    function EnemyDetector:Destroy()
-        for billboard, info in pairs(tracked) do
-            for _, connection in ipairs(info.connections or {}) do
-                pcall(function() connection:Disconnect() end)
-            end
-            tracked[billboard] = nil
-            records[billboard] = nil
-        end
-        table.clear(tracked)
-        table.clear(records)
-    end
 end
 
 -- ==========================================
@@ -4600,6 +4662,21 @@ local function resolveManualInputActive(humanoid, now, previouslyActive)
     local deadzone = OBSTACLE_CONFIG.ManualTouchDeadzone
     local strength = getTouchMoveVector().Magnitude
 
+    if strength < deadzone and UserInputService.GamepadEnabled then
+        -- Gamepad thumbsticks are treated as manual control on supported devices.
+        for _, gamepadType in ipairs({ Enum.UserInputType.Gamepad1, Enum.UserInputType.Gamepad2 }) do
+            local okState, gamepadState = pcall(UserInputService.GetGamepadState, UserInputService, gamepadType)
+            if okState and type(gamepadState) == "table" then
+                for _, inputObject in ipairs(gamepadState) do
+                    if inputObject.KeyCode == Enum.KeyCode.Thumbstick1 then
+                        strength = math.max(strength, inputObject.Position.Magnitude)
+                    end
+                end
+            end
+            if strength >= deadzone then break end
+        end
+    end
+
     if strength < deadzone then
         local focused = nil
         pcall(function()
@@ -4621,6 +4698,21 @@ local function resolveManualInputActive(humanoid, now, previouslyActive)
         local ownCommand = activeMove ~= nil
             or now < emergencyMoveUntil
             or (now - lastAutoMoveCommandAt) < 0.9
+        if not ownCommand and AppState.WaypointMoveExpected and AppState.WaypointGoalPosition then
+            local root = getHRP()
+            local moveDirection = Vector3.new(humanoid.MoveDirection.X, 0, humanoid.MoveDirection.Z)
+            local desiredDirection = root and Vector3.new(
+                AppState.WaypointGoalPosition.X - root.Position.X,
+                0,
+                AppState.WaypointGoalPosition.Z - root.Position.Z
+            ) or Vector3.zero
+            -- If current movement follows the active waypoint, it is our own MoveTo.
+            -- A clearly different direction is treated as manual override.
+            if moveDirection.Magnitude > 0.3 and desiredDirection.Magnitude > 0.1
+                and moveDirection.Unit:Dot(desiredDirection.Unit) >= 0.60 then
+                ownCommand = true
+            end
+        end
         if not ownCommand and humanoid.MoveDirection.Magnitude > 0.3 then
             manualFallbackStreak += 1
             if manualFallbackStreak >= 3 then
@@ -4768,7 +4860,9 @@ local WaypointRuntime = {
     Points = {},
     CurrentIndex = 1,
     TargetIndex = nil,
+    PausedTargetIndex = nil,
     Moving = false,
+    ManualOverride = false,
     ScanRadius = 60,
     WaveThreshold = 0, -- 0 = không tự chuyển theo Wave
     LastStartedMatch = 1,
@@ -4796,6 +4890,8 @@ local function haltWaypointMovement()
     end
     WaypointRuntime.Moving = false
     WaypointRuntime.TargetIndex = nil
+    AppState.WaypointMoveExpected = false
+    AppState.WaypointGoalPosition = nil
 end
 
 local function setEvadeStatus(message, color)
@@ -4831,17 +4927,23 @@ local function startWaypointMode()
     WaypointRuntime.Points = points
     WaypointRuntime.CurrentIndex = 1
     WaypointRuntime.TargetIndex = nil
+    WaypointRuntime.PausedTargetIndex = nil
     WaypointRuntime.ScanRadius = math.clamp(tonumber(WaypointRuntime.ScanRadius) or 60, 1, 1000)
     WaypointRuntime.Enabled = true
     WaypointRuntime.AutoSwitchedToOriginal = false
+    WaypointRuntime.ManualOverride = false
 
     if (root.Position - points[1]).Magnitude > 3 then
         WaypointRuntime.TargetIndex = 1
         WaypointRuntime.Moving = true
+        AppState.WaypointMoveExpected = true
+        AppState.WaypointGoalPosition = points[1]
         humanoid:MoveTo(points[1])
         setEvadeStatus("Waypoint: đang đi đến Point 1", Color3.fromRGB(255, 190, 90))
     else
         WaypointRuntime.Moving = false
+        AppState.WaypointMoveExpected = false
+        AppState.WaypointGoalPosition = nil
         setEvadeStatus("Waypoint: đang chờ tại Point 1", Color3.fromRGB(100, 255, 140))
     end
     return true, "Auto Evade Waypoint đã bật."
@@ -4852,8 +4954,12 @@ local function stopAllEvadeModes()
     WaypointRuntime.Enabled = false
     WaypointRuntime.AutoEvadeEnabled = false
     WaypointRuntime.AutoSwitchedToOriginal = false
+    WaypointRuntime.PausedTargetIndex = nil
+    WaypointRuntime.ManualOverride = false
     AppState.IsActive = false
     AppState.InForbiddenZone = false
+    AppState.WaypointMoveExpected = false
+    AppState.WaypointGoalPosition = nil
     AppState.ScanRadius = 25
     local humanoid = getHumanoid()
     pcall(function() if humanoid then setForbiddenZoneSpeed(humanoid, false) end end)
@@ -4869,6 +4975,10 @@ local function switchToOriginalSmartEvade(reason)
     haltWaypointMovement()
     WaypointRuntime.Enabled = false
     WaypointRuntime.AutoSwitchedToOriginal = true
+    WaypointRuntime.PausedTargetIndex = nil
+    WaypointRuntime.ManualOverride = false
+    AppState.WaypointMoveExpected = false
+    AppState.WaypointGoalPosition = nil
     AppState.ScanRadius = 25
     AppState.IsActive = true
     AppState.InForbiddenZone = false
@@ -4906,10 +5016,15 @@ local function updateWaypointMovement(humanoid, root, enemies)
         if (root.Position - target).Magnitude <= 3 then
             WaypointRuntime.CurrentIndex = targetIndex
             WaypointRuntime.TargetIndex = nil
+            WaypointRuntime.PausedTargetIndex = nil
             WaypointRuntime.Moving = false
+            AppState.WaypointMoveExpected = false
+            AppState.WaypointGoalPosition = nil
             pcall(function() humanoid:MoveTo(root.Position) end)
             setEvadeStatus("Đã đến Point " .. tostring(targetIndex) .. " · đang kiểm tra địch", Color3.fromRGB(100, 255, 140))
         else
+            AppState.WaypointMoveExpected = true
+            AppState.WaypointGoalPosition = target
             setEvadeStatus("Waypoint: Point " .. tostring(WaypointRuntime.CurrentIndex)
                 .. " → Point " .. tostring(targetIndex), Color3.fromRGB(255, 190, 90))
         end
@@ -4941,6 +5056,8 @@ local function updateWaypointMovement(humanoid, root, enemies)
     local nextPoint = WaypointRuntime.Points[nextIndex]
     WaypointRuntime.TargetIndex = nextIndex
     WaypointRuntime.Moving = true
+    AppState.WaypointMoveExpected = true
+    AppState.WaypointGoalPosition = nextPoint
     humanoid:MoveTo(nextPoint) -- Đi thẳng tới tọa độ, không dùng né quái/pathfinding.
     setEvadeStatus("Có địch trong " .. tostring(radius) .. " studs · đi Point " .. tostring(nextIndex),
         Color3.fromRGB(255, 190, 90))
@@ -4975,7 +5092,44 @@ addConn(RunService.Heartbeat:Connect(function()
     local allEnemies = Treost.EnemyDetector:ScanAll()
 
     -- Waypoint mode chỉ đọc khoảng cách địch; bỏ qua toàn bộ Smart Evade safety/path logic.
+    -- Nhưng khi người chơi chủ động giữ joystick/phím/gamepad, nhường quyền MoveTo ngay.
     if WaypointRuntime.Enabled then
+        local wasManual = WaypointRuntime.ManualOverride == true
+        local manualActive = resolveManualInputActive(humanoid, now, wasManual)
+        WaypointRuntime.ManualOverride = manualActive
+        if manualActive then
+            if not wasManual and WaypointRuntime.Moving then
+                -- Preserve the exact destination being travelled to so release resumes it,
+                -- rather than waiting at the previous point and silently losing progress.
+                WaypointRuntime.PausedTargetIndex = WaypointRuntime.TargetIndex
+                haltWaypointMovement()
+            end
+            setEvadeStatus("Waypoint · TỰ ĐIỀU KHIỂN · Automation tạm nhường quyền", Color3.fromRGB(100, 190, 255))
+            return
+        elseif wasManual then
+            local resumeIndex = WaypointRuntime.PausedTargetIndex
+            WaypointRuntime.PausedTargetIndex = nil
+            if resumeIndex and WaypointRuntime.Points[resumeIndex] then
+                local resumeTarget = WaypointRuntime.Points[resumeIndex]
+                if (hrp.Position - resumeTarget).Magnitude > 3 then
+                    WaypointRuntime.TargetIndex = resumeIndex
+                    WaypointRuntime.Moving = true
+                    AppState.WaypointMoveExpected = true
+                    AppState.WaypointGoalPosition = resumeTarget
+                    humanoid:MoveTo(resumeTarget)
+                    setEvadeStatus("Waypoint · Đã thả điều khiển · tiếp tục Point " .. tostring(resumeIndex),
+                        Color3.fromRGB(100, 255, 140))
+                else
+                    WaypointRuntime.CurrentIndex = resumeIndex
+                    WaypointRuntime.TargetIndex = nil
+                    WaypointRuntime.Moving = false
+                    AppState.WaypointMoveExpected = false
+                    AppState.WaypointGoalPosition = nil
+                end
+            else
+                setEvadeStatus("Waypoint · Đã thả điều khiển · tiếp tục tự động", Color3.fromRGB(100, 255, 140))
+            end
+        end
         updateWaypointMovement(humanoid, hrp, allEnemies)
         return
     end
@@ -5626,9 +5780,9 @@ do
     local notificationsEnabled = true
     local localizationApplying = setmetatable({}, { __mode = "k" })
     local languagePairs = {
-        {"ChenFuWei", "ChenFuWei"},
+        {"Evade System", "ChenFuWei"},
         {"● He thong san sang", "● System ready"},
-        {"Các chức năng điều khiển chung của trận đấu.", "General match controls, game speed and automation."},
+        {"Các chức năng chung của trận đấu; phần Evade và waypoint ở tab riêng.", "General match controls. Evade and waypoint tools are in a separate tab."},
         {"* Yêu cầu Gamepass để sử dụng X3", "* X3 requires a Gamepass."},
         {"Auto Play Again gọi RestartGame khi trận kết thúc. Play Macro tự lặp Macro qua các trận; Auto Play Again chỉ cần bật nếu muốn tự yêu cầu trận mới.", "Auto Play Again calls RestartGame after a match. Play Macro repeats the macro across matches; enable Auto Play Again only when you also want the game to request the next match."},
         {"TÊN FILE", "FILE NAME"},
@@ -5640,7 +5794,7 @@ do
         {"Spawn: chua dat", "Spawn: not set"},
         {"Destination: chua dat", "Destination: not set"},
         {"Route: chua record", "Route: not recorded"},
-        {"SAVED MAP FILES", "SAVED MAP FILES"},
+        {"SAVED EVADE FILES", "SAVED EVADE FILES"},
         {"MAP FILE (vi du: duy_maps/Map_A.json)", "MAP FILE (auto-saved under duy_maps/)"},
         {"Current Map: -- | Route Points: 0 | Status: NOT READY", "Current map: -- | Route points: 0 | Status: NOT READY"},
         {"Target: --  |  HP: --\nRoute progress: --", "Target: --  |  HP: --\nRoute progress: --"},
@@ -5682,7 +5836,7 @@ do
         {"Select saved Macro                         ▼", "Chọn Macro đã lưu                         ▼"},
         {"SEND MACRO JSON", "GỬI JSON MACRO"},
         {"Macro export: no file selected", "Macro: chưa chọn file"},
-        {"EVADE JSON → DISCORD", "EVADE JSON → DISCORD"},
+        {"EVADE JSON → DISCORD", "JSON EVADE → DISCORD"},
         {"Select saved Evade                         ▼", "Chọn Evade đã lưu                         ▼"},
         {"SEND EVADE JSON", "GỬI JSON EVADE"},
         {"Evade export: no file selected", "Evade: chưa chọn file"},
@@ -5720,7 +5874,7 @@ do
         {"Paste JSON here...", "Dán JSON tại đây..."},
         {"JSON is valid. Enter a name for the imported item, or use Skip for an automatic name.", "JSON hợp lệ. Nhập tên hoặc chọn bỏ qua để đặt tên tự động."},
         {"MACRO NAME", "TÊN MACRO"},
-        {"EVADE FILE NAME", "TÊN FILE EVADE"},
+        {"EVADE NAME", "TÊN EVADE"},
         {"VALIDATE JSON", "KIỂM TRA JSON"},
         {"SKIP NAME", "BỎ QUA TÊN"},
         {"IMPORT", "NHẬP"},
@@ -5728,7 +5882,7 @@ do
         {"EXPORT MACRO", "XUẤT MACRO"},
         {"EXPORT EVADE", "XUẤT EVADE"},
         {"RUN AHEAD BY", "CHẠY SỚM HƠN"},
-        {"Các chức năng điều khiển chung của trận đấu.", "General match controls for the current match."},
+        {"Các chức năng chung của trận đấu; phần Evade và waypoint ở tab riêng.", "General match controls. Evade and waypoint tools are in a separate tab."},
         {"* Yêu cầu Gamepass để sử dụng X3", "* X3 requires a Gamepass."},
         {"TÊN FILE", "FILE NAME"},
         {"TỐI ƯU HIỆU NĂNG", "PERFORMANCE"},
@@ -5854,7 +6008,7 @@ do
 
     local function addStroke(parent, color, thickness)
         return newInstance("UIStroke", {
-            Color = color or Color3.fromRGB(145, 24, 48),
+            Color = color or Color3.fromRGB(132, 22, 44),
             Thickness = thickness or 1,
         }, parent)
     end
@@ -6215,7 +6369,7 @@ do
             BorderSizePixel = 0,
         }, screen)
         addCorner(window, 11)
-        addStroke(window, Color3.fromRGB(210, 26, 58), 1.4)
+        addStroke(window, Color3.fromRGB(145, 24, 48), 1)
 
         -- Native pixel sizing: avoid fractional UIScale blur. Start compact; all four corners resize the window.
         local responsiveScale = newInstance("UIScale", { Scale = 1 }, window)
@@ -6282,7 +6436,7 @@ do
             BorderSizePixel = 0,
         }, header)
 
-        makeLabel(header, "EVADE", UDim2.new(0, 32, 0, 0), UDim2.new(1, -173, 1, 0), {
+        makeLabel(header, "ChenFuWei", UDim2.new(0, 32, 0, 0), UDim2.new(1, -173, 1, 0), {
             Font = Enum.Font.GothamBold,
             TextSize = 14,
             Color = C.ACCENT,
@@ -6298,11 +6452,11 @@ do
             TextColor = C.RED,
         })
 
-        local logo = makeButton(screen, "EVADE", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
+        local logo = makeButton(screen, "福维", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
             TextSize = 12,
-            Background = Color3.fromRGB(18, 39, 70),
+            Background = Color3.fromRGB(92, 12, 28),
             TextColor = C.ACCENT,
-            Radius = 27,
+            Radius = 23,
         })
         logo.Visible = false
 
@@ -6320,13 +6474,13 @@ do
             local handle = newInstance("TextButton", {
                 Name = "Resize" .. corner.name, AnchorPoint = corner.anchor,
                 Position = corner.position, Size = UDim2.fromOffset(20, 20),
-                BackgroundColor3 = Color3.fromRGB(39, 54, 74), BorderSizePixel = 0,
+                BackgroundColor3 = Color3.fromRGB(82, 12, 29), BorderSizePixel = 0,
                 Text = corner.glyph, Font = Enum.Font.GothamBold, TextSize = 13,
                 TextColor3 = C.ACCENT, AutoButtonColor = false, Active = true,
                 ZIndex = 80,
             }, window)
             addCorner(handle, 5)
-            addStroke(handle, Color3.fromRGB(145, 24, 48), 1)
+            addStroke(handle, Color3.fromRGB(180, 36, 58), 1)
             handle.InputBegan:Connect(function(input)
                 if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
                     resizeActive = true
@@ -6459,7 +6613,7 @@ do
                 Name = "AccentBar",
                 Position = UDim2.new(0, 0, 0, 0),
                 Size = UDim2.new(0, 4, 1, 0),
-                BackgroundColor3 = accentColor or Color3.fromRGB(85, 175, 255),
+                BackgroundColor3 = accentColor or C.ACCENT,
                 BorderSizePixel = 0,
                 ZIndex = 192,
             }, toast)
@@ -6675,14 +6829,14 @@ do
             end)
         end
 
-        -- Keo cua so chi tu header va nen thanh tab; vung noi dung danh cho cuon.
+        -- Keo cua so tu vung nen cua noi dung va thanh tab, ngoai header.
         -- Cac nut/tab con van nhan click rieng, khong bi doi thanh thao tac keo.
-        -- Chỉ header và phần nền thanh tab được kéo; nội dung trong tab chỉ cuộn.
+        makeDraggable(content, window)
         makeDraggable(sidebar, window)
 
         local tabNames = isMobileLayout
-            and { "MAIN", "EVADE", "MACRO", "WEBHOOK", "PERF" }
-            or { "MAIN", "EVADE", "MACRO", "WEBHOOK", "PERF" }
+            and { "MAIN", "EVADE", "MACRO", "WEBHOOK", "PERF", "INFO" }
+            or { "MAIN", "EVADE", "MACRO", "WEBHOOK", "PERF", "INFO" }
         local tabButtons = {}
         local tabFrames = {}
 
@@ -6695,12 +6849,10 @@ do
                     TextSize = isMobileLayout and 10 or 11,
                 })
             tabButtons[index] = tabButton
-            -- A tab can also act as a drag handle; click-without-drag still selects it.
-            makeDraggable(tabButton, window)
 
-            -- MAIN va TARGET deu la ScrollingFrame: automation co the dai hon viewport,
+            -- MAIN va EVADE deu la ScrollingFrame: automation co the dai hon viewport,
             -- khong tran khoi cua so va khong de menu bi keo dai theo noi dung.
-            local scrollableTab = index == 1 or index == 2 or index == 4 or index == 5
+            local scrollableTab = index == 1 or index == 2 or index == 4
             local frameClass = scrollableTab and "ScrollingFrame" or "Frame"
             local frameProperties = {
                 Size = UDim2.new(1, 0, 1, 0),
@@ -6709,7 +6861,7 @@ do
                 Active = true,
             }
             if scrollableTab then
-                local canvasHeight = index == 1 and 560 or (index == 2 and 620 or 760)
+                local canvasHeight = index == 1 and 560 or (index == 2 and 540 or 700)
                 frameProperties.CanvasSize = UDim2.new(0, 0, 0, canvasHeight)
                 frameProperties.ScrollBarThickness = 4
                 frameProperties.ScrollBarImageColor3 = C.ACCENT
@@ -6722,10 +6874,16 @@ do
             tabFrames[index] = frame
         end
 
+        -- Register drag on each tab frame only after tabFrames has been created.
+        -- Registering earlier referenced a nil/global tabFrames and aborted GUI:Build.
+        for _, tabFrame in ipairs(tabFrames) do
+            makeDraggable(tabFrame, window)
+        end
+
         local function switchTab(index)
             for i, frame in ipairs(tabFrames) do
                 frame.Visible = i == index
-                tabButtons[i].BackgroundColor3 = i == index and Color3.fromRGB(27, 44, 68) or C.SIDEBAR
+                tabButtons[i].BackgroundColor3 = i == index and C.ACTIVE_FILE or C.SIDEBAR
                 tabButtons[i].TextColor3 = i == index and C.ACCENT or C.DIM
             end
         end
@@ -6752,26 +6910,30 @@ do
         makeLabel(globalPanel, "MAIN CONTROL", UDim2.new(0, 14, 0, 10), UDim2.new(1, -28, 0, 22), {
             Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
         })
-        makeLabel(globalPanel, "Các chức năng điều khiển và tự động hóa trận đấu.",
+        makeLabel(globalPanel, "Các chức năng chung của trận đấu; phần Evade và waypoint ở tab riêng.",
             UDim2.new(0, 14, 0, 34), UDim2.new(1, -28, 0, 28), {
                 TextSize = 9, Color = C.DIM, Wrapped = true,
             })
 
         local speedPanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 72),
-            Size = UDim2.new(0.48, -8, 0, 146),
+            Size = UDim2.new(0.48, -8, 0, 126),
             BackgroundColor3 = C.INPUT,
             BorderSizePixel = 0,
         }, globalPanel)
         addCorner(speedPanel, 9)
-        addStroke(speedPanel, Color3.fromRGB(145, 24, 48), 1)
+        addStroke(speedPanel, Color3.fromRGB(132, 22, 44), 1)
         makeLabel(speedPanel, "GAME SPEED", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 10, Color = C.ACCENT,
         })
-        local gameSpeedX1Button = makeButton(speedPanel, "SPEED X1", UDim2.new(0, 10, 0, 35), UDim2.new(1, -20, 0, 27), { Background = C.BUTTON, TextSize = 9 })
-        local gameSpeedX15Button = makeButton(speedPanel, "SPEED X1.5", UDim2.new(0, 10, 0, 66), UDim2.new(1, -20, 0, 27), { Background = C.BUTTON, TextSize = 9 })
-        local gameSpeedX2Button = makeButton(speedPanel, "SPEED X2", UDim2.new(0, 10, 0, 97), UDim2.new(1, -20, 0, 27), { Background = C.BUTTON, TextSize = 9 })
-        makeLabel(speedPanel, "X1.5 phụ thuộc hỗ trợ của server.", UDim2.new(0, 10, 0, 127), UDim2.new(1, -20, 0, 14), {
+        local gameSpeedX2Button = makeButton(speedPanel, "SPEED X2", UDim2.new(0, 10, 0, 38), UDim2.new(1, -20, 0, 30), {
+            Background = C.BUTTON,
+        })
+        local gameSpeedX3Button = makeButton(speedPanel, "SPEED X3", UDim2.new(0, 10, 0, 76), UDim2.new(1, -20, 0, 30), {
+            Background = C.BUTTON,
+            TextSize = 9,
+        })
+        makeLabel(speedPanel, "* Yêu cầu Gamepass để sử dụng X3", UDim2.new(0, 10, 0, 108), UDim2.new(1, -20, 0, 14), {
             TextSize = 7, Color = C.YELLOW,
         })
 
@@ -6782,7 +6944,7 @@ do
             BorderSizePixel = 0,
         }, globalPanel)
         addCorner(automationPanel, 9)
-        addStroke(automationPanel, Color3.fromRGB(145, 24, 48), 1)
+        addStroke(automationPanel, Color3.fromRGB(132, 22, 44), 1)
         makeLabel(automationPanel, "AUTOMATION", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 20), {
             Font = Enum.Font.GothamBold, TextSize = 10, Color = C.ACCENT,
         })
@@ -6809,7 +6971,7 @@ do
         local difficultyList = newInstance("ScrollingFrame", {
             Position = UDim2.new(0, 10, 0, 84),
             Size = UDim2.new(1, -20, 0, 112),
-            BackgroundColor3 = Color3.fromRGB(24, 11, 16),
+            BackgroundColor3 = Color3.fromRGB(25, 6, 12),
             BorderSizePixel = 0,
             ScrollBarThickness = 3,
             ScrollBarImageColor3 = C.ACCENT,
@@ -6884,7 +7046,7 @@ do
                 and (uiLanguage == "VI"
                     and "Auto Ability đã bật: Ability sẽ tự kích hoạt khi hồi xong; bỏ qua Ability theo Time trong JSON."
                     or "Auto Ability enabled: abilities trigger when cooldown ends; timed ability actions in JSON are skipped.")
-                or (uiLanguage == "VI" and "Auto Ability đã tắt: ActivateUnitAbility không được lưu trong Macro JSON."
+                or (uiLanguage == "VI" and "Auto Ability đã tắt: Macro Ability sẽ chạy theo Time trong JSON."
                     or "Auto Ability disabled: ability actions follow their JSON timestamps.")
             if callbacks.onAutoAbilityChanged then
                 ok, message = callbacks.onAutoAbilityChanged(enabled)
@@ -6901,17 +7063,14 @@ do
 
         local activeGameSpeed = 1
         local function refreshGameSpeedButtons()
-            local choices = {
-                { Button = gameSpeedX1Button, Value = 1, Text = "SPEED X1" },
-                { Button = gameSpeedX15Button, Value = 1.5, Text = "SPEED X1.5" },
-                { Button = gameSpeedX2Button, Value = 2, Text = "SPEED X2" },
-            }
-            for _, item in ipairs(choices) do
-                local selected = activeGameSpeed == item.Value
-                item.Button.Text = item.Text .. (selected and "  ✓" or "")
-                item.Button.BackgroundColor3 = selected and C.GREEN_DARK or C.BUTTON
-                item.Button.TextColor3 = C.TEXT
-            end
+            gameSpeedX2Button.Text = activeGameSpeed == 2 and "SPEED X2  ✓" or "SPEED X2"
+            gameSpeedX3Button.Text = activeGameSpeed == 3 and "SPEED X3  ✓" or "SPEED X3"
+            gameSpeedX2Button.BackgroundColor3 = activeGameSpeed == 2 and C.GREEN_DARK or C.BUTTON
+            gameSpeedX3Button.BackgroundColor3 = activeGameSpeed == 3 and C.GREEN_DARK or C.BUTTON
+            gameSpeedX2Button.TextColor3 = activeGameSpeed == 3 and C.DIM or C.TEXT
+            gameSpeedX3Button.TextColor3 = activeGameSpeed == 2 and C.DIM or C.TEXT
+            gameSpeedX2Button.Active = activeGameSpeed ~= 3
+            gameSpeedX3Button.Active = activeGameSpeed ~= 2
         end
         local function applyGameSpeed(multiplier)
             local ok, message
@@ -6920,15 +7079,20 @@ do
             if ok then
                 activeGameSpeed = multiplier
                 refreshGameSpeedButtons()
-                notify("Đã gửi yêu cầu Game Speed X" .. tostring(multiplier) .. ".", C.GREEN)
+                notify(multiplier == 1 and "Đã tắt Game Speed." or ("Đã bật Speed X" .. tostring(multiplier) .. "."), C.GREEN)
             else
                 notify(message or "Không thể đổi Game Speed.", C.YELLOW)
             end
             setStatus(message, ok and C.GREEN or C.YELLOW)
         end
-        gameSpeedX1Button.Activated:Connect(function() applyGameSpeed(1) end)
-        gameSpeedX15Button.Activated:Connect(function() applyGameSpeed(1.5) end)
-        gameSpeedX2Button.Activated:Connect(function() applyGameSpeed(2) end)
+        gameSpeedX2Button.Activated:Connect(function()
+            if activeGameSpeed == 3 then return end
+            applyGameSpeed(activeGameSpeed == 2 and 1 or 2)
+        end)
+        gameSpeedX3Button.Activated:Connect(function()
+            if activeGameSpeed == 2 then return end
+            applyGameSpeed(activeGameSpeed == 3 and 1 or 3)
+        end)
         refreshGameSpeedButtons()
 
         -- ============================================================
@@ -6982,7 +7146,7 @@ do
         local macroDropdownList = newInstance("ScrollingFrame", {
             Position = UDim2.new(0, 6, 0, 106),
             Size = UDim2.new(1, -12, 0, 78),
-            BackgroundColor3 = Color3.fromRGB(12, 15, 23),
+            BackgroundColor3 = Color3.fromRGB(25, 6, 12),
             BorderSizePixel = 0,
             ScrollBarThickness = 3,
             ScrollBarImageColor3 = C.ACCENT,
@@ -6994,7 +7158,7 @@ do
             ZIndex = 35,
         }, macroScroll)
         addCorner(macroDropdownList, 6)
-        addStroke(macroDropdownList, Color3.fromRGB(127, 38, 54), 1)
+        addStroke(macroDropdownList, Color3.fromRGB(145, 24, 48), 1)
         newInstance("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, macroDropdownList)
         newInstance("UIPadding", {
             PaddingTop = UDim.new(0, 3), PaddingLeft = UDim.new(0, 3),
@@ -7006,7 +7170,7 @@ do
             BackgroundColor3 = C.INPUT, BorderSizePixel = 0,
         }, macroScroll)
         addCorner(macroStatusCard, 8)
-        addStroke(macroStatusCard, Color3.fromRGB(145, 24, 48), 1)
+        addStroke(macroStatusCard, Color3.fromRGB(132, 22, 44), 1)
         local macroFileStatus = makeLabel(macroStatusCard, "MACRO FILE: NONE · ACTIONS: --",
             UDim2.new(0, 10, 0, 6), UDim2.new(1, -20, 0, 18), { TextSize = 11, Color = C.ACCENT })
         local macroProgressStatus = makeLabel(macroStatusCard, "STATUS: READY",
@@ -7022,23 +7186,11 @@ do
         local macroRecordSetter
         macroRecordSetter = makeToggle(macroScroll, "RECORD MACRO", UDim2.new(0, 6, 0, 221), function(enabled)
             local ok, message = false, "Recorder Engine chưa sẵn sàng."
-            if enabled then
-                macroProgressStatus.Text = "STATUS: RECORD REQUESTED · đang kiểm tra Macro Engine..."
-                macroProgressStatus.TextColor3 = C.YELLOW
-            end
             if callbacks.onMacroRecordChanged then
-                local callOK, result, detail = pcall(callbacks.onMacroRecordChanged, enabled)
-                if callOK then
-                    ok, message = result == true, detail
-                else
-                    ok, message = false, "Record callback error: " .. tostring(result)
-                end
+                ok, message = callbacks.onMacroRecordChanged(enabled)
             end
             if not ok then macroRecordSetter(false, true) end
-            if api and api.setMacroStatus then
-                pcall(api.setMacroStatus, tostring(message or (ok and "Record enabled." or "Record failed.")), ok)
-            end
-            setStatus(message or (ok and "Record enabled." or "Record failed."), ok and C.GREEN or C.YELLOW)
+            setStatus(message, ok and C.GREEN or C.YELLOW)
         end)
         local macroPlaySetter
         macroPlaySetter = makeToggle(macroScroll, "PLAY MACRO", UDim2.new(0, 6, 0, 255), function(enabled)
@@ -7050,12 +7202,12 @@ do
             setStatus(message, ok and C.GREEN or C.YELLOW)
         end)
 
-        local macroFifoInfo = makeLabel(macroScroll,
-            "FIFO: PLACE ĐẦU THỬ LẠI MỖI 20s · ACTION SAU CÁCH 2s · TỐI ĐA 10 LẦN THỬ LẠI",
+        makeLabel(macroScroll,
+            "FIFO FIXED: PlaceUnit đầu thử ngay · retry 20s; Action sau cách nhau 2s · tối đa 10 retry",
             UDim2.new(0, 6, 0, 289), UDim2.new(1, -12, 0, 28), {
-                TextSize = 9, Color = C.ACCENT, Wrapped = true,
+                TextSize = 9, Color = C.YELLOW, Wrapped = true,
             })
-        macroFifoInfo.TextYAlignment = Enum.TextYAlignment.Center
+        -- Time/EventSeq vẫn được lưu trong JSON; FIFO Replay không dùng Time để lập lịch.
         macroScroll.CanvasSize = UDim2.new(0, 0, 0, 364)
 
         local selectedMacroKey = nil
@@ -7248,7 +7400,7 @@ do
         newInstance("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 8) }, evadeDropdownButton)
         local evadeDropdownList = newInstance("ScrollingFrame", {
             Position = UDim2.new(0, 0, 0, 107), Size = UDim2.new(1, 0, 0, 74),
-            BackgroundColor3 = Color3.fromRGB(12, 15, 23), BorderSizePixel = 0,
+            BackgroundColor3 = Color3.fromRGB(25, 6, 12), BorderSizePixel = 0,
             ScrollBarThickness = 4, ScrollBarImageColor3 = C.ACCENT,
             CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
             Visible = false, Active = true, Selectable = true, ScrollingEnabled = true,
@@ -7322,7 +7474,7 @@ do
             for _, child in ipairs(evadeDropdownList:GetChildren()) do
                 if child:IsA("TextButton") then child:Destroy() end
             end
-            local keys = SaveManager:GetFileList()
+            local keys = SaveManager:GetEvadeFileList()
             if #keys == 0 then
                 selectedEvadeKey = nil
                 evadeDropdownButton.Text = "Chưa có file                         ▼"
@@ -7330,8 +7482,16 @@ do
                 evadeFileStatusLabel.Text = "FILE: -- · POINTS: 0"
                 return
             end
-            if selectedEvadeKey and not SaveManager:GetFile(selectedEvadeKey) then selectedEvadeKey = nil end
-            if not selectedEvadeKey then selectedEvadeKey = select(1, SaveManager:GetActiveFile()) end
+            if selectedEvadeKey and not SaveManager:IsEvadeFile(selectedEvadeKey) then selectedEvadeKey = nil end
+            if not selectedEvadeKey then
+                local activeKey = select(1, SaveManager:GetActiveFile())
+                if activeKey and SaveManager:IsEvadeFile(activeKey) then
+                    selectedEvadeKey = activeKey
+                else
+                    selectedEvadeKey = keys[1]
+                    if selectedEvadeKey then SaveManager:SelectFile(selectedEvadeKey) end
+                end
+            end
             local active = selectedEvadeKey and SaveManager:GetFile(selectedEvadeKey)
             evadeDropdownButton.Text = tostring(active and active.MapName or "Chưa có file") .. "                         ▼"
             for index, key in ipairs(keys) do
@@ -7363,7 +7523,7 @@ do
             evadeFileStatusLabel.Text = string.format("FILE: %s · POINTS: %d", tostring(active and active.MapName or "--"), count)
         end
         evadeDropdownButton.Activated:Connect(function()
-            if #SaveManager:GetFileList() == 0 then
+            if #SaveManager:GetEvadeFileList() == 0 then
                 evadeFileOperationLabel.Text = "Chưa có file Evade. Hãy tạo file trước."
                 evadeFileOperationLabel.TextColor3 = C.YELLOW
                 return
@@ -7434,7 +7594,7 @@ do
         }, screen)
         local editorCard = newInstance("Frame", {
             AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.78, 0.52),
-            Size = UDim2.fromOffset(224, 216),
+            Size = UDim2.fromOffset(224, 264),
             BackgroundColor3 = C.PANEL, BorderSizePixel = 0, ZIndex = 181,
             Active = true,
         }, editorOverlay)
@@ -7484,9 +7644,18 @@ do
         editorFileLabel.ZIndex = 182
         local editorPointCount = makeLabel(editorCard, "Đã lưu: 0 điểm", UDim2.new(0, 12, 0, 61), UDim2.new(1, -24, 0, 18), { TextSize = 9, Color = C.TEXT })
         editorPointCount.ZIndex = 182
-        local setPointButton = makeButton(editorCard, "SET POINT 1", UDim2.new(0, 12, 0, 87), UDim2.new(1, -24, 0, 34), { Background = C.GREEN_DARK, TextSize = 11, ZIndex = 183 })
-        local deletePointButton = makeButton(editorCard, "DELETE POINT 1", UDim2.new(0, 12, 0, 128), UDim2.new(1, -24, 0, 29), { Background = C.RED_DARK, TextSize = 9, ZIndex = 183 })
-        local donePointButton = makeButton(editorCard, "XONG", UDim2.new(0, 12, 0, 166), UDim2.new(1, -24, 0, 34), { Background = C.GREEN, TextSize = 11, ZIndex = 183 })
+        local waypointIndexLabel = makeLabel(editorCard, "CHỌN WAYPOINT # (sửa / xóa)",
+            UDim2.new(0, 12, 0, 84), UDim2.new(1, -24, 0, 16), { TextSize = 8, Color = C.DIM })
+        waypointIndexLabel.ZIndex = 182
+        local waypointIndexBox = makeTextBox(editorCard, "1",
+            UDim2.new(0, 12, 0, 102), UDim2.new(1, -24, 0, 28))
+        waypointIndexBox.ZIndex = 183
+        waypointIndexBox.Text = "1"
+        local setPointButton = makeButton(editorCard, "SET / UPDATE POINT 1",
+            UDim2.new(0, 12, 0, 139), UDim2.new(1, -24, 0, 32), { Background = C.GREEN_DARK, TextSize = 10, ZIndex = 183 })
+        local deletePointButton = makeButton(editorCard, "DELETE SELECTED POINT",
+            UDim2.new(0, 12, 0, 178), UDim2.new(1, -24, 0, 30), { Background = C.RED_DARK, TextSize = 9, ZIndex = 183 })
+        local donePointButton = makeButton(editorCard, "XONG", UDim2.new(0, 12, 0, 215), UDim2.new(1, -24, 0, 34), { Background = C.GREEN, TextSize = 11, ZIndex = 183 })
 
         local function getCurrentSavedPoints()
             local _, data = SaveManager:GetActiveFile()
@@ -7496,18 +7665,29 @@ do
             local _, data = SaveManager:GetActiveFile()
             local points = data and data.EvadePoints or {}
             local count = #points
+            local selectedIndex = tonumber(waypointIndexBox.Text)
+            if not selectedIndex or selectedIndex % 1 ~= 0 or selectedIndex < 1 then
+                selectedIndex = count + 1
+                waypointIndexBox.Text = tostring(selectedIndex)
+            end
             editorPointCount.Text = "Đã lưu: " .. tostring(count) .. " điểm"
             editorFileLabel.Text = "FILE: " .. tostring(data and data.MapName or "--")
-            setPointButton.Text = "SET POINT " .. tostring(count + 1)
-            deletePointButton.Text = "DELETE POINT " .. tostring(math.max(count, 1))
-            deletePointButton.Active = count > 0
-            deletePointButton.BackgroundColor3 = count > 0 and C.RED_DARK or C.BUTTON
-            deletePointButton.TextColor3 = count > 0 and C.TEXT or C.DIM
-            local countForStatus = count
+            setPointButton.Text = (selectedIndex <= count and "UPDATE POINT " or "SET POINT ") .. tostring(selectedIndex)
+            local canDelete = selectedIndex <= count
+            deletePointButton.Active = canDelete
+            deletePointButton.Selectable = canDelete
+            deletePointButton.BackgroundColor3 = canDelete and C.RED_DARK or C.BUTTON
+            deletePointButton.TextColor3 = canDelete and C.TEXT or C.DIM
+            local canSet = selectedIndex <= count + 1 and selectedIndex <= 1500
+            setPointButton.Active = canSet
+            setPointButton.Selectable = canSet
+            setPointButton.BackgroundColor3 = canSet and C.GREEN_DARK or C.BUTTON
+            setPointButton.TextColor3 = canSet and C.TEXT or C.DIM
             if data then
-                evadeFileStatusLabel.Text = string.format("FILE: %s · POINTS: %d", tostring(data.MapName), countForStatus)
+                evadeFileStatusLabel.Text = string.format("FILE: %s · POINTS: %d", tostring(data.MapName), count)
             end
         end
+        waypointIndexBox.FocusLost:Connect(refreshEditorPointButtons)
 
         createEvadeFileButton.Activated:Connect(function()
             if not updateEvadeCreateButton() then return end
@@ -7533,24 +7713,30 @@ do
         end)
 
         setPointButton.Activated:Connect(function()
-            local ok, result = callbacks.onAddEvadePoint()
+            local index = tonumber(waypointIndexBox.Text)
+            local ok, result, operation = callbacks.onSetEvadePoint(index)
             if ok then
+                waypointIndexBox.Text = operation == "added" and tostring(tonumber(result) + 1) or tostring(result)
                 refreshEditorPointButtons()
-                evadeFileOperationLabel.Text = "Đã lưu Point " .. tostring(result) .. "."
+                evadeFileOperationLabel.Text = (operation == "added" and "Đã thêm Point " or "Đã cập nhật Point ") .. tostring(result) .. "."
                 evadeFileOperationLabel.TextColor3 = C.GREEN
             else
-                evadeFileOperationLabel.Text = tostring(result or "Không lưu được điểm.")
+                evadeFileOperationLabel.Text = tostring(result or "Không lưu được waypoint.")
                 evadeFileOperationLabel.TextColor3 = C.RED
             end
         end)
         deletePointButton.Activated:Connect(function()
-            local ok, result = callbacks.onDeleteLastEvadePoint()
+            local index = tonumber(waypointIndexBox.Text)
+            local ok, result = callbacks.onDeleteEvadePoint(index)
             if ok then
+                local _, data = SaveManager:GetActiveFile()
+                local remaining = data and #(data.EvadePoints or {}) or 0
+                waypointIndexBox.Text = tostring(math.max(1, math.min(tonumber(result) or 1, math.max(remaining, 1))))
                 refreshEditorPointButtons()
                 evadeFileOperationLabel.Text = "Đã xóa Point " .. tostring(result) .. "."
                 evadeFileOperationLabel.TextColor3 = C.YELLOW
             else
-                evadeFileOperationLabel.Text = tostring(result or "Không có điểm để xóa.")
+                evadeFileOperationLabel.Text = tostring(result or "Waypoint được chọn không tồn tại.")
                 evadeFileOperationLabel.TextColor3 = C.YELLOW
             end
         end)
@@ -7710,6 +7896,7 @@ do
             getSelectedKey = function() return selectedEvadeKey end,
         }
 
+
         -- TAB 4: DISCORD WEBHOOK
         local webhookPanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
@@ -7770,7 +7957,7 @@ do
             local list = newInstance("ScrollingFrame", {
                 Position = UDim2.new(0, 14, 0, y),
                 Size = UDim2.new(1, -28, 0, 82),
-                BackgroundColor3 = Color3.fromRGB(12, 15, 23),
+                BackgroundColor3 = Color3.fromRGB(25, 6, 12),
                 BorderSizePixel = 0,
                 ScrollBarThickness = 4,
                 ScrollBarImageColor3 = C.ACCENT,
@@ -7925,6 +8112,7 @@ do
             evadeDiscordStatus.TextColor3 = ok and C.GREEN or C.RED
         end)
 
+
         -- TAB 5: HIỆU NĂNG
         local performancePanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
@@ -8024,68 +8212,82 @@ do
         performanceScroll.CanvasSize = UDim2.new(0, 0, 0, antiAfkY + 55)
 
 
-        -- EVADE FILE MANAGER callbacks: create, choose, rename, delete, import/export.
-        local selectedKey = nil
-
-        local function refreshDropdown()
-            if EvadeUI and EvadeUI.refreshFiles then EvadeUI.refreshFiles() end
-        end
-
-        local function formatUIValue(value)
-            if value == nil then return "null" end
-            local integer = math.floor(tonumber(value) or 0)
-            local reversed = tostring(integer):reverse():gsub("(%d%d%d)", "%1,"):reverse()
-            return reversed:gsub("^,", "")
-        end
-
+        -- ============================================================
+        -- API BRIDGE: CFW BACKEND <-> EVADE GUI
+        -- The old Target tab UI was intentionally removed. Keep the backend
+        -- API shape used by CFW startup/recording, while routing visible status
+        -- to the replacement Evade tab.
+        -- ============================================================
         self._api = {
             setStatus = setStatus,
             notify = notify,
             clearToasts = clearToasts,
             getLanguage = function() return uiLanguage end,
-            refreshDropdown = refreshDropdown,
-            updateCreateButton = updateEvadeCreateButton,
-            setSelectedKey = function(key)
-                selectedKey = key
-                if EvadeUI and EvadeUI.setSelected then EvadeUI.setSelected(key) end
+
+            -- Legacy Target-tab API compatibility. These functions are inert
+            -- because the Target tab has been replaced by Evade.
+            refreshDropdown = function()
+                if EvadeUI and EvadeUI.refreshFiles then EvadeUI.refreshFiles() end
             end,
-            setEvadeStatus = function(text, color)
-                if EvadeUI and EvadeUI.setMode then EvadeUI.setMode(text, color) end
-            end,
-            setEvadeFileStatus = function(text, color)
-                if EvadeUI and EvadeUI.setFileStatus then EvadeUI.setFileStatus(text, color) end
-            end,
-            refreshEvadeDropdown = refreshDropdown,
-            setEvadeAutoUI = function(value, silent)
-                if EvadeUI and EvadeUI.setAutoEvade then EvadeUI.setAutoEvade(value, silent) end
-            end,
-            getEvadeLabels = function()
-                if EvadeUI and EvadeUI.getLabels then return EvadeUI.getLabels() end
-                return nil, nil
-            end,
+            updateCreateButton = function() end,
+            setSpawnLabel = function() end,
+            setDestinationLabel = function() end,
             setTargetInfo = function() end,
-            setScannerInfo = function(snapshot)
-                if EvadeUI and EvadeUI.setMode and not Treost.WaypointRuntime.Enabled and not Treost.AppState.IsActive then
-                    EvadeUI.setMode("MODE: OFF · Wave " .. tostring(snapshot.Wave or "--"), C.DIM)
-                end
-            end,
-            setPerformanceUI = function(values, silent)
-                for name, setter in pairs(performanceSetters) do setter(values and values[name] == true, silent == true) end
-            end,
-            setPerformanceModeUI = function(mode) refreshPerformanceModeButtons(mode) end,
-            setAntiAFKUI = function(enabled, silent) if antiAfkSetter then antiAfkSetter(enabled == true, silent == true) end end,
+            setRouteStatus = function() end,
             setSpeedUI = function() end,
             setNoclipUI = function() end,
             setFollowUI = function() end,
             setScannerUI = function() end,
             setSpeedModeUI = function() end,
-            setBossInfo = function(text) if EvadeUI then EvadeUI.setFileStatus("Boss: " .. tostring(text), C.DIM) end end,
+
+            setScannerInfo = function(snapshot)
+                if EvadeUI and EvadeUI.setMode and Treost
+                    and not Treost.WaypointRuntime.Enabled and not Treost.AppState.IsActive then
+                    EvadeUI.setMode("MODE: OFF · Wave " .. tostring(snapshot and snapshot.Wave or "--"), C.DIM)
+                end
+            end,
+            setEvadeStatus = function(message, color)
+                if EvadeUI and EvadeUI.setMode then EvadeUI.setMode(message, color) end
+            end,
+            setEvadeFileStatus = function(message, color)
+                if EvadeUI and EvadeUI.setFileStatus then EvadeUI.setFileStatus(message, color) end
+            end,
+            refreshEvadeDropdown = function()
+                if EvadeUI and EvadeUI.refreshFiles then EvadeUI.refreshFiles() end
+            end,
+            setEvadeAutoUI = function(value, silent)
+                if EvadeUI and EvadeUI.setAutoEvade then EvadeUI.setAutoEvade(value == true, silent == true) end
+            end,
+            getEvadeLabels = function()
+                if EvadeUI and EvadeUI.getLabels then return EvadeUI.getLabels() end
+                return nil, nil
+            end,
+            setBossInfo = function(message)
+                if EvadeUI and EvadeUI.setFileStatus then
+                    EvadeUI.setFileStatus("Boss: " .. tostring(message), C.DIM)
+                end
+            end,
+
+            setPerformanceUI = function(values, silent)
+                for name, setter in pairs(performanceSetters) do
+                    setter(values and values[name] == true, silent == true)
+                end
+            end,
+            setPerformanceModeUI = function(mode)
+                refreshPerformanceModeButtons(mode)
+            end,
+            setAntiAFKUI = function(enabled, silent)
+                if antiAfkSetter then antiAfkSetter(enabled == true, silent == true) end
+            end,
             setWebhookStatus = function(message, ok)
                 webhookStatusLabel.Text = "Webhook: " .. tostring(message)
                 webhookStatusLabel.TextColor3 = ok and C.GREEN or C.RED
             end,
+
             refreshMacroDropdown = refreshMacroDropdown,
-            setMacroJson = function(key, raw) if selectedMacroKey == key then updateMacroFileStatus() end end,
+            setMacroJson = function(key, raw)
+                if selectedMacroKey == key then updateMacroFileStatus() end
+            end,
             setMacroRecordPreview = function(key, raw, actionCount)
                 if selectedMacroKey == key then
                     local data = MacroStore:GetFile(key)
@@ -8103,8 +8305,12 @@ do
                 updateMacroFileStatus()
                 return true
             end,
-            setMacroRecordUI = function(enabled, silent) macroRecordSetter(enabled == true, silent == true) end,
-            setMacroPlayUI = function(enabled, silent) macroPlaySetter(enabled == true, silent == true) end,
+            setMacroRecordUI = function(enabled, silent)
+                macroRecordSetter(enabled == true, silent == true)
+            end,
+            setMacroPlayUI = function(enabled, silent)
+                macroPlaySetter(enabled == true, silent == true)
+            end,
             getActiveMacro = function()
                 local key, data = MacroStore:GetActiveFile()
                 if not data then return nil end
@@ -8124,15 +8330,310 @@ do
                 macroProgressStatus.TextColor3 = ok and C.GREEN or C.YELLOW
             end,
             setMapOperationStatus = function(message, ok)
-                if EvadeUI then EvadeUI.setFileStatus("STATUS: " .. tostring(message or ""), ok == false and C.RED or C.ACCENT) end
+                if EvadeUI and EvadeUI.setFileStatus then
+                    EvadeUI.setFileStatus("STATUS: " .. tostring(message or ""), ok == false and C.RED or C.ACCENT)
+                end
             end,
-            setSpawnLabel = function() end,
-            setDestinationLabel = function() end,
-            setRouteStatus = function() end,
+            setSelectedKey = function(key)
+                if EvadeUI and EvadeUI.setSelected then EvadeUI.setSelected(key) end
+            end,
         }
 
+        -- ============================================================
+        -- TAB INFORMATION + SETTING / DEVICE PROFILE
+        -- ============================================================
+        local infoTab = tabFrames[6]
+        local compactInfoLayout = isMobileLayout or (window.AbsoluteSize.X - currentSidebarWidth) < 560
+        local infoScroll = newInstance("ScrollingFrame", {
+            Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+            ScrollBarThickness = 4, ScrollBarImageColor3 = C.ACCENT,
+            Active = compactInfoLayout, ScrollingEnabled = compactInfoLayout,
+            CanvasSize = compactInfoLayout and UDim2.new(0, 0, 0, 545) or UDim2.new(0, 0, 1, 0),
+        }, infoTab)
+        local infoPanel = newInstance("Frame", {
+            Position = compactInfoLayout and UDim2.new(0, 10, 0, 10) or UDim2.new(0, 10, 0, 12),
+            Size = compactInfoLayout and UDim2.new(1, -20, 0, 150) or UDim2.new(0.43, -16, 1, -24),
+            BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
+        }, infoScroll)
+        addCorner(infoPanel, 11)
+        addStroke(infoPanel, Color3.fromRGB(145, 24, 48), 1)
+        makeLabel(infoPanel, "SYSTEM INFORMATION", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
+            Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
+        })
+        local infoText = makeLabel(infoPanel, "Reading device information...", UDim2.new(0, 14, 0, 48),
+            UDim2.new(1, -28, 0, compactInfoLayout and 70 or 190), {
+            TextSize = 10, Color = C.TEXT, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
+        })
+        local infoDisclaimer = makeLabel(infoPanel, "Executor information is user-selected and is not a security verification.",
+            UDim2.new(0, 14, 0, compactInfoLayout and 120 or 250), UDim2.new(1, -28, 0, compactInfoLayout and 24 or 42), {
+                TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top,
+            })
+
+        local settingTab = infoTab
+        local settingPanel = newInstance("Frame", {
+            Position = compactInfoLayout and UDim2.new(0, 10, 0, 170) or UDim2.new(0.44, 2, 0, 12),
+            Size = compactInfoLayout and UDim2.new(1, -20, 0, 360) or UDim2.new(0.56, -14, 1, -24),
+            BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
+        }, infoScroll)
+        addCorner(settingPanel, 11)
+        addStroke(settingPanel, Color3.fromRGB(145, 24, 48), 1)
+        makeLabel(settingPanel, "DEVICE & EXECUTOR SETTING", UDim2.new(0, 14, 0, 12), UDim2.new(1, -28, 0, 22), {
+            Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT,
+        })
+        makeLabel(settingPanel, "Choose your executor. This profile is saved locally on this device/executor.",
+            UDim2.new(0, 14, 0, 40), UDim2.new(1, -28, 0, 36), {
+                TextSize = 9, Color = C.DIM, Wrapped = true,
+            })
+        local profileFile = "duy_device_profile.json"
+        local deviceProfile = { Executor = "Not selected", Device = "Unknown" }
+        local function loadDeviceProfile()
+            if type(readfile) ~= "function" then return end
+            local ok, raw = pcall(readfile, profileFile)
+            if not ok or type(raw) ~= "string" or raw == "" then return end
+            local decodedOK, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
+            if decodedOK and type(decoded) == "table" then deviceProfile = decoded end
+        end
+        local function saveDeviceProfile()
+            if type(writefile) ~= "function" then
+                notify("Executor không hỗ trợ lưu hồ sơ cục bộ.", C.YELLOW)
+                return false
+            end
+            local ok = pcall(function() writefile(profileFile, HttpService:JSONEncode(deviceProfile)) end)
+            if not ok then notify("Không lưu được hồ sơ thiết bị.", C.YELLOW) end
+            return ok
+        end
+        loadDeviceProfile()
+        uiLanguage = "EN"
+        notificationsEnabled = deviceProfile.Notifications ~= false
+        applyUILanguage("EN", screen)
+        local deltaTextBoosted = setmetatable({}, { __mode = "k" })
+        local deltaTextConnections = setmetatable({}, { __mode = "k" })
+        local deltaTextConnection
+        local function fitDeltaText(instance)
+            if not instance or not instance.Parent then return end
+            if not (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")) then return end
+            if instance:IsA("TextButton") then
+                instance.Font = Enum.Font.GothamBold
+            elseif instance:IsA("TextBox") and instance.Font ~= Enum.Font.Code then
+                instance.Font = Enum.Font.GothamMedium
+            elseif instance:IsA("TextLabel") then
+                instance.Font = Enum.Font.GothamSemibold
+            end
+            local width = math.max(48, instance.AbsoluteSize.X - 12)
+            local height = math.max(14, instance.AbsoluteSize.Y - 3)
+            local desired = instance:IsA("TextBox") and (instance.Font == Enum.Font.Code and 12 or 13)
+                or (instance:IsA("TextButton") and 13 or 13)
+            local minimum = instance.AbsoluteSize.Y >= 24 and 11 or 10
+            local candidate = desired
+            local measuredText = tostring(instance.Text or "")
+            if measuredText == "" and instance:IsA("TextBox") then
+                measuredText = tostring(instance.PlaceholderText or "")
+            end
+            local wrapped = instance:IsA("TextLabel") and instance.TextWrapped == true
+            while candidate > minimum do
+                local ok, bounds = pcall(function()
+                    return TextService:GetTextSize(measuredText, candidate, instance.Font,
+                        Vector2.new(width, height))
+                end)
+                if ok and bounds and bounds.Y <= height + 1 and (wrapped or bounds.X <= width + 1) then break end
+                candidate -= 1
+            end
+            instance.TextSize = math.max(minimum, candidate)
+            instance.TextTransparency = 0
+            instance.TextStrokeColor3 = Color3.fromRGB(5, 8, 14)
+            instance.TextStrokeTransparency = 1 -- avoid dark halo that makes Delta text look blurred
+            instance.TextScaled = false
+            pcall(function() instance.TextTruncate = Enum.TextTruncate.None end)
+        end
+        local function registerDeltaText(instance)
+            if not instance or not instance.Parent then return end
+            if not (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")) then return end
+            fitDeltaText(instance)
+            if deltaTextBoosted[instance] then return end
+            deltaTextBoosted[instance] = true
+            local connections = {}
+            table.insert(connections, instance:GetPropertyChangedSignal("Text"):Connect(function()
+                task.defer(function() fitDeltaText(instance) end)
+            end))
+            table.insert(connections, instance:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+                task.defer(function() fitDeltaText(instance) end)
+            end))
+            deltaTextConnections[instance] = connections
+        end
+        local function applyDeltaTextReadability()
+            for _, descendant in ipairs(screen:GetDescendants()) do
+                registerDeltaText(descendant)
+            end
+            if not deltaTextConnection then
+                deltaTextConnection = screen.DescendantAdded:Connect(function(descendant)
+                    task.defer(function() registerDeltaText(descendant) end)
+                end)
+                table.insert(self._connections, deltaTextConnection)
+            end
+        end
+        local function getDeviceInfo()
+            local camera = workspace.CurrentCamera
+            local viewport = camera and camera.ViewportSize or Vector2.new(0, 0)
+            local touch = UserInputService.TouchEnabled
+            local keyboard = UserInputService.KeyboardEnabled
+            local device = (touch and not keyboard) and "Mobile" or ((keyboard and not touch) and "PC" or "Hybrid/Unknown")
+            return device, viewport
+        end
+        local executorLabel = makeLabel(settingPanel, "Executor: " .. tostring(deviceProfile.Executor or "Not selected"),
+            UDim2.new(0, 14, 0, 126), UDim2.new(1, -28, 0, 20), { TextSize = 10, Color = C.TEXT })
+        local deltaButton = makeButton(settingPanel, "DELTA", UDim2.new(0, 14, 0, 151), UDim2.new(0.46, -6, 0, 34), { Background = C.BUTTON })
+        local xenoButton = makeButton(settingPanel, "XENO", UDim2.new(0.54, 0, 0, 151), UDim2.new(0.46, -14, 0, 34), { Background = C.BUTTON })
+        local function refreshSystemInfo()
+            local device, viewport = getDeviceInfo()
+            local executor = deviceProfile.Executor
+            if not executor or executor == "Chưa chọn" or executor == "Not selected" then
+                executor = uiLanguage == "VI" and "Chưa chọn" or "Not selected"
+            end
+            local storage = type(writefile) == "function" and (uiLanguage == "VI" and "Có" or "Available")
+                or (uiLanguage == "VI" and "Chỉ trong phiên" or "Session only")
+            if uiLanguage == "VI" then
+                infoText.Text = string.format("Executor: %s\nThiết bị: %s\nMàn hình: %d x %d\nLưu hồ sơ: %s",
+                    tostring(executor), device, viewport.X, viewport.Y, storage)
+            else
+                infoText.Text = string.format("Executor: %s\nDevice: %s\nScreen: %d x %d\nProfile storage: %s",
+                    tostring(executor), device, viewport.X, viewport.Y, storage)
+            end
+            executorLabel.Text = "Executor: " .. tostring(executor)
+        end
+        local function chooseExecutor(name)
+            deviceProfile.Executor = name
+            local device = getDeviceInfo()
+            deviceProfile.Device = device
+            deviceProfile.ProfileVersion = 1
+            saveDeviceProfile()
+            notify(uiLanguage == "VI" and ("Đã lưu cấu hình " .. name .. " / " .. device .. ".")
+                or ("Saved " .. name .. " profile for " .. device .. "."), C.GREEN)
+            if tostring(name):lower() == "delta" then applyDeltaTextReadability() end
+            refreshSystemInfo()
+        end
+        deltaButton.Activated:Connect(function() chooseExecutor("Delta") end)
+        xenoButton.Activated:Connect(function() chooseExecutor("Xeno") end)
+        local resetProfileButton = makeButton(settingPanel, "RESET DEVICE PROFILE", UDim2.new(0, 14, 0, 192), UDim2.new(1, -28, 0, 30), {
+            Background = C.RED_DARK, TextSize = 9,
+        })
+        resetProfileButton.Activated:Connect(function()
+            deviceProfile = { Executor = "Not selected", Device = "Unknown" }
+            if type(delfile) == "function" then pcall(delfile, profileFile) end
+            refreshSystemInfo()
+            notify(uiLanguage == "VI" and "Đã đặt lại hồ sơ. Hãy chọn Delta hoặc Xeno."
+                or "Device profile reset. Select Delta or Xeno.", C.YELLOW)
+        end)
+        local refreshInfoButton = makeButton(settingPanel, "REFRESH DEVICE INFO", UDim2.new(0, 14, 0, 230), UDim2.new(1, -28, 0, 28), {
+            Background = C.BUTTON, TextSize = 9,
+        })
+        refreshInfoButton.Activated:Connect(function()
+            refreshSystemInfo()
+            notify(uiLanguage == "VI" and "Đã cập nhật thông tin thiết bị." or "Device information refreshed.", C.ACCENT)
+        end)
+        -- Language selector intentionally removed: this build uses English UI only.
+        local notificationsCard = newInstance("Frame", {
+            Position = UDim2.new(0, 10, 0, 80), Size = UDim2.new(1, -20, 0, 38),
+            BackgroundColor3 = C.INPUT, BorderSizePixel = 0,
+        }, settingPanel)
+        addCorner(notificationsCard, 9)
+        addStroke(notificationsCard, Color3.fromRGB(145, 24, 48), 1)
+        local notificationsSetter = makeToggle(notificationsCard, "TOAST NOTIFICATIONS", UDim2.new(0, 10, 0, 4), function(enabled)
+            notificationsEnabled = enabled == true
+            deviceProfile.Notifications = notificationsEnabled
+            saveDeviceProfile()
+            if not notificationsEnabled then clearToasts() end
+            return true, "Toast notifications " .. (notificationsEnabled and "enabled." or "disabled.")
+        end)
+        notificationsSetter(notificationsEnabled, true)
+        refreshSystemInfo()
+
+        local function refreshAdaptivePanelLayout()
+            if not window or not window.Parent then return end
+            local innerWidth = window.AbsoluteSize.X - currentSidebarWidth
+            local narrow = isMobileLayout or innerWidth < 560
+            if narrow then
+                leftPanel.Position = UDim2.new(0, 9, 0, 9)
+                leftPanel.Size = UDim2.new(1, -18, 0, 520)
+                rightPanel.Position = UDim2.new(0, 9, 0, 540)
+                rightPanel.Size = UDim2.new(1, -18, 0, 410)
+                main.CanvasSize = UDim2.new(0, 0, 0, 965)
+                main.ScrollingEnabled, main.Active = true, true
+            else
+                leftPanel.Position = UDim2.new(0, 9, 0, 9)
+                leftPanel.Size = UDim2.new(0.51, -12, 0, 520)
+                rightPanel.Position = UDim2.new(0.51, 3, 0, 9)
+                rightPanel.Size = UDim2.new(0.49, -12, 0, 520)
+                main.CanvasSize = UDim2.new(0, 0, 0, 540)
+                main.ScrollingEnabled, main.Active = true, true
+            end
+
+            compactInfoLayout = narrow
+            if narrow then
+                infoScroll.CanvasSize = UDim2.new(0, 0, 0, 545)
+                infoScroll.ScrollingEnabled, infoScroll.Active = true, true
+                infoPanel.Position = UDim2.new(0, 10, 0, 10)
+                infoPanel.Size = UDim2.new(1, -20, 0, 150)
+                infoText.Size = UDim2.new(1, -28, 0, 70)
+                infoDisclaimer.Position = UDim2.new(0, 14, 0, 120)
+                infoDisclaimer.Size = UDim2.new(1, -28, 0, 24)
+                settingPanel.Position = UDim2.new(0, 10, 0, 170)
+                settingPanel.Size = UDim2.new(1, -20, 0, 360)
+            else
+                infoScroll.CanvasSize = UDim2.new(0, 0, 1, 0)
+                infoScroll.ScrollingEnabled, infoScroll.Active = false, false
+                infoPanel.Position = UDim2.new(0, 10, 0, 12)
+                infoPanel.Size = UDim2.new(0.43, -16, 1, -24)
+                infoText.Size = UDim2.new(1, -28, 0, 190)
+                infoDisclaimer.Position = UDim2.new(0, 14, 0, 250)
+                infoDisclaimer.Size = UDim2.new(1, -28, 0, 42)
+                settingPanel.Position = UDim2.new(0.44, 2, 0, 12)
+                settingPanel.Size = UDim2.new(0.56, -14, 1, -24)
+            end
+        end
+        local adaptiveLayoutConnection = window:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            task.defer(refreshAdaptivePanelLayout)
+        end)
+        table.insert(self._connections, adaptiveLayoutConnection)
+        task.defer(refreshAdaptivePanelLayout)
+
+        -- Lan dau chay tren moi bo luu tru cuc bo: hoi chon executor truoc khi thao tac.
+        if not deviceProfile.Executor or deviceProfile.Executor == "Chưa chọn" or deviceProfile.Executor == "Not selected" then
+            local setupOverlay = newInstance("Frame", {
+                Name = "FirstRunSetup", Size = UDim2.fromScale(1, 1),
+                BackgroundColor3 = Color3.fromRGB(3, 5, 10), BackgroundTransparency = 0.12,
+                BorderSizePixel = 0, ZIndex = 150,
+            }, screen)
+            local setupCard = newInstance("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.new(0.82, 0, 0, 190), BackgroundColor3 = C.PANEL,
+                BorderSizePixel = 0, ZIndex = 151,
+            }, setupOverlay)
+            addCorner(setupCard, 10)
+            addStroke(setupCard, C.ACCENT, 1)
+            makeLabel(setupCard, "SELECT EXECUTOR", UDim2.new(0, 14, 0, 14), UDim2.new(1, -28, 0, 24), {
+                Font = Enum.Font.GothamBold, TextSize = 12, Color = C.ACCENT,
+            }).ZIndex = 152
+            makeLabel(setupCard, "Which executor are you using? Your choice is saved locally on this device.",
+                UDim2.new(0, 14, 0, 44), UDim2.new(1, -28, 0, 42), {
+                    TextSize = 9, Color = C.TEXT, Wrapped = true,
+                }).ZIndex = 152
+            local setupDelta = makeButton(setupCard, "DELTA · MOBILE", UDim2.new(0, 14, 0, 104), UDim2.new(0.47, -5, 0, 38), {
+                Background = C.BUTTON, ZIndex = 153,
+            })
+            local setupXeno = makeButton(setupCard, "XENO · PC", UDim2.new(0.53, 0, 0, 104), UDim2.new(0.47, -14, 0, 38), {
+                Background = C.BUTTON, ZIndex = 153,
+            })
+            local function finishSetup(name)
+                chooseExecutor(name)
+                if setupOverlay and setupOverlay.Parent then setupOverlay:Destroy() end
+            end
+            setupDelta.Activated:Connect(function() finishSetup("Delta") end)
+            setupXeno.Activated:Connect(function() finishSetup("Xeno") end)
+        end
+
         updateEvadeCreateButton()
-        refreshDropdown()
+        refreshEvadeDropdown()
+        refreshEditorPointButtons()
         refreshMacroDropdown()
         if tostring(deviceProfile.Executor or ""):lower() == "delta" then
             task.defer(applyDeltaTextReadability)
@@ -8173,7 +8674,7 @@ local function notifyMatchStartedOnce(context)
     if not context or matchStartToastNotified[context] then return end
     matchStartToastNotified[context] = true
     if api and api.notify then
-        api.notify("Match started", Color3.fromRGB(70, 160, 255), "ChenFuWei")
+        api.notify("Match started", Color3.fromRGB(255, 45, 72), "ChenFuWei")
     end
 end
 local enemyElapsed = 0
@@ -8220,7 +8721,7 @@ local function sendMatchReport(report)
             title = isWin and "💚 GARDEN TOWER DEFENSE · VICTORY"
                 or (isLoss and "💔 GARDEN TOWER DEFENSE · DEFEAT" or "⚠️ GARDEN TOWER DEFENSE · MATCH REPORT"),
             description = "🎮 Trận " .. tostring(report.MatchNumber or "?")
-                .. " trong phiên theo dõi · " .. resultLabel,
+                .. " trong phiên Play Macro · " .. resultLabel,
             color = reportColor,
             fields = {
                 { name = "👤 Name", value = tostring(report.Name or "N/A"), inline = true },
@@ -8230,9 +8731,7 @@ local function sendMatchReport(report)
                 { name = "🌱 Seeds :", value = "Trước: " .. formatNumber(report.SeedsBefore)
                     .. "\nSau: " .. formatNumber(report.SeedsAfter)
                     .. "\nThay đổi: " .. seedChange, inline = false },
-                { name = "👥 Người chơi sống sót", value = tostring(report.SurvivorSummary or "N/A")
-                    .. "\n" .. tostring(report.ParticipantDetails or ""), inline = false },
-                { name = "📊 Thống kê phiên theo dõi", value = "Số trận: " .. tostring(report.MatchNumber or 0)
+                { name = "📊 Thống kê từ lúc Play Macro", value = "Số trận: " .. tostring(report.MatchNumber or 0)
                     .. "\nThắng: " .. tostring(report.Wins or 0)
                     .. " · Thua: " .. tostring(report.Losses or 0), inline = false },
                 { name = "🕒 Giờ Việt Nam (UTC+7)", value = vietnamTime, inline = true },
@@ -8432,16 +8931,23 @@ callbacks.onAutoEvadeChanged = function(enabled)
         if api then api.setEvadeAutoUI(false, true) end
         return true, "Đã tắt Auto Evade và dừng di chuyển tự động."
     end
+
+    local activeKey = select(1, SaveManager:GetActiveFile())
+    if not activeKey or not SaveManager:IsEvadeFile(activeKey) then
+        return false, "Hãy tạo/chọn file Evade trước. File Map CFW cũ không phải waypoint."
+    end
     Treost.WaypointRuntime.AutoEvadeEnabled = true
     local ok, message = Treost.startWaypointMode()
     if not ok then
         Treost.WaypointRuntime.AutoEvadeEnabled = false
         return false, message
     end
+
     Treost.WaypointRuntime.LastStartedMatch = MatchScanner.CurrentMatch
     local snapshot = MatchScanner:GetSnapshot()
     local currentWave = tonumber(snapshot and snapshot.Wave)
-    if Treost.WaypointRuntime.WaveThreshold > 0 and currentWave and currentWave >= Treost.WaypointRuntime.WaveThreshold then
+    if Treost.WaypointRuntime.WaveThreshold > 0
+        and currentWave and currentWave >= Treost.WaypointRuntime.WaveThreshold then
         Treost.switchToOriginalSmartEvade("already reached threshold")
     elseif api then
         api.setEvadeStatus("MODE: WAYPOINT · " .. tostring(#Treost.WaypointRuntime.Points) .. " điểm", Color3.fromRGB(100, 255, 140))
@@ -8451,8 +8957,11 @@ end
 
 callbacks.onAddEvadePoint = function()
     if destroyed then return false, "Script đã đóng." end
-    local _, data = SaveManager:GetActiveFile()
-    if not data then return false, "Hãy tạo hoặc chọn file Evade trước." end
+    if Treost.WaypointRuntime.AutoEvadeEnabled then
+        return false, "Hãy tắt Auto Evade trước khi chỉnh sửa waypoint."
+    end
+    local activeKey, data = SaveManager:GetActiveFile()
+    if not data or not SaveManager:IsEvadeFile(activeKey) then return false, "Hãy tạo hoặc chọn file Evade trước." end
     local root = getHRP()
     if not root then return false, "Không tìm thấy HumanoidRootPart." end
     local points = type(data.EvadePoints) == "table" and table.clone(data.EvadePoints) or {}
@@ -8463,10 +8972,65 @@ callbacks.onAddEvadePoint = function()
     return true, #points
 end
 
+callbacks.onSetEvadePoint = function(index)
+    if destroyed then return false, "Script đã đóng." end
+    if Treost.WaypointRuntime.AutoEvadeEnabled then
+        return false, "Hãy tắt Auto Evade trước khi chỉnh sửa waypoint."
+    end
+    local activeKey, data = SaveManager:GetActiveFile()
+    if not data or not SaveManager:IsEvadeFile(activeKey) then return false, "Hãy tạo hoặc chọn file Evade trước." end
+    local root = getHRP()
+    if not root then return false, "Không tìm thấy HumanoidRootPart." end
+
+    local points = type(data.EvadePoints) == "table" and table.clone(data.EvadePoints) or {}
+    local selectedIndex = tonumber(index)
+    if selectedIndex == nil then selectedIndex = #points + 1 end
+    if selectedIndex ~= selectedIndex or selectedIndex % 1 ~= 0 or selectedIndex < 1 then
+        return false, "Waypoint # phải là số nguyên dương."
+    end
+    if selectedIndex > #points + 1 then
+        return false, "Chỉ có thể cập nhật điểm hiện có hoặc thêm điểm kế tiếp (#" .. tostring(#points + 1) .. ")."
+    end
+    if selectedIndex > #points and #points >= 1500 then
+        return false, "Đã đạt giới hạn 1500 waypoint."
+    end
+
+    local point = { X = root.Position.X, Y = root.Position.Y, Z = root.Position.Z }
+    local operation = selectedIndex <= #points and "updated" or "added"
+    points[selectedIndex] = point
+    local ok, err = SaveManager:UpdateActiveEvadePoints(points)
+    if not ok then return false, err or "Không lưu được waypoint." end
+    if api then api.refreshEvadeDropdown() end
+    return true, selectedIndex, operation
+end
+
+callbacks.onDeleteEvadePoint = function(index)
+    if destroyed then return false, "Script đã đóng." end
+    if Treost.WaypointRuntime.AutoEvadeEnabled then
+        return false, "Hãy tắt Auto Evade trước khi chỉnh sửa waypoint."
+    end
+    local activeKey, data = SaveManager:GetActiveFile()
+    if not data or not SaveManager:IsEvadeFile(activeKey) then return false, "Chưa chọn file Evade." end
+    local points = type(data.EvadePoints) == "table" and table.clone(data.EvadePoints) or {}
+    local selectedIndex = tonumber(index)
+    if not selectedIndex or selectedIndex ~= selectedIndex or selectedIndex % 1 ~= 0
+        or selectedIndex < 1 or selectedIndex > #points then
+        return false, "Waypoint # không tồn tại trong file hiện tại."
+    end
+    table.remove(points, selectedIndex)
+    local ok, err = SaveManager:UpdateActiveEvadePoints(points)
+    if not ok then return false, err or "Không xóa được waypoint." end
+    if api then api.refreshEvadeDropdown() end
+    return true, selectedIndex
+end
+
 callbacks.onDeleteLastEvadePoint = function()
     if destroyed then return false, "Script đã đóng." end
-    local _, data = SaveManager:GetActiveFile()
-    if not data then return false, "Chưa chọn file Evade." end
+    if Treost.WaypointRuntime.AutoEvadeEnabled then
+        return false, "Hãy tắt Auto Evade trước khi chỉnh sửa waypoint."
+    end
+    local activeKey, data = SaveManager:GetActiveFile()
+    if not data or not SaveManager:IsEvadeFile(activeKey) then return false, "Chưa chọn file Evade." end
     local points = type(data.EvadePoints) == "table" and table.clone(data.EvadePoints) or {}
     if #points == 0 then return false, "Chưa có waypoint để xóa." end
     local deletedIndex = #points
@@ -8478,6 +9042,14 @@ callbacks.onDeleteLastEvadePoint = function()
 end
 
 callbacks.onSelectEvadeFile = function(key)
+    if not SaveManager:IsEvadeFile(key) then
+        return false, "Đây là file Map CFW cũ, không phải file Evade. Dữ liệu cũ vẫn được giữ nguyên."
+    end
+    if Treost.WaypointRuntime.AutoEvadeEnabled then
+        Treost.stopAllEvadeModes()
+        Treost.WaypointRuntime.AutoEvadeEnabled = false
+        if api then api.setEvadeAutoUI(false, true) end
+    end
     local ok, err = SaveManager:SelectFile(key)
     if not ok then return false, err end
     local _, data = SaveManager:GetActiveFile()
@@ -8489,8 +9061,6 @@ callbacks.onSelectEvadeFile = function(key)
     end
     return true, "Đã nạp file Evade: " .. tostring(data.MapName)
 end
-
-
 
 local function findRemoteEvent(remoteName)
     -- Uu tien dung folder remote chinh thuc; ho tro ca RemoteEvents va RemoteFunctions.
@@ -8544,7 +9114,7 @@ end
 -- ============================================================
 -- ============================================================
 -- GTD MACRO ENGINE + AUTO ABILITY + AUTO DIFFICULTY
--- Macro JSON lưu Action theo Sequence/FIFO; metadata thời gian nội bộ không được xuất.
+-- Macro JSON lưu PlaceUnit / UpgradeUnit / SellUnit theo Time và thứ tự sự kiện.
 -- Ability hoạt động độc lập; giao diện Macro không có bảng cài lịch phát riêng.
 -- ============================================================
 local MacroEngine = {
@@ -8555,7 +9125,6 @@ local MacroEngine = {
     _recordContext = nil,
     _recordEndConnection = nil,
     _recordBaseHPConnection = nil,
-    _recordLegacyTerminalConnection = nil,
     _recordState = "OFF",
     _recordOriginContext = nil,
     _recordOriginStartStamp = nil,
@@ -8626,6 +9195,7 @@ local MacroEngine = {
     _lastReplayStartStamp = nil,
     _replayRunGeneration = 0,
     _replayScheduleOffset = 0,
+    _replayLeadSeconds = 0, -- số giây thực chạy sớm; chuyển đổi theo TickSpeed khi Replay
     _replayFailedActions = {},
     _preflightSkipActions = {}, -- Action khong an toan/bi lap duoc bo qua rieng, khong chan ca Macro
     _failedPlaceRecordIds = {}, -- PlaceUnit bị Server từ chối; bỏ qua các Action phụ thuộc ID đó, không treo FIFO
@@ -8996,9 +9566,6 @@ end
 
 function MacroEngine:_queueAction(action, eventTime, reservedSeq)
     if type(action) ~= "table" then return nil end
-    -- EventSeq is the authoritative FIFO order captured at the original input event.
-    -- Time remains internal recorder metadata only for correlating delayed observer updates;
-    -- it is stripped from JSON and is never read by the Replay scheduler.
     local elapsed = tonumber(eventTime) or tonumber(action.Time) or getMacroElapsed()
     local seq = tonumber(reservedSeq) or self:_reserveEventSeq()
     if seq > (tonumber(self._eventSeq) or 0) then self._eventSeq = seq end
@@ -9018,14 +9585,13 @@ function MacroEngine:_queueAction(action, eventTime, reservedSeq)
     table.insert(self.Actions, insertAt, action)
     if self.Recording and self._recordKey and api and api.setMacroRecordPreview then
         local cleanActions = {}
-        for sequence, source in ipairs(self.Actions) do
+        for _, source in ipairs(self.Actions) do
             local clean = {}
             for field, value in pairs(source) do
-                if type(field) ~= "string" or (field:sub(1, 1) ~= "_" and field ~= "Time" and field ~= "EventSeq") then
+                if type(field) ~= "string" or field:sub(1, 1) ~= "_" then
                     clean[field] = value
                 end
             end
-            clean.Sequence = sequence
             cleanActions[#cleanActions + 1] = clean
         end
         local previewOK, previewJSON = pcall(function()
@@ -9036,7 +9602,7 @@ function MacroEngine:_queueAction(action, eventTime, reservedSeq)
         end
     end
     if self.Recording and api and api.setMacroStatus then
-        api.setMacroStatus(string.format("RECORDING · %d Action · FIFO sequence captured", #self.Actions), true)
+        api.setMacroStatus(string.format("RECORDING · %d Action · Game Time %.2fs", #self.Actions, getMacroElapsed(self._recordContext)), true)
     end
     return action
 end
@@ -9503,161 +10069,8 @@ local MatchStatsTracker = {
     Wins = 0,
     Losses = 0,
     Current = nil,
-    LastResult = "UNKNOWN",
-    LastResultContext = nil,
-    LastSurvivorSummary = "N/A",
     _reported = setmetatable({}, { __mode = "k" }),
 }
-
-local function disconnectPlayerMatchWatchers(current)
-    if not current then return end
-    for _, connection in ipairs({ current.PlayerAddedConnection, current.PlayerRemovingConnection }) do
-        if connection then pcall(function() connection:Disconnect() end) end
-    end
-    for _, participant in ipairs(current.Participants or {}) do
-        for _, connection in ipairs(participant.Connections or {}) do
-            pcall(function() connection:Disconnect() end)
-        end
-        for _, connection in ipairs(participant.HumanoidConnections or {}) do
-            pcall(function() connection:Disconnect() end)
-        end
-        table.clear(participant.Connections or {})
-        table.clear(participant.HumanoidConnections or {})
-    end
-end
-
-local function isAliveHumanoid(humanoid)
-    if not humanoid or not humanoid.Parent then return nil end
-    local stateOK, state = pcall(function() return humanoid:GetState() end)
-    return humanoid.Health > 0 and (not stateOK or state ~= Enum.HumanoidStateType.Dead)
-end
-
-function MatchStatsTracker:_captureParticipants(current)
-    current.Participants = {}
-    current.ParticipantByPlayer = {}
-
-    local function capturePlayer(player)
-        if not player or current.ParticipantByPlayer[player] then return end
-        local participant = {
-            Player = player,
-            Alive = nil,
-            Known = false,
-            Character = nil,
-            Humanoid = nil,
-            Connections = {},
-            HumanoidConnections = {},
-        }
-        current.ParticipantByPlayer[player] = participant
-        table.insert(current.Participants, participant)
-
-        local function clearHumanoidConnections()
-            for _, connection in ipairs(participant.HumanoidConnections) do
-                pcall(function() connection:Disconnect() end)
-            end
-            table.clear(participant.HumanoidConnections)
-        end
-
-        local function bindCharacter(character)
-            if self.Current ~= current or not character then return end
-            local humanoid = character:FindFirstChildOfClass("Humanoid")
-                or character:WaitForChild("Humanoid", 5)
-            if self.Current ~= current or not humanoid or not humanoid:IsA("Humanoid") then return end
-
-            clearHumanoidConnections()
-            participant.Character = character
-            participant.Humanoid = humanoid
-            local alive = isAliveHumanoid(humanoid)
-            if alive ~= nil then
-                participant.Alive = alive
-                participant.Known = true
-            end
-
-            table.insert(participant.HumanoidConnections, humanoid.Died:Connect(function()
-                if self.Current == current and participant.Humanoid == humanoid then
-                    participant.Alive = false
-                    participant.Known = true
-                end
-            end))
-            table.insert(participant.HumanoidConnections, humanoid.HealthChanged:Connect(function(health)
-                if self.Current == current and participant.Humanoid == humanoid and health <= 0 then
-                    participant.Alive = false
-                    participant.Known = true
-                end
-            end))
-        end
-
-        if player.Character then task.spawn(bindCharacter, player.Character) end
-        table.insert(participant.Connections, player.CharacterAdded:Connect(function(character)
-            task.spawn(bindCharacter, character)
-        end))
-        table.insert(participant.Connections, player.CharacterRemoving:Connect(function(character)
-            if participant.Character ~= character then return end
-            local humanoid = participant.Humanoid
-            local health = humanoid and tonumber(humanoid.Health) or nil
-            if health ~= nil and health <= 0 then
-                participant.Alive = false
-                participant.Known = true
-            elseif health ~= nil and health > 0 then
-                -- A living avatar may be removed during victory/lobby cleanup; preserve its
-                -- last confirmed living state instead of misclassifying cleanup as death.
-                participant.Alive = true
-                participant.Known = true
-            end
-        end))
-    end
-
-    for _, player in ipairs(Players:GetPlayers()) do capturePlayer(player) end
-    current.PlayerAddedConnection = Players.PlayerAdded:Connect(function(player)
-        if self.Current == current then capturePlayer(player) end
-    end)
-    current.PlayerRemovingConnection = Players.PlayerRemoving:Connect(function(player)
-        if self.Current ~= current then return end
-        local participant = current.ParticipantByPlayer[player]
-        if participant then
-            participant.Alive = false
-            participant.Known = true
-        end
-    end)
-end
-
-function MatchStatsTracker:_evaluateSurvivors(current)
-    local survivors, knownCount, total = 0, 0, #(current and current.Participants or {})
-    local details = {}
-    for _, participant in ipairs(current and current.Participants or {}) do
-        local player = participant.Player
-        if player and player.Parent == Players then
-            local character = player.Character
-            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-            if humanoid then
-                local alive = isAliveHumanoid(humanoid)
-                if alive ~= nil then
-                    participant.Character = character
-                    participant.Humanoid = humanoid
-                    participant.Alive = alive
-                    participant.Known = true
-                end
-            end
-            -- A missing Character alone is not evidence of death. Died/HealthChanged
-            -- and CharacterRemoving (when Health <= 0) record a confirmed death.
-        end
-
-        if participant.Known then
-            knownCount += 1
-            if participant.Alive == true then survivors += 1 end
-        end
-        details[#details + 1] = tostring(player and player.Name or "Player") .. ": "
-            .. (participant.Known and (participant.Alive and "ALIVE" or "DEAD") or "UNKNOWN")
-    end
-
-    local result = "UNKNOWN"
-    if total > 0 and survivors > 0 then
-        result = "WIN (VICTORY)"
-    elseif total > 0 and knownCount == total then
-        result = "LOSS (DEFEAT)"
-    end
-    local summary = tostring(survivors) .. "/" .. tostring(total) .. " alive"
-    return result, survivors, total, summary, table.concat(details, "\n")
-end
 
 function MatchStatsTracker:StartSession()
     self.Enabled = true
@@ -9665,22 +10078,16 @@ function MatchStatsTracker:StartSession()
     self.Wins = 0
     self.Losses = 0
     self.Current = nil
-    self.LastResult = "UNKNOWN"
-    self.LastResultContext = nil
-    self.LastSurvivorSummary = "N/A"
     self._reported = setmetatable({}, { __mode = "k" })
     if MatchScanner then
         MatchScanner:Reset()
+        -- UI Victory/Defeat cung la nguon ket thuc hop le, ke ca khi GameEndTime
+        -- hoac BaseHP_1 khong duoc replicate day du. Finish co co che chong gui lap.
         MatchScanner._onReport = function(scannerReport)
             local current = MatchStatsTracker.Current
             if current and current.Context then
-                local ctx = current.Context
-                local reason = "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal")
-                -- MatchScanner is a result/statistics source only. Macro Record/Replay
-                -- lifecycle is driven by the Context's GameEndTime/BaseHP/ChildRemoved
-                -- signals, matching the CFW lifecycle and avoiding premature transitions
-                -- when a Victory/Defeat UI appears before Context state is finalized.
-                MatchStatsTracker:Finish(ctx, reason)
+                MatchStatsTracker:Finish(current.Context,
+                    "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal"))
             end
         end
         if not MatchScanner._active then
@@ -9689,20 +10096,10 @@ function MatchStatsTracker:StartSession()
             end, MatchScanner._onReport)
         end
     end
-
-    local contexts = workspace:FindFirstChild("Contexts")
-    if contexts then
-        for _, ctx in ipairs(contexts:GetChildren()) do
-            if isMacroMatchActive(ctx) then
-                self:Begin(ctx)
-                break
-            end
-        end
-    end
 end
 
 function MatchStatsTracker:StopArming()
-    -- A match already being tracked continues to its terminal signal; only future matches stop.
+    -- Match dang chay van duoc theo doi den luc ket thuc; chi ngung tinh cac tran moi.
     self.Enabled = false
 end
 
@@ -9720,9 +10117,7 @@ function MatchStatsTracker:Begin(ctx)
         StartedAt = os.clock(),
         StartStamp = startStamp,
         Before = readMatchAccountStats(),
-        Participants = {},
     }
-    self:_captureParticipants(self.Current)
     return true
 end
 
@@ -9731,14 +10126,23 @@ function MatchStatsTracker:Finish(ctx, reason)
     if not current or current.Context ~= ctx or self._reported[ctx] then return false end
     self._reported[ctx] = true
 
-    local result, survivors, participantCount, survivorSummary, participantDetails = self:_evaluateSurvivors(current)
+    local endStamp = tonumber(ctx and ctx:GetAttribute("GameEndTime")) or 0
+    local baseHP = tonumber(ctx and ctx:GetAttribute("BaseHP_1"))
+    local result
+    if MatchScanner and (MatchScanner.Result == "WIN (VICTORY)" or MatchScanner.Result == "LOSS (DEFEAT)") then
+        result = MatchScanner.Result
+    elseif baseHP ~= nil then
+        result = baseHP > 0 and "WIN (VICTORY)" or "LOSS (DEFEAT)"
+    else
+        result = "UNKNOWN"
+    end
+
     if result == "WIN (VICTORY)" then
         self.Wins += 1
     elseif result == "LOSS (DEFEAT)" then
         self.Losses += 1
     end
 
-    local endStamp = tonumber(ctx and ctx:GetAttribute("GameEndTime")) or 0
     local after = readMatchAccountStats()
     local duration
     if endStamp > current.StartStamp and current.StartStamp > 0 then
@@ -9751,7 +10155,7 @@ function MatchStatsTracker:Finish(ctx, reason)
         MatchNumber = current.MatchNumber,
         Result = result,
         Name = LP.Name,
-        WaveInfo = wave and (tostring(wave) .. "/" .. tostring(MatchScanner.MaxWave or 40)) or "N/A",
+        WaveInfo = wave and (tostring(wave) .. "/40") or "N/A",
         DurationSeconds = duration,
         CashBefore = current.Before.Cash,
         CashAfter = after.Cash,
@@ -9762,18 +10166,10 @@ function MatchStatsTracker:Finish(ctx, reason)
         Wins = self.Wins,
         Losses = self.Losses,
         AccountSeeds = after.Seeds,
-        SurvivorCount = survivors,
-        ParticipantCount = participantCount,
-        SurvivorSummary = survivorSummary,
-        ParticipantDetails = participantDetails,
         EndReason = tostring(reason or "GameEndTime"),
         ReportId = HttpService:GenerateGUID(false),
     }
-    self.LastResult = result
-    self.LastResultContext = ctx
-    self.LastSurvivorSummary = survivorSummary
     self.Current = nil
-    disconnectPlayerMatchWatchers(current)
     sendMatchReport(report)
     return true
 end
@@ -9783,8 +10179,9 @@ function MatchStatsTracker:Tick()
     local ctx = current and current.Context
     if not ctx then return end
     local endStamp = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-    if endStamp > 0 or not ctx.Parent then
-        self:Finish(ctx, endStamp > 0 and "GameEndTime" or "Context removed")
+    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+    if endStamp > 0 or (baseHP ~= nil and baseHP <= 0) or not ctx.Parent then
+        self:Finish(ctx, endStamp > 0 and "GameEndTime" or (not ctx.Parent and "Context removed" or "BaseHP_1"))
     end
 end
 
@@ -11048,15 +11445,10 @@ function MacroEngine:_bindMacroLifecycleContext(ctx)
             if self._recordState == "WAITING_FOR_NEXT_MATCH" then
                 self:_tryStartWaitingRecord(ctx)
             end
-            if MatchStatsTracker and MatchStatsTracker.Enabled and isMacroMatchActive(ctx) then
-                MatchStatsTracker:Begin(ctx)
-            end
             local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
             local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-            if endTime > 0 or (baseHP ~= nil and baseHP <= 0) or not ctx.Parent then
-                local reason = endTime > 0 and "GameEndTime"
-                    or ((baseHP ~= nil and baseHP <= 0) and "BaseHP_1" or "Context removed")
-                self:_onMacroMatchEnded(ctx, reason)
+            if endTime > 0 or (baseHP ~= nil and baseHP <= 0) then
+                self:_onMacroMatchEnded(ctx, endTime > 0 and "GameEndTime" or "BaseHP_1")
             elseif self._autoRepeatArmed and self._waitingNextMatch then
                 self:_onNewMatchStarted(ctx)
             end
@@ -11138,15 +11530,12 @@ function MacroEngine:_tryStartWaitingRecord(ctx)
 
     local origin = self._recordOriginContext
     if origin then
-        local ctxStartStamp = getMacroStartStamp(ctx)
-        local originStartStamp = tonumber(self._recordOriginStartStamp) or getMacroStartStamp(origin)
-        local sameContextRestarted = ctx == origin and ctxStartStamp ~= originStartStamp
-        local newerContextStarted = ctx ~= origin and ctxStartStamp > originStartStamp
-        if not sameContextRestarted and not newerContextStarted then
+        local sameContextRestarted = ctx == origin
+            and getMacroStartStamp(ctx) ~= self._recordOriginStartStamp
+        if not sameContextRestarted then
             local originEnd = tonumber(origin:GetAttribute("GameEndTime")) or 0
             local originHP = tonumber(origin:GetAttribute("BaseHP_1"))
-            local originEnded = self._recordOriginEnded or originEnd > 0
-                or (originHP ~= nil and originHP <= 0) or not origin.Parent
+            local originEnded = self._recordOriginEnded or originEnd > 0 or (originHP ~= nil and originHP <= 0)
             if not originEnded then return false end
             if ctx == origin then return false end
         end
@@ -11158,7 +11547,6 @@ end
 
 function MacroEngine:_activateRecordForContext(ctx)
     if self._recordState ~= "WAITING_FOR_NEXT_MATCH" or not isMacroMatchActive(ctx) then return false end
-    self._recordWaitGeneration = (tonumber(self._recordWaitGeneration) or 0) + 1
     self._recordState = "RECORDING"
     self._recordContext = ctx
     startMacroGameClock(ctx)
@@ -11195,29 +11583,20 @@ function MacroEngine:_activateRecordForContext(ctx)
     self:_startObserver(ctx)
 
     if self._recordEndConnection then pcall(function() self._recordEndConnection:Disconnect() end) end
-    if self._recordBaseHPConnection then
-        pcall(function() self._recordBaseHPConnection:Disconnect() end)
-        self._recordBaseHPConnection = nil
-    end
-    if self._recordLegacyTerminalConnection then
-        pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
-        self._recordLegacyTerminalConnection = nil
-    end
+    if self._recordBaseHPConnection then pcall(function() self._recordBaseHPConnection:Disconnect() end) end
     self._recordEndConnection = ctx:GetAttributeChangedSignal("GameEndTime"):Connect(function()
         local ended = tonumber(ctx:GetAttribute("GameEndTime")) or 0
         if ended > 0 and self._recordState == "RECORDING" and self._recordContext == ctx then
-            task.spawn(function() self:_saveRecord("trận kết thúc · GameEndTime") end)
+            task.spawn(function() self:_saveRecord("trận kết thúc") end)
         end
     end)
-    -- CFW parity: một số lượt chơi kết thúc bằng BaseHP_1 = 0 trước khi GameEndTime cập nhật.
     self._recordBaseHPConnection = ctx:GetAttributeChangedSignal("BaseHP_1"):Connect(function()
         local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
         if baseHP and baseHP <= 0 and self._recordState == "RECORDING" and self._recordContext == ctx then
             task.delay(0.35, function()
                 if self._recordState == "RECORDING" and self._recordContext == ctx then
                     local ended = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-                    local currentHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-                    if ended > 0 or (currentHP ~= nil and currentHP <= 0) then
+                    if ended > 0 or (tonumber(ctx:GetAttribute("BaseHP_1")) or 1) <= 0 then
                         self:_saveRecord("Base HP về 0 / trận kết thúc")
                     end
                 end
@@ -11286,7 +11665,6 @@ function MacroEngine:_saveRecord(reason)
         self:_stopObserver()
         if self._recordEndConnection then pcall(function() self._recordEndConnection:Disconnect() end); self._recordEndConnection = nil end
         if self._recordBaseHPConnection then pcall(function() self._recordBaseHPConnection:Disconnect() end); self._recordBaseHPConnection = nil end
-        if self._recordLegacyTerminalConnection then pcall(function() self._recordLegacyTerminalConnection:Disconnect() end); self._recordLegacyTerminalConnection = nil end
         if not self._autoRepeatArmed then self:_disconnectMacroLifecycleWatchers() end
         if api then api.setMacroRecordUI(false, true) end
         return false, "Không còn Macro file đang chọn để lưu."
@@ -11323,8 +11701,15 @@ function MacroEngine:_saveRecord(reason)
         end
     end
     self:_stopObserver()
-    -- _queueAction inserts by the reserved EventSeq captured at the original input event.
-    -- Keep that exact FIFO order; do not sort or pace saved actions by timestamps.
+    -- Remote callbacks có thể trả về muộn; sắp xếp lại theo timestamp đã chụp tại lúc thao tác.
+    -- EventSeq là tie-break để hai action cùng Time vẫn có thứ tự xác định.
+    table.sort(self.Actions, function(a, b)
+        local ta, tb = tonumber(a.Time) or 0, tonumber(b.Time) or 0
+        if ta == tb then
+            return (tonumber(a._EventSeq or a.EventSeq) or 0) < (tonumber(b._EventSeq or b.EventSeq) or 0)
+        end
+        return ta < tb
+    end)
 
     -- Gán Order theo thứ tự PlaceUnit thật trong trận; Upgrade/Sell tham chiếu cùng Order.
     local orderByRecordId = {}
@@ -11355,9 +11740,9 @@ function MacroEngine:_saveRecord(reason)
             -- ActivateUnitAbility và mọi Action ngoài schema yêu cầu không được ghi vào JSON.
             discardedUnsupportedActions += 1
         else
-            -- Schema mục tiêu: Place có tọa độ/CF; Unit action có Type+Sequence+ID;
-            -- UpgradeAll/SellAll dùng Type+Sequence. Không lưu thời điểm chạy.
-            local clean = { Type = action.Type, Sequence = #cleanActions + 1 }
+            -- Schema mục tiêu: Place có tọa độ/CF; Unit action chỉ Type+Time+ID;
+            -- UpgradeAll/SellAll chỉ Type+Time. Không lưu Ability.
+            local clean = { Type = action.Type, Time = math.floor((tonumber(action.Time) or 0) * 100 + 0.5) / 100 }
             if action.Type == "PlaceUnit" then
                 clean.Unit, clean.ID, clean.Position, clean.CF = action.Unit, action.ID, action.Position, action.CF
                 clean.Order = tonumber(action.Order)
@@ -11464,10 +11849,6 @@ function MacroEngine:_saveRecord(reason)
         pcall(function() self._recordBaseHPConnection:Disconnect() end)
         self._recordBaseHPConnection = nil
     end
-    if self._recordLegacyTerminalConnection then
-        pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
-        self._recordLegacyTerminalConnection = nil
-    end
     if not self._autoRepeatArmed then self:_disconnectMacroLifecycleWatchers() end
     if api then
         api.setMacroRecordUI(false, true)
@@ -11566,70 +11947,11 @@ function MacroEngine:StartRecord()
     self._saveQueued = false
     self._savingRecord = false
 
-    self._recordWaitGeneration = (tonumber(self._recordWaitGeneration) or 0) + 1
-    local waitGeneration = self._recordWaitGeneration
-
-    local watcherOK, watcherError = pcall(function()
-        self:_ensureMacroLifecycleWatchers()
-    end)
-    if not watcherOK then
-        self._recordWaitGeneration = self._recordWaitGeneration + 1
-        self._recordState = "OFF"
-        self._recordKey = nil
-        self._recordOriginContext = nil
-        self._recordOriginStartStamp = nil
-        self._recordOriginEnded = false
-        self.Recording = false
-        if api and api.setMacroStatus then
-            pcall(api.setMacroStatus, "RECORD SETUP FAILED · " .. tostring(watcherError), false)
-        end
-        return false, "Không khởi tạo được watcher chuyển trận: " .. tostring(watcherError)
-    end
+    self:_ensureMacroLifecycleWatchers()
     if api then
-        if api.setMacroRecordUI then pcall(api.setMacroRecordUI, true, true) end
-        if api.setMacroStatus then
-            pcall(api.setMacroStatus,
-                "WAITING FOR NEXT MATCH · Record đã được kích hoạt. Đang chờ trận kế tiếp...", true)
-        end
-        if api.notify then
-            pcall(api.notify, "Record đã bật · đang chờ trận kế tiếp",
-                Color3.fromRGB(50, 200, 110), "RECORD ARMED")
-        end
+        api.setMacroRecordUI(true, true)
+        api.setMacroStatus("WAITING FOR NEXT MATCH · Đã chuẩn bị Record. Đang chờ trận tiếp theo...", true)
     end
-
-    -- CFW giữ watcher theo Context/Attribute. Bổ sung polling dự phòng để không bỏ lỡ
-    -- Context được tạo trước khi kết nối kịp hoặc attribute không phát Changed signal.
-    task.spawn(function()
-        local lastStatusAt = 0
-        while not destroyed
-            and waitGeneration == self._recordWaitGeneration
-            and self._recordState == "WAITING_FOR_NEXT_MATCH" do
-            local ok, err = pcall(function()
-                self:_ensureMacroLifecycleWatchers()
-                local contexts = workspace:FindFirstChild("Contexts")
-                if contexts then
-                    for _, ctx in ipairs(contexts:GetChildren()) do
-                        if self._recordState ~= "WAITING_FOR_NEXT_MATCH" then break end
-                        self:_tryStartWaitingRecord(ctx)
-                    end
-                else
-                    local active = getActiveMacroMatchContext()
-                    if active then self:_tryStartWaitingRecord(active) end
-                end
-            end)
-            if not ok then
-                self:_diag("RECORD", "Wait-next-match poll error: " .. tostring(err))
-                if api then pcall(api.setMacroStatus, "RECORD WAIT ERROR · " .. tostring(err), false) end
-            elseif api and os.clock() - lastStatusAt >= 3
-                and self._recordState == "WAITING_FOR_NEXT_MATCH" then
-                lastStatusAt = os.clock()
-                pcall(api.setMacroStatus,
-                    "WAITING FOR NEXT MATCH · Đã bật Record · đang theo dõi trận hiện tại và chờ trận mới.",
-                    true)
-            end
-            task.wait(0.5)
-        end
-    end)
 
     -- Không kích hoạt Record trong trận đang diễn ra tại thời điểm bấm.
     -- Nếu đang ở Lobby, context trận sắp tới sẽ tự kích hoạt khi GameStartTime > 0.
@@ -11638,7 +11960,6 @@ end
 
 function MacroEngine:StopRecord(reason)
     if self._recordState == "WAITING_FOR_NEXT_MATCH" then
-        self._recordWaitGeneration = (tonumber(self._recordWaitGeneration) or 0) + 1
         self._recordState = "OFF"
         self._recordKey = nil
         self._recordOriginContext = nil
@@ -13139,7 +13460,7 @@ function MacroEngine:_resolveReplayRuntimeId(action)
     end
 
     -- Không chờ block 2.5s tại đây. Mỗi lượt FIFO chỉ thử ánh xạ nhanh một lần;
-    -- nếu Model chưa replicate, scheduler sẽ gọi lại theo chu kỳ FIFO 2 giây.
+    -- nếu Model chưa replicate, scheduler sẽ gọi lại sau 1.5s.
     if pending and pending.Snapshot then
         local pendingAction = {
             Unit = pending.Unit or action.Unit,
@@ -13197,7 +13518,7 @@ function MacroEngine:_runAction(action, token, ctx)
         local cashWait = 0
         if not localCashLooksEnough then
             self:_diag("CASH", string.format(
-                "PlaceUnit %s đang ở lượt FIFO Sequence; bỏ qua local cash gate (đọc được %s, Cost %s).",
+                "PlaceUnit %s gửi đúng Macro Time; bỏ qua local cash gate (đọc được %s, Cost %s).",
                 tostring(action.Unit), tostring(cashAtPlaceTime), tostring(cost)))
         end
 
@@ -13275,27 +13596,27 @@ function MacroEngine:_runAction(action, token, ctx)
         if isMacroRemoteRejected(response) then
             local rejectionText = macroResponseText(response)
             self:_diag("PLACE", "Server từ chối PlaceUnit " .. tostring(action.Unit)
-                .. " tại Sequence " .. tostring(action.Sequence or "?") .. "; đang chờ retry. "
+                .. " tại Macro Time " .. tostring(action.Time) .. "; sẽ thử lại sau 1.5s. "
                 .. tostring(rejectionText))
-            return false, "Server từ chối PlaceUnit; scheduler sẽ thử lại theo FIFO: " .. tostring(rejectionText),
+            return false, "Server từ chối PlaceUnit; sẽ thử lại sau 1.5s: " .. tostring(rejectionText),
                 { Retryable = true, RemoteSent = true, ServerRejected = true }
         end
 
-        -- Chờ ngắn để nhận Model. Nếu chưa thấy, scheduler sẽ thử lại; mọi lần
+        -- Chờ ngắn để nhận Model. Nếu chưa thấy, scheduler sẽ thử lại sau 1.5s; mọi lần
         -- retry đều kiểm tra snapshot đầu tiên trước khi gửi Remote lần nữa.
         local newId, model, detectError = waitMacroEntity(action, snapshot, token, ctx, 0.12)
         if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
             return false, "Replay đã chuyển trận trong lúc xác nhận Model; bỏ kết quả của trận cũ."
         end
         if not newId then
-            local key = tonumber(action.Order) or tonumber(action.ID) or tostring(action.Sequence or "?")
+            local key = tonumber(action.Order) or tonumber(action.ID) or tostring(action.Time)
             self._pendingOrderMappings[key] = {
                 Unit = action.Unit, Position = action.Position, CF = action.CF,
                 Snapshot = snapshot, Order = tonumber(action.Order), RecordID = tonumber(action.ID),
                 SentAt = getMacroElapsed(), Error = detectError,
             }
             return false, "Chưa thấy Model của " .. tostring(action.Unit)
-                .. "; sẽ kiểm tra lại và thử đặt theo FIFO: " .. tostring(detectError),
+                .. "; sẽ kiểm tra lại và thử đặt sau 1.5s: " .. tostring(detectError),
                 { Retryable = true, RemoteSent = true, RetrySafe = true }
         end
 
@@ -13377,13 +13698,13 @@ function MacroEngine:_runAction(action, token, ctx)
                 .. " · Order=" .. tostring(action.Order or "?")
                 .. " · RecordID=" .. tostring(oldId or "?")
                 .. " · Unit=" .. tostring(action.Unit or "?")
-                .. ". Sẽ thử ánh xạ lại theo FIFO; không gửi nhầm Upgrade sang Tower khác.",
+                .. ". Sẽ thử ánh xạ lại sau 1.5s; không gửi nhầm Upgrade sang Tower khác.",
                 { Retryable = true, RemoteSent = false }
         end
         if not rf.UpgradeUnit then return false, "Remote UpgradeUnit không tồn tại." end
         local model = findMacroModelById(newId, action.Unit, ctx)
         if not model then
-            return false, "Runtime ID đã map nhưng Model chưa sẵn sàng; scheduler sẽ thử lại theo FIFO 2 giây.",
+            return false, "Runtime ID đã map nhưng Model chưa sẵn sàng; sẽ thử lại sau 1.5s.",
                 { Retryable = true, RemoteSent = false }
         end
 
@@ -13408,7 +13729,7 @@ function MacroEngine:_runAction(action, token, ctx)
         end
 
         -- Không dùng Cash cục bộ để chặn Upgrade: HUD/leaderstats có thể lệch hoặc compact.
-        -- Gửi đúng Action tại vị trí FIFO hiện tại; scheduler quản lý retry.
+        -- Gửi theo Time của Macro; nếu Server từ chối rõ ràng, scheduler retry sau 1.5s.
         if not self.Playing or token ~= self._playToken or self._activeReplayContext ~= ctx then
             return false, "Replay đã chuyển trận trước khi UpgradeUnit."
         end
@@ -13416,7 +13737,7 @@ function MacroEngine:_runAction(action, token, ctx)
         if not callOK then return false, "UpgradeUnit Remote lỗi: " .. tostring(response) end
         if isMacroRemoteRejected(response) then
             local rejectionText = macroResponseText(response)
-            return false, "Server từ chối UpgradeUnit; scheduler sẽ thử lại theo FIFO: " .. tostring(rejectionText),
+            return false, "Server từ chối UpgradeUnit; sẽ thử lại sau 1.5s: " .. tostring(rejectionText),
                 { Retryable = true, RemoteSent = true, ServerRejected = true }
         end
 
@@ -13478,7 +13799,7 @@ function MacroEngine:_runAction(action, token, ctx)
             return false, "UpgradeAll Remote lỗi: " .. tostring(result)
         end
         if isMacroRemoteRejected(result) then
-            return false, "Server từ chối UpgradeAll; sẽ thử lại theo FIFO: "
+            return false, "Server từ chối UpgradeAll; sẽ thử lại sau 1.5s: "
                 .. tostring(macroResponseText(result)),
                 { Retryable = true, RemoteSent = true, ServerRejected = true }
         end
@@ -13525,6 +13846,9 @@ function MacroEngine:_startReplayRun(ctx, isAutoRepeat)
         return false, "Macro JSON trống hoặc không hợp lệ."
     end
     hydrateReplayPlacementMetadata(actions)
+    if type(actions[1]) ~= "table" or actions[1].Type ~= "PlaceUnit" then
+        return false, "FIFO yêu cầu Action đầu tiên là PlaceUnit; không thể bắt đầu Replay với file đã thay đổi."
+    end
 
     local startStamp = getMacroStartStamp(ctx)
     local firstPlaceIndex = nil
@@ -13768,6 +14092,9 @@ function MacroEngine:StartPlay(isAutoRepeat, forcedContext)
     local okDecode, actions = pcall(function() return HttpService:JSONDecode(item.Content or "[]") end)
     if not okDecode or type(actions) ~= "table" or #actions == 0 then return false, "Macro JSON trống hoặc không hợp lệ." end
     hydrateReplayPlacementMetadata(actions)
+    if type(actions[1]) ~= "table" or actions[1].Type ~= "PlaceUnit" then
+        return false, "FIFO yêu cầu Action đầu tiên trong JSON là PlaceUnit để có thể thử ngay khi Replay bắt đầu."
+    end
 
     -- Preflight theo FIFO Sequence + ID. Legacy Time fields are ignored during replay.
     local recordedIds = {}
@@ -13978,18 +14305,11 @@ function MacroEngine:_onNewMatchStarted(ctx)
     local startStamp = getMacroStartStamp(ctx)
     local origin = self._playOriginContext
     if origin then
-        local originStartStamp = tonumber(self._playOriginStartStamp) or getMacroStartStamp(origin)
-        local sameOriginRun = ctx == origin and startStamp == originStartStamp
-        local sameContextRestarted = ctx == origin and startStamp ~= originStartStamp
-        local newerContextStarted = ctx ~= origin and startStamp > originStartStamp
-        if sameOriginRun then return end
-        if not sameContextRestarted and not newerContextStarted then
-            local originEnd = tonumber(origin:GetAttribute("GameEndTime")) or 0
-            local originHP = tonumber(origin:GetAttribute("BaseHP_1"))
-            local originEnded = self._playOriginEnded or originEnd > 0
-                or (originHP ~= nil and originHP <= 0) or not origin.Parent
-            if not originEnded then return end
-        end
+        local originEnd = tonumber(origin:GetAttribute("GameEndTime")) or 0
+        local originHP = tonumber(origin:GetAttribute("BaseHP_1"))
+        local originEnded = self._playOriginEnded or originEnd > 0 or (originHP ~= nil and originHP <= 0) or not origin.Parent
+        local sameOriginRun = ctx == origin and startStamp == self._playOriginStartStamp
+        if sameOriginRun or not originEnded then return end
     end
     if self._lastReplayContext == ctx and self._lastReplayStartStamp == startStamp then return end
 
@@ -14304,9 +14624,6 @@ function MacroEngine:Destroy()
     stopMacroGameClock()
 
     self.AutoDifficultyEnabled = false
-    self._difficultyAttempted = false
-    self._difficultyAttempts = 0
-    self._difficultyRetryAt = 0
     self.AutoPlayAgainEnabled = false
     self:_disconnectMacroLifecycleWatchers()
     self:_disconnectRestartWatchers()
@@ -14319,10 +14636,6 @@ function MacroEngine:Destroy()
     if self._recordBaseHPConnection then
         pcall(function() self._recordBaseHPConnection:Disconnect() end)
         self._recordBaseHPConnection = nil
-    end
-    if self._recordLegacyTerminalConnection then
-        pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
-        self._recordLegacyTerminalConnection = nil
     end
 
     if self.Recording and not self._savingRecord and not self._saveQueued then
@@ -14376,13 +14689,11 @@ callbacks.onMacroPlayChanged = function(enabled)
             return false, "Record đang lưu JSON. Hãy đợi lưu xong rồi bật Play Macro."
         end
         local ok, message = MacroEngine:StartPlay()
-        if ok and MatchStatsTracker and not MatchStatsTracker.Enabled then
-            MatchStatsTracker:StartSession()
-        end
+        if ok and MatchStatsTracker then MatchStatsTracker:StartSession() end
         return ok, message
     end
     local ok, message = MacroEngine:StopPlay("người dùng tắt Play Macro")
-    if MatchStatsTracker and not savedWebhookUrl then MatchStatsTracker:StopArming() end
+    if MatchStatsTracker then MatchStatsTracker:StopArming() end
     return ok, message
 end
 
@@ -14435,13 +14746,13 @@ end
 
 callbacks.onGameSpeed = function(multiplier)
     multiplier = tonumber(multiplier)
-    if multiplier ~= 1 and multiplier ~= 1.5 and multiplier ~= 2 then
-        return false, "Chỉ hỗ trợ tốc độ X1, X1.5 hoặc X2."
+    if multiplier ~= 1 and multiplier ~= 2 and multiplier ~= 3 then
+        return false, "Chỉ hỗ trợ tốc độ X1, X2 hoặc X3."
     end
     local ok, err = sendRemote(findRemoteEvent("ChangeTickSpeed"), multiplier)
     if not ok then return false, "Không gửi được Game Speed: " .. tostring(err) end
-    if multiplier == 1.5 then
-        return true, "Đã gửi yêu cầu X1.5 qua ChangeTickSpeed; cần server chấp nhận giá trị thập phân."
+    if multiplier == 3 then
+        return true, "Đã gửi yêu cầu X3. Lưu ý: X3 yêu cầu Gamepass để được game cho phép áp dụng."
     elseif multiplier == 2 then
         return true, "Đã gửi yêu cầu Game Speed X2."
     end
@@ -14490,18 +14801,7 @@ callbacks.onClose = function()
         })
     end)
 
-    shutdownStep("Smart Evade + Waypoint", function()
-        -- The controller owns its local AppState/planner/movement references.
-        -- Shut it down through the exported API; do not leak globals from this scope.
-        Treost.shutdown()
-    end)
-
-    shutdownStep("restore Game Speed X1", function()
-        if callbacks.onGameSpeed then callbacks.onGameSpeed(1) end
-    end)
-    shutdownStep("disable Auto Skip", function()
-        if callbacks.onAutoSkipChanged then callbacks.onAutoSkipChanged(false) end
-    end)
+    shutdownStep("Smart Evade stop", function() if Treost then Treost.stopAllEvadeModes() end end)
     shutdownStep("Macro", function() if MacroEngine then MacroEngine:Destroy() end end)
 
     autoFollowEnabled = false
@@ -14542,6 +14842,8 @@ callbacks.onClose = function()
     shutdownStep("Performance restore", function()
         if PerformanceManager then PerformanceManager:Destroy() end
     end)
+    shutdownStep("Smart Evade", function() if Treost then Treost.shutdown() end end)
+
     shutdownStep("Target/ability controllers", function()
         for _, controller in pairs({TargetSelector, BossTracker, AutoAbilityController}) do
             if controller then
@@ -14603,31 +14905,60 @@ end
 
 local function validateEvadeData(data)
     if type(data) ~= "table" then return false, "JSON root phải là object." end
-    if type(data.Name) ~= "string" or trim(data.Name) == "" then return false, "Name không hợp lệ." end
+    if type(data.Name) ~= "string" or trim(data.Name) == "" then
+        return false, "Name là trường bắt buộc và không được để trống."
+    end
+    if data.Version ~= nil and type(data.Version) ~= "string" and type(data.Version) ~= "number" then
+        return false, "Version phải là chuỗi hoặc số."
+    end
+
     local points = data.Waypoints or data.EvadePoints or data.Points
-    if type(points) ~= "table" or #points < 1 then return false, "Waypoints cần ít nhất 1 điểm." end
-    for index, point in ipairs(points) do
-        if type(point) ~= "table" then return false, "Waypoint lỗi tại điểm " .. tostring(index) end
-        local x, y, z = tonumber(point.X), tonumber(point.Y), tonumber(point.Z)
-        if not x or not y or not z or x ~= x or y ~= y or z ~= z
+    if type(points) ~= "table" then return false, "Waypoints phải là một danh sách." end
+
+    local count, maxIndex = 0, 0
+    for key, point in pairs(points) do
+        if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+            return false, "Waypoints chỉ được chứa chỉ số mảng 1, 2, 3..."
+        end
+        count += 1
+        maxIndex = math.max(maxIndex, key)
+        if type(point) ~= "table" then
+            return false, "Waypoint lỗi tại điểm " .. tostring(key) .. "."
+        end
+        -- JSON waypoints must carry numeric coordinates, not numeric-looking strings/booleans.
+        local x, y, z = point.X, point.Y, point.Z
+        if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number"
+            or x ~= x or y ~= y or z ~= z
             or math.abs(x) >= 1e7 or math.abs(y) >= 1e7 or math.abs(z) >= 1e7 then
-            return false, "Waypoint không hợp lệ tại điểm " .. tostring(index)
+            return false, "Tọa độ X/Y/Z phải là số hữu hạn hợp lệ tại waypoint " .. tostring(key) .. "."
         end
     end
-    return true
+    if count < 1 then return false, "Waypoints cần ít nhất 1 điểm." end
+    if count > 1500 then return false, "Waypoints vượt giới hạn 1500 điểm." end
+    if count ~= maxIndex then return false, "Waypoints có chỉ số bị khuyết; thứ tự mảng không liên tục." end
+    return true, points
 end
 
 callbacks.onExportMap = function(path)
-    local _, active = SaveManager:GetActiveFile()
-    if not active then return false, "Hãy tạo hoặc chọn file Evade trước." end
+    local activeKey, active = SaveManager:GetActiveFile()
+    if not active or not SaveManager:IsEvadeFile(activeKey) then
+        return false, "Hãy tạo hoặc chọn file Evade trước; file Map CFW cũ không thể export thành Evade."
+    end
     local points = type(active.EvadePoints) == "table" and active.EvadePoints or {}
     local safeName = tostring(active.MapName or "Evade"):gsub('[\\/:*?"<>|]', "_")
     local filePath = cleanMapFileName(path or ("duy_evade/" .. safeName .. ".json"))
     if not filePath then return false, "Đường dẫn export không hợp lệ." end
-    local data = { Version = "1.0", Name = tostring(active.MapName or "Evade"), Waypoints = points }
+
+    local data = {
+        Version = "1.0",
+        Name = tostring(active.MapName or "Evade"),
+        Waypoints = points,
+    }
     local valid, reason = validateEvadeData(data)
-    if not valid then return false, "Không thể export: " .. reason end
-    local encoded = HttpService:JSONEncode(data)
+    if not valid then return false, "Không thể export: " .. tostring(reason) end
+    local encodeOK, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+    if not encodeOK then return false, "Không mã hóa được Evade JSON: " .. tostring(encoded) end
+
     if type(writefile) ~= "function" then
         if type(setclipboard) == "function" then
             local copied, copyError = pcall(setclipboard, encoded)
@@ -14636,6 +14967,7 @@ callbacks.onExportMap = function(path)
         end
         return false, "Executor không hỗ trợ writefile hoặc clipboard export."
     end
+
     local function tryWrite(destination)
         local folder = destination:match("^(.*)/[^/]+$")
         if folder and folder ~= "" and type(isfolder) == "function" and type(makefolder) == "function" then
@@ -14647,7 +14979,12 @@ callbacks.onExportMap = function(path)
         end
         writefile(destination, encoded)
     end
+
     local ok, err = pcall(tryWrite, filePath)
+    if not ok and not path then
+        filePath = safeName .. ".json"
+        ok, err = pcall(tryWrite, filePath)
+    end
     if not ok then
         if type(setclipboard) == "function" and pcall(setclipboard, encoded) then
             return true, "Đã copy Evade JSON; lưu file thất bại: " .. tostring(err)
@@ -14655,47 +14992,63 @@ callbacks.onExportMap = function(path)
         return false, "Export thất bại: " .. tostring(err)
     end
     local copied = type(setclipboard) == "function" and pcall(setclipboard, encoded)
-    return true, "Đã export Evade JSON: " .. filePath .. (copied and " (đã copy clipboard)." or ".")
+    local message = "Đã export Evade JSON: " .. filePath .. (copied and " (đã copy clipboard)." or ".")
+    if api and api.setMapOperationStatus then api.setMapOperationStatus(message, true) end
+    return true, message
 end
 
 callbacks.onValidateMapImport = function(raw)
     if type(raw) ~= "string" or trim(raw) == "" then return false, "Hãy dán Evade JSON trước." end
     local decodedOK, imported = pcall(function() return HttpService:JSONDecode(raw) end)
     if not decodedOK or type(imported) ~= "table" then return false, "JSON không hợp lệ." end
-    local copy = table.clone(imported)
-    if type(copy.Name) ~= "string" or trim(copy.Name) == "" then copy.Name = "EvadeImport" end
-    local valid, reason = validateEvadeData(copy)
-    if not valid then return false, "Evade JSON bị từ chối: " .. reason end
-    local points = copy.Waypoints or copy.EvadePoints or copy.Points
-    return true, string.format("Evade JSON hợp lệ · %d waypoint", #points)
+    local valid, pointsOrError = validateEvadeData(imported)
+    if not valid then return false, "Evade JSON bị từ chối: " .. tostring(pointsOrError) end
+    return true, string.format("Evade JSON hợp lệ · %d waypoint", #pointsOrError)
 end
 
 callbacks.onImportMapData = function(raw, requestedName)
+    if Treost.WaypointRuntime.AutoEvadeEnabled then
+        return false, "Hãy tắt Auto Evade trước khi import file mới."
+    end
     if type(raw) ~= "string" or trim(raw) == "" then return false, "Hãy dán Evade JSON trước." end
     local okDecode, imported = pcall(function() return HttpService:JSONDecode(raw) end)
     if not okDecode or type(imported) ~= "table" then return false, "JSON không hợp lệ." end
+    local valid, pointsOrError = validateEvadeData(imported)
+    if not valid then return false, "Evade JSON bị từ chối: " .. tostring(pointsOrError) end
+
     local requested = trim(requestedName or "")
-    if requested == "" then requested = trim(imported.Name or "") end
+    if requested == "" then requested = trim(imported.Name) end
     if requested == "" then
         local suffix = 1
         repeat
             requested = "Evade" .. tostring(suffix)
             suffix += 1
-        until not SaveManager:NameExists(requested) or suffix > 10000
+        until not SaveManager:NameExists(requested, nil, "EVADE") or suffix > 10000
     end
-    if SaveManager:NameExists(requested) then return false, "Tên file đã tồn tại; hãy chọn tên khác." end
-    local staged = { Version = "1.0", Name = requested, Waypoints = imported.Waypoints or imported.EvadePoints or imported.Points }
-    local valid, reason = validateEvadeData(staged)
-    if not valid then return false, "Evade JSON bị từ chối: " .. reason end
+    if SaveManager:NameExists(requested, nil, "EVADE") then
+        return false, "Tên file Evade đã tồn tại; hãy chọn tên khác. File cũ không bị thay đổi."
+    end
+
+    -- Stage a fresh validated array before creating any file; invalid JSON never touches existing data.
+    local stagedPoints = {}
+    for index, point in ipairs(pointsOrError) do
+        stagedPoints[index] = {
+            X = tonumber(point.X),
+            Y = tonumber(point.Y),
+            Z = tonumber(point.Z),
+        }
+    end
+
     local created, activeKey = SaveManager:CreateFile(requested)
     if not created then return false, "Không tạo được file: " .. tostring(activeKey) end
     local _, active = SaveManager:GetActiveFile()
-    if not active then SaveManager:DeleteFile(activeKey); return false, "Không kích hoạt được file import." end
-    active.MapName = requested
-    active.EvadePoints = {}
-    for _, point in ipairs(staged.Waypoints) do
-        table.insert(active.EvadePoints, { X = tonumber(point.X), Y = tonumber(point.Y), Z = tonumber(point.Z) })
+    if not active then
+        SaveManager:DeleteFile(activeKey)
+        return false, "Không kích hoạt được file import."
     end
+    active.FileType = "EVADE"
+    active.MapName = requested
+    active.EvadePoints = stagedPoints
     local persistenceOK, persistenceError = SaveManager:Persist()
     local note = ""
     if SaveManager:HasPersistence() and not persistenceOK then
@@ -14706,7 +15059,7 @@ callbacks.onImportMapData = function(raw, requestedName)
     if api then
         api.setSelectedKey(activeKey)
         api.refreshEvadeDropdown()
-        api.setEvadeFileStatus("Đã import " .. requested .. " · " .. tostring(#active.EvadePoints) .. " điểm" .. note, Color3.fromRGB(100, 255, 140))
+        api.setEvadeFileStatus("Đã import " .. requested .. " · " .. tostring(#stagedPoints) .. " điểm" .. note, Color3.fromRGB(100, 255, 140))
     end
     return true, activeKey, "Đã import Evade: " .. requested .. note
 end
@@ -14725,14 +15078,24 @@ callbacks.onImportMap = function(path)
 end
 
 callbacks.onCreateFile = function(name)
-    local ok, key = SaveManager:CreateFile(name)
+    if Treost.WaypointRuntime.AutoEvadeEnabled then
+        return false, "Hãy tắt Auto Evade trước khi tạo file Evade mới."
+    end
+    local ok, keyOrError = SaveManager:CreateFile(name)
     if ok then
         local _, data = SaveManager:GetActiveFile()
-        if data then data.EvadePoints = {} end
+        if data then
+            data.FileType = "EVADE"
+            data.EvadePoints = {}
+        end
         SaveManager:Persist()
-        if api then api.setSelectedKey(key); api.refreshEvadeDropdown() end
+        if api then
+            api.setSelectedKey(keyOrError)
+            api.refreshEvadeDropdown()
+            api.setEvadeFileStatus("Đã tạo file Evade: " .. tostring(name), Color3.fromRGB(100, 255, 140))
+        end
     end
-    return ok, key
+    return ok, keyOrError
 end
 
 callbacks.onToggleRouteRecord = function()
@@ -14764,21 +15127,25 @@ callbacks.onDelete = function(key)
     local deletingActive = select(1, SaveManager:GetActiveFile()) == key
     if deletingActive and Treost.WaypointRuntime.AutoEvadeEnabled then
         Treost.stopAllEvadeModes()
+        Treost.WaypointRuntime.AutoEvadeEnabled = false
         if api then api.setEvadeAutoUI(false, true) end
     end
+
     local ok, err = SaveManager:DeleteFile(key)
     if not ok then return false, err end
-
+    SaveManager:EnsureActiveEvadeFile()
     local nextKey, nextData = SaveManager:GetActiveFile()
     if nextData then
         if type(nextData.EvadePoints) ~= "table" then nextData.EvadePoints = {} end
         callbacks.onSelectEvadeFile(nextKey)
     else
         Treost.stopAllEvadeModes()
+        Treost.WaypointRuntime.AutoEvadeEnabled = false
         if api then
             api.setSelectedKey(nil)
             api.refreshEvadeDropdown()
             api.setEvadeFileStatus("Không còn file Evade nào.", Color3.fromRGB(255, 190, 90))
+            api.setEvadeAutoUI(false, true)
         end
     end
     return true
@@ -14824,7 +15191,7 @@ callbacks.onScanNow = function()
     MatchScanner:DebugUI() -- chi quet UI khi nguoi dung bam SCAN NOW
     if api then
         api.setScannerInfo(snapshot)
-        api.setStatus("Da kiem tra UI mot lan. Auto Scanner chi lang nghe su kien.", Color3.fromRGB(91, 169, 255))
+        api.setStatus("Da kiem tra UI mot lan. Auto Scanner chi lang nghe su kien.", Color3.fromRGB(255, 45, 72))
     end
 end
 
@@ -14837,7 +15204,8 @@ callbacks.onResetScanner = function()
     end
 end
 
--- Match-end notification uses the same player/partner survival result as the Discord report.
+-- Thong bao bat dau/ket thuc tran dua tren Context attributes da co trong game.
+-- Ket qua uu tien BaseHP_1; neu khong co du lieu thi hien UNKNOWN, khong doan.
 local matchWatchContext, matchWatchStart, matchWatchEnded = nil, 0, false
 local matchWatchElapsed = 0
 local matchWatchConnection
@@ -14862,16 +15230,12 @@ matchWatchConnection = RunService.Heartbeat:Connect(function(dt)
     end
     if startStamp > 0 and endStamp > 0 and not matchWatchEnded then
         matchWatchEnded = true
-        local result = MatchStatsTracker and MatchStatsTracker.LastResultContext == ctx
-            and MatchStatsTracker.LastResult or "UNKNOWN"
-        local resultText = result == "WIN (VICTORY)" and "THẮNG"
-            or (result == "LOSS (DEFEAT)" and "THUA" or "CHƯA XÁC ĐỊNH")
-        local summary = MatchStatsTracker and MatchStatsTracker.LastResultContext == ctx
-            and MatchStatsTracker.LastSurvivorSummary or "Không có dữ liệu người chơi"
+        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+        local result = baseHP and (baseHP > 0 and "THẮNG" or "THUA") or "CHƯA XÁC ĐỊNH"
         if api and api.notify then
-            local color = resultText == "THẮNG" and Color3.fromRGB(47, 163, 100)
-                or (resultText == "THUA" and Color3.fromRGB(225, 90, 90) or Color3.fromRGB(225, 172, 66))
-            api.notify("TRẬN ĐẤU KẾT THÚC · " .. resultText .. " · " .. tostring(summary), color)
+            local color = result == "THẮNG" and Color3.fromRGB(47, 163, 100)
+                or (result == "THUA" and Color3.fromRGB(225, 90, 90) or Color3.fromRGB(225, 172, 66))
+            api.notify("TRẬN ĐẤU KẾT THÚC · " .. result, color)
         end
     end
 end)
@@ -14974,9 +15338,13 @@ callbacks.getWebhookExportFiles = function()
         local item = MacroStore:GetFile(key)
         if item then table.insert(macros, { Key = key, Name = tostring(item.Name or key) }) end
     end
-    for _, key in ipairs(SaveManager:GetFileList()) do
+    for _, key in ipairs(SaveManager:GetEvadeFileList()) do
         local item = SaveManager:GetFile(key)
-        if item then table.insert(evades, { Key = key, Name = tostring(item.MapName or key) }) end
+        -- Include explicitly created Evade files; the sender validates the waypoint array
+        -- before upload, so an empty editor file is reported clearly rather than hidden.
+        if item then
+            table.insert(evades, { Key = key, Name = tostring(item.MapName or key) })
+        end
     end
     return { Macros = macros, Evades = evades }
 end
@@ -14997,8 +15365,14 @@ end
 
 callbacks.onSendEvadeJSONToDiscord = function(key)
     local item = key and SaveManager:GetFile(key)
-    if not item then return false, "Hãy chọn một file Evade đã lưu." end
-    local evadeData = { Version = "1.0", Name = tostring(item.MapName or "Evade"), Waypoints = item.EvadePoints or {} }
+    if not item or not SaveManager:IsEvadeFile(key) then
+        return false, "Hãy chọn một file Evade đã lưu; file Map CFW cũ không được gửi ở đây."
+    end
+    local evadeData = {
+        Version = "1.0",
+        Name = tostring(item.MapName or "Evade"),
+        Waypoints = item.EvadePoints or {},
+    }
     local valid, reason = validateEvadeData(evadeData)
     if not valid then return false, "Evade JSON chưa hợp lệ: " .. tostring(reason) end
     local encodeOK, raw = pcall(function() return HttpService:JSONEncode(evadeData) end)
@@ -15023,18 +15397,15 @@ callbacks.onConfigureWebhook = function(url)
         local saveOK, saveMessage = persistWebhookUrl(url)
         if not saveOK then return false, saveMessage end
         savedWebhookUrl = url
-        if MatchStatsTracker and not MatchStatsTracker.Enabled then MatchStatsTracker:StartSession() end
-        return true, "Da luu Discord link tren may; tu dong theo doi va gui bao cao WIN/LOSS."
+        return true, "Da luu Discord link tren may; lan sau se tu nap lai."
     end
 
     savedWebhookUrl = url
-    if MatchStatsTracker and not MatchStatsTracker.Enabled then MatchStatsTracker:StartSession() end
-    return true, "Da luu trong phien nay; tu dong theo doi va gui bao cao WIN/LOSS."
+    return true, "Da luu trong phien nay; executor khong ho tro luu link qua lan chay sau."
 end
 
 callbacks.onResetWebhook = function()
     savedWebhookUrl = nil
-    if MatchStatsTracker then MatchStatsTracker:StopArming() end
     local cleared, message = clearPersistedWebhookUrl()
     return cleared, message
 end
@@ -15042,7 +15413,7 @@ end
 callbacks.onTestWebhook = function()
     local payload = {
         embeds = {{
-            title = "🔵 EVADE - WEBHOOK TEST",
+            title = "🔵 EVADE SYSTEM - TEST",
             description = "Webhook Discord đã kết nối và nhận được tin nhắn kiểm tra.",
             color = 3447003,
             fields = {{ name = "📡 Trạng thái", value = "✅ SEND TEST thành công", inline = true }},
@@ -15056,17 +15427,11 @@ end
 -- STARTUP / RESTORE
 -- ============================================================
 SaveManager:Init()
+SaveManager:EnsureActiveEvadeFile()
 MacroStore:Init()
 api = GUI:Build(callbacks)
-local treostLabelBridgeOK, treostLabelBridgeError = pcall(function()
-    local statusLabel, memoryLabel = api.getEvadeLabels()
-    Treost.setLabels(statusLabel, memoryLabel)
-    Treost.updateMemoryLabel()
-end)
-if not treostLabelBridgeOK then
-    warn("[TREOST HYBRID] Evade label bridge error (Macro startup will continue): "
-        .. tostring(treostLabelBridgeError))
-end
+Treost.setLabels(api.getEvadeLabels())
+Treost.updateMemoryLabel()
 
 api.setMacroStatus("Đang khởi tạo Macro Engine...", true)
 api.setWebhookStatus(
@@ -15081,73 +15446,107 @@ task.defer(function()
     -- Một số server dựng RemoteFunctions chậm sau khi GUI đã hiện; thử lại tối đa 10 giây.
     for attempt = 1, 20 do
         if destroyed then return end
-        local callOK, initOK, initMessage = pcall(function()
-            return MacroEngine:Init()
-        end)
-        if callOK then
-            macroInitOK, macroInitMessage = initOK == true, initMessage
-        else
-            macroInitOK = false
-            macroInitMessage = "MacroEngine:Init exception: " .. tostring(initOK)
-            warn("[TREOST HYBRID] " .. macroInitMessage)
-        end
+        macroInitOK, macroInitMessage = MacroEngine:Init()
         if macroInitOK then break end
         task.wait(0.5)
     end
     if destroyed then return end
     pcall(function() MacroEngine:_ensureMacroLifecycleWatchers() end)
-
-    local autoAbilityOK, autoAbilityError = pcall(function()
-        AutoAbilityController:Start()
-    end)
-    if not autoAbilityOK then
-        warn("[TREOST HYBRID] Auto Ability startup error (AutoDifficulty will still start): "
-            .. tostring(autoAbilityError))
-    end
-
-    local difficultyWatcherOK, difficultyWatcherError = pcall(function()
-        MacroEngine:StartDifficultyWatcher()
-    end)
-    if not difficultyWatcherOK then
-        warn("[TREOST HYBRID] AutoDifficulty watcher startup error: " .. tostring(difficultyWatcherError))
-    end
-
-    if not difficultyWatcherOK then
-        api.setMacroStatus("AutoDifficulty watcher chưa khởi động: " .. tostring(difficultyWatcherError), false)
-    elseif not macroInitOK then
-        api.setMacroStatus("Macro chưa sẵn sàng: " .. tostring(macroInitMessage)
-            .. " · AutoDifficulty watcher đã khởi động; Remote/Context cần được kiểm tra.", false)
-    elseif not autoAbilityOK then
-        api.setMacroStatus("Macro đã khởi tạo; Auto Ability lỗi: " .. tostring(autoAbilityError)
-            .. " · AutoDifficulty watcher vẫn đang chạy.", false)
+    AutoAbilityController:Start()
+    MacroEngine:StartDifficultyWatcher()
+    if not macroInitOK then
+        api.setMacroStatus("Macro chưa sẵn sàng: " .. tostring(macroInitMessage), false)
     else
         api.setMacroStatus(macroInitMessage, MacroEngine._recordHookReady)
     end
 end)
 
--- Restore the last selected Evade file for display only; movement starts only when toggled ON.
+local function applyFileSettings(data)
+    -- Dung target/path cu truoc khi ap dung cau hinh file moi.
+    MovementController:Stop()
+    TargetSelector:Clear()
+    autoFollowEnabled = false
+
+    local settings = type(data.Settings) == "table" and data.Settings or {}
+    local speed = math.clamp(safeNumber(settings.Speed, 1), CONFIG.MIN_SPEED, CONFIG.MAX_SPEED)
+    local noclip = settings.Noclip == true
+    local follow = false -- Target tab was replaced by Evade; legacy AutoFollow is kept dormant.
+    local performanceOptions = {
+        HideEnemyModels = settings.Performance_HideEnemyModels == true,
+        SimplifyMap = settings.Performance_SimplifyMap == true,
+        HideTextures = settings.Performance_HideTextures == true,
+        DisableShadows = settings.Performance_DisableShadows == true,
+        DisableEffects = settings.Performance_DisableEffects == true,
+        DisableFog = settings.Performance_DisableFog == true,
+    }
+    local performanceMode = settings.PerformanceMode
+    if PERFORMANCE_PRESETS[performanceMode] then
+        performanceOptions = PERFORMANCE_PRESETS[performanceMode]
+    elseif performanceMode ~= "CUSTOM" then
+        local anyEnabled = false
+        for _, enabled in pairs(performanceOptions) do if enabled then anyEnabled = true break end end
+        performanceMode = anyEnabled and "CUSTOM" or "NORMAL"
+        SaveManager:UpdateActiveSettings({ PerformanceMode = performanceMode })
+    end
+    PerformanceManager:ApplyOptions(performanceOptions)
+    api.setPerformanceUI(performanceOptions, true)
+    api.setPerformanceModeUI(performanceMode or "NORMAL")
+
+    PlayerController:SetSpeed(speed)
+    PlayerController:SetNoclip(noclip)
+
+    api.setSpeedUI(speed, true)
+    api.setNoclipUI(noclip, true)
+    api.setFollowUI(false, true)
+    api.setScannerUI(false, true)
+    speedMode = settings.SpeedMode == "MATCH_ENEMY" and "MATCH_ENEMY" or "NORMAL"
+    api.setSpeedModeUI(speedMode)
+    autoFollowEnabled = false
+    if follow and MapManager:IsReady() then
+        setAutoFollow(true)
+        api.setFollowUI(true, true)
+    end
+end
+
+callbacks.onSelectFile = function(key)
+    local ok, err = SaveManager:SelectFile(key)
+    if not ok then return false, err end
+
+    local _, data = SaveManager:GetActiveFile()
+    if not data then return false, "Du lieu file khong ton tai." end
+
+    MapManager:LoadFromFile(data)
+    api.setSpawnLabel(MapManager:GetSpawn())
+    api.setDestinationLabel(MapManager:GetDestination())
+    api.updateCreateButton()
+    api.setRouteStatus(string.format("%d diem", #(MapManager:GetRoute() or {})))
+    applyFileSettings(data)
+    return true
+end
+
+callbacks.getFileList = function()
+    return SaveManager:GetFileList()
+end
+
+-- Restore the most recently selected Evade file for display only; movement starts only when toggled ON.
 local activeKey, activeData = SaveManager:GetActiveFile()
 if activeData then
     if type(activeData.EvadePoints) ~= "table" then activeData.EvadePoints = {} end
     api.setSelectedKey(activeKey)
     api.setEvadeFileStatus("Đã nạp " .. tostring(activeData.MapName or activeKey)
         .. " · " .. tostring(#activeData.EvadePoints) .. " waypoint", Color3.fromRGB(100, 255, 140))
+    applyFileSettings(activeData)
 else
-    api.setStatus("Chưa có file Evade. Hãy tạo file và đặt các waypoint trước.", Color3.fromRGB(225, 172, 66))
+    api.setStatus("Chưa có file Evade. Hãy tạo file và đặt waypoint trước.", Color3.fromRGB(225, 172, 66))
 end
 
 local function handleEvadeWaveSnapshot(snapshot)
     if destroyed or type(snapshot) ~= "table" then return end
     local wave = tonumber(snapshot.Wave)
-
-    -- Chạm ngưỡng đã chọn: kết thúc Waypoint ngay và trả quyền cho Smart Evade gốc.
     if Treost.WaypointRuntime.Enabled and Treost.WaypointRuntime.WaveThreshold > 0
         and wave and wave >= Treost.WaypointRuntime.WaveThreshold then
         Treost.switchToOriginalSmartEvade("wave")
     end
-
-    -- Handoff là một chiều trong phiên này: trận mới vẫn dùng Smart Evade gốc.
-    -- Người dùng có thể tắt/bật lại Auto Evade để chủ động bắt đầu Waypoint lần nữa.
 end
 
 MatchScanner:Start(function(snapshot)
@@ -15242,8 +15641,7 @@ local lastObservedPosition = nil
 local teleportResumeToken = 0
 
 -- ============================================================
--- RUNTIME UPDATE LOOP (ENEMY CACHE, EVENT-DRIVEN UI SCANNER)
--- ============================================================
+-- RUNTIME UPDATE LOOP (SHARED ENEMY CACHE FOR BOSS/PERFORMANCE; SMART EVADE OWNS MOVEMENT)
 local heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
     if destroyed then return end
 
@@ -15252,54 +15650,20 @@ local heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
         notifyMatchStartedOnce(activeMatchContext)
     end
 
-    local root = getHRP()
-    if root then
-        if autoFollowEnabled and lastObservedPosition and not manualMovementActive() then
-            local displacement = (root.Position - lastObservedPosition).Magnitude
-            local expectedMovement = CONFIG.BASE_WALK_SPEED * PlayerController:GetSpeed()
-                * math.max(deltaTime, 1 / 60) * 2.5 + 8
-            if displacement > expectedMovement then
-                teleportResumeToken += 1
-                local token = teleportResumeToken
-                MovementController:SetPaused(true)
-                task.delay(0.01, function()
-                    if token == teleportResumeToken and autoFollowEnabled and not manualMovementActive() then
-                        MovementController:SetPaused(false)
-                    end
-                end)
-            end
-        end
-        lastObservedPosition = root.Position
-    else
-        lastObservedPosition = nil
-    end
-
     enemyElapsed += deltaTime
     if enemyElapsed >= CONFIG.ENEMY_SCAN_INTERVAL then
         enemyElapsed = 0
-        if autoFollowEnabled or PerformanceManager:IsEnabled("HideEnemyModels") or BossTracker.MaxHP ~= nil then
+        if PerformanceManager:IsEnabled("HideEnemyModels") or BossTracker.MaxHP ~= nil then
             local enemies = Treost.EnemyDetector:ScanAll()
-            if BossTracker.MaxHP ~= nil then monitorBoss(enemies) end -- chi doc cache enemy hop le
+            if BossTracker.MaxHP ~= nil then monitorBoss(enemies) end
             if PerformanceManager:IsEnabled("HideEnemyModels") then
                 PerformanceManager:RefreshEnemyModels(enemies)
             end
-            if autoFollowEnabled then
-                local destination = MapManager:GetDestination()
-                if destination then
-                    local target = TargetSelector:Select(enemies, MapManager:GetSpawn(), destination, MapManager:GetRoute())
-                    api.setTargetInfo(target, destination)
-                else
-                    TargetSelector:Clear()
-                    api.setTargetInfo(nil, nil)
-                end
-            else
-                api.setTargetInfo(nil, nil)
-            end
-        else
-            api.setTargetInfo(nil, nil)
         end
     end
 end)
 table.insert(runtimeConnections, heartbeatConnection)
 
-print("[EVADE] TREOST Smart Evade + CFW Main/Macro/Webhook/Performance initialized.")
+print("[ChenFuWei] CFW + TREOST Smart Evade + FIFO Macro initialized.")
+print("[ChenFuWei] Route recording: start at Spawn, follow the route, stop near Destination.")
+print("[ChenFuWei] Movement pause API: PlayerGui.DuySystemMovementOverride:Fire(true/false)")
