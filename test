@@ -7918,6 +7918,8 @@ do
 
 
         -- TAB 4: DISCORD WEBHOOK
+        local webhookStatusLabel -- khai báo ngoài scope vì api.setWebhookStatus dùng sau
+        do -- v1.5 repair: Webhook scope riêng để GUI:Build không vượt 200 local
         local webhookPanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
             Size = UDim2.new(1, -24, 0, 690),
@@ -7938,7 +7940,7 @@ do
             UDim2.new(0, 14, 0, 124), UDim2.new(0.48, -5, 0, 30), { Background = C.GREEN_DARK })
         local testWebhookButton = makeButton(webhookPanel, "SEND TEST",
             UDim2.new(0.52, 5, 0, 124), UDim2.new(0.48, -19, 0, 30), { Background = C.BUTTON })
-        local webhookStatusLabel = makeLabel(webhookPanel,
+        webhookStatusLabel = makeLabel(webhookPanel,
             savedWebhookUrl and "Webhook: Da tu nap link da luu tren may." or "Webhook: chua cau hinh",
             UDim2.new(0, 14, 0, 165), UDim2.new(1, -28, 0, 24), {
                 TextSize = 10, Color = savedWebhookUrl and C.GREEN or C.DIM,
@@ -8131,9 +8133,11 @@ do
             evadeDiscordStatus.Text = tostring(message or "")
             evadeDiscordStatus.TextColor3 = ok and C.GREEN or C.RED
         end)
+        end -- v1.5 repair: giải phóng local register của GUI:Build (Webhook)
 
 
         -- TAB 5: HIỆU NĂNG
+        do -- v1.5 repair: Performance scope riêng để GUI:Build không vượt 200 local
         local performancePanel = newInstance("Frame", {
             Position = UDim2.new(0, 12, 0, 12),
             Size = UDim2.new(1, -24, 1, -24),
@@ -8358,6 +8362,7 @@ do
                 if EvadeUI and EvadeUI.setSelected then EvadeUI.setSelected(key) end
             end,
         }
+        end -- v1.5 repair: giải phóng local register của GUI:Build (Performance)
 
         -- ============================================================
         -- TAB INFORMATION + SETTING / DEVICE PROFILE
