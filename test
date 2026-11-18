@@ -1,5 +1,6 @@
 --[[
-    TREOST EVADE HYBRID - V1.2
+    TREOST EVADE HYBRID - V1.6
+    AutoDifficulty block is transplanted verbatim from CFW_GOC.
     TREOST remains the base for the original Smart Evade engine and persistent ObstacleMemory.
     Selected CFW components are integrated without replacing the TREOST evade algorithms.
 
@@ -6850,9 +6851,17 @@ do
                     or ("Auto Difficulty enabled: Level " .. tostring(selectedDifficultyLevel) .. " will be selected when the level screen appears."))
                 or (uiLanguage == "VI" and "Đã tắt Auto Difficulty." or "Auto Difficulty disabled.")
             if callbacks.onAutoDifficultyChanged then
-                ok, message = callbacks.onAutoDifficultyChanged(enabled)
+                local callOK, result, detail = pcall(callbacks.onAutoDifficultyChanged, enabled)
+                if callOK then
+                    ok, message = result == true, detail
+                else
+                    ok, message = false, "Auto Difficulty callback error: " .. tostring(result)
+                end
             end
             if not ok then autoDifficultySetter(false, true) end
+            if api and api.setMacroStatus then
+                pcall(api.setMacroStatus, tostring(message or "Auto Difficulty updated."), ok)
+            end
             setStatus(message, ok and C.GREEN or C.YELLOW)
         end)
         local autoPlayAgainSetter, getAutoPlayAgain
@@ -7020,11 +7029,23 @@ do
         local macroRecordSetter
         macroRecordSetter = makeToggle(macroScroll, "RECORD MACRO", UDim2.new(0, 6, 0, 221), function(enabled)
             local ok, message = false, "Recorder Engine chưa sẵn sàng."
+            if enabled then
+                macroProgressStatus.Text = "STATUS: RECORD REQUESTED · đang kiểm tra Macro Engine..."
+                macroProgressStatus.TextColor3 = C.YELLOW
+            end
             if callbacks.onMacroRecordChanged then
-                ok, message = callbacks.onMacroRecordChanged(enabled)
+                local callOK, result, detail = pcall(callbacks.onMacroRecordChanged, enabled)
+                if callOK then
+                    ok, message = result == true, detail
+                else
+                    ok, message = false, "Record callback error: " .. tostring(result)
+                end
             end
             if not ok then macroRecordSetter(false, true) end
-            setStatus(message, ok and C.GREEN or C.YELLOW)
+            if api and api.setMacroStatus then
+                pcall(api.setMacroStatus, tostring(message or (ok and "Record enabled." or "Record failed.")), ok)
+            end
+            setStatus(message or (ok and "Record enabled." or "Record failed."), ok and C.GREEN or C.YELLOW)
         end)
         local macroPlaySetter
         macroPlaySetter = makeToggle(macroScroll, "PLAY MACRO", UDim2.new(0, 6, 0, 255), function(enabled)
@@ -8206,7 +8227,7 @@ local function sendMatchReport(report)
             title = isWin and "💚 GARDEN TOWER DEFENSE · VICTORY"
                 or (isLoss and "💔 GARDEN TOWER DEFENSE · DEFEAT" or "⚠️ GARDEN TOWER DEFENSE · MATCH REPORT"),
             description = "🎮 Trận " .. tostring(report.MatchNumber or "?")
-                .. " trong phiên Play Macro · " .. resultLabel,
+                .. " trong phiên theo dõi · " .. resultLabel,
             color = reportColor,
             fields = {
                 { name = "👤 Name", value = tostring(report.Name or "N/A"), inline = true },
@@ -8218,7 +8239,7 @@ local function sendMatchReport(report)
                     .. "\nThay đổi: " .. seedChange, inline = false },
                 { name = "👥 Người chơi sống sót", value = tostring(report.SurvivorSummary or "N/A")
                     .. "\n" .. tostring(report.ParticipantDetails or ""), inline = false },
-                { name = "📊 Thống kê từ lúc Play Macro", value = "Số trận: " .. tostring(report.MatchNumber or 0)
+                { name = "📊 Thống kê phiên theo dõi", value = "Số trận: " .. tostring(report.MatchNumber or 0)
                     .. "\nThắng: " .. tostring(report.Wins or 0)
                     .. " · Thua: " .. tostring(report.Losses or 0), inline = false },
                 { name = "🕒 Giờ Việt Nam (UTC+7)", value = vietnamTime, inline = true },
@@ -8540,6 +8561,7 @@ local MacroEngine = {
     IdMap = {},
     _recordContext = nil,
     _recordEndConnection = nil,
+    _recordBaseHPConnection = nil,
     _recordLegacyTerminalConnection = nil,
     _recordState = "OFF",
     _recordOriginContext = nil,
@@ -8688,7 +8710,8 @@ local function getMacroContext()
         local voteEnd = tonumber(ctx:GetAttribute("DifficultyVoteEnd")) or 0
         score = math.max(score, gst, voteEnd)
         local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-        if endTime <= 0 then score += 10000000000 end
+        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+        if endTime <= 0 and (baseHP == nil or baseHP > 0) then score += 10000000000 end
         if score > bestScore then best, bestScore = ctx, score end
     end
     return best
@@ -8715,7 +8738,8 @@ local function isMacroMatchActive(ctx)
     if not ctx or not ctx.Parent then return false end
     local startStamp = getMacroStartStamp(ctx)
     local endStamp = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-    if startStamp <= 0 or endStamp > 0 then
+    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+    if startStamp <= 0 or endStamp > 0 or (baseHP ~= nil and baseHP <= 0) then
         return false
     end
     return getMacroEntities(ctx) ~= nil
@@ -8745,7 +8769,8 @@ local function getCurrentMacroMatchContext()
     for _, ctx in ipairs(contexts:GetChildren()) do
         local stamp = getMacroStartStamp(ctx)
         local ended = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-        if stamp > 0 and ended <= 0 and stamp > bestStamp then
+        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+        if stamp > 0 and ended <= 0 and (baseHP == nil or baseHP > 0) and stamp > bestStamp then
             best, bestStamp = ctx, stamp
         end
     end
@@ -9658,14 +9683,27 @@ function MatchStatsTracker:StartSession()
             if current and current.Context then
                 local ctx = current.Context
                 local reason = "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal")
+                -- MatchScanner is a result/statistics source only. Macro Record/Replay
+                -- lifecycle is driven by the Context's GameEndTime/BaseHP/ChildRemoved
+                -- signals, matching the CFW lifecycle and avoiding premature transitions
+                -- when a Victory/Defeat UI appears before Context state is finalized.
                 MatchStatsTracker:Finish(ctx, reason)
-                if MacroEngine then MacroEngine:_onMacroMatchEnded(ctx, reason) end
             end
         end
         if not MatchScanner._active then
             MatchScanner:Start(function(snapshot)
                 if not destroyed and api and api.setScannerInfo then api.setScannerInfo(snapshot) end
             end, MatchScanner._onReport)
+        end
+    end
+
+    local contexts = workspace:FindFirstChild("Contexts")
+    if contexts then
+        for _, ctx in ipairs(contexts:GetChildren()) do
+            if isMacroMatchActive(ctx) then
+                self:Begin(ctx)
+                break
+            end
         end
     end
 end
@@ -11017,9 +11055,15 @@ function MacroEngine:_bindMacroLifecycleContext(ctx)
             if self._recordState == "WAITING_FOR_NEXT_MATCH" then
                 self:_tryStartWaitingRecord(ctx)
             end
+            if MatchStatsTracker and MatchStatsTracker.Enabled and isMacroMatchActive(ctx) then
+                MatchStatsTracker:Begin(ctx)
+            end
             local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-            if endTime > 0 or not ctx.Parent then
-                self:_onMacroMatchEnded(ctx, endTime > 0 and "GameEndTime" or "Context removed")
+            local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+            if endTime > 0 or (baseHP ~= nil and baseHP <= 0) or not ctx.Parent then
+                local reason = endTime > 0 and "GameEndTime"
+                    or ((baseHP ~= nil and baseHP <= 0) and "BaseHP_1" or "Context removed")
+                self:_onMacroMatchEnded(ctx, reason)
             elseif self._autoRepeatArmed and self._waitingNextMatch then
                 self:_onNewMatchStarted(ctx)
             end
@@ -11033,6 +11077,7 @@ function MacroEngine:_bindMacroLifecycleContext(ctx)
     end
     addConnection(ctx:GetAttributeChangedSignal("GameStartTime"):Connect(evaluate))
     addConnection(ctx:GetAttributeChangedSignal("GameEndTime"):Connect(evaluate))
+    addConnection(ctx:GetAttributeChangedSignal("BaseHP_1"):Connect(evaluate))
     addConnection(ctx.DescendantAdded:Connect(function(descendant)
         if descendant.Name == "Entities" then evaluate() end
     end))
@@ -11100,11 +11145,15 @@ function MacroEngine:_tryStartWaitingRecord(ctx)
 
     local origin = self._recordOriginContext
     if origin then
-        local sameContextRestarted = ctx == origin
-            and getMacroStartStamp(ctx) ~= self._recordOriginStartStamp
-        if not sameContextRestarted then
+        local ctxStartStamp = getMacroStartStamp(ctx)
+        local originStartStamp = tonumber(self._recordOriginStartStamp) or getMacroStartStamp(origin)
+        local sameContextRestarted = ctx == origin and ctxStartStamp ~= originStartStamp
+        local newerContextStarted = ctx ~= origin and ctxStartStamp > originStartStamp
+        if not sameContextRestarted and not newerContextStarted then
             local originEnd = tonumber(origin:GetAttribute("GameEndTime")) or 0
-            local originEnded = self._recordOriginEnded or originEnd > 0 or not origin.Parent
+            local originHP = tonumber(origin:GetAttribute("BaseHP_1"))
+            local originEnded = self._recordOriginEnded or originEnd > 0
+                or (originHP ~= nil and originHP <= 0) or not origin.Parent
             if not originEnded then return false end
             if ctx == origin then return false end
         end
@@ -11116,6 +11165,7 @@ end
 
 function MacroEngine:_activateRecordForContext(ctx)
     if self._recordState ~= "WAITING_FOR_NEXT_MATCH" or not isMacroMatchActive(ctx) then return false end
+    self._recordWaitGeneration = (tonumber(self._recordWaitGeneration) or 0) + 1
     self._recordState = "RECORDING"
     self._recordContext = ctx
     startMacroGameClock(ctx)
@@ -11152,6 +11202,10 @@ function MacroEngine:_activateRecordForContext(ctx)
     self:_startObserver(ctx)
 
     if self._recordEndConnection then pcall(function() self._recordEndConnection:Disconnect() end) end
+    if self._recordBaseHPConnection then
+        pcall(function() self._recordBaseHPConnection:Disconnect() end)
+        self._recordBaseHPConnection = nil
+    end
     if self._recordLegacyTerminalConnection then
         pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
         self._recordLegacyTerminalConnection = nil
@@ -11159,7 +11213,22 @@ function MacroEngine:_activateRecordForContext(ctx)
     self._recordEndConnection = ctx:GetAttributeChangedSignal("GameEndTime"):Connect(function()
         local ended = tonumber(ctx:GetAttribute("GameEndTime")) or 0
         if ended > 0 and self._recordState == "RECORDING" and self._recordContext == ctx then
-            task.spawn(function() self:_saveRecord("trận kết thúc") end)
+            task.spawn(function() self:_saveRecord("trận kết thúc · GameEndTime") end)
+        end
+    end)
+    -- CFW parity: một số lượt chơi kết thúc bằng BaseHP_1 = 0 trước khi GameEndTime cập nhật.
+    self._recordBaseHPConnection = ctx:GetAttributeChangedSignal("BaseHP_1"):Connect(function()
+        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+        if baseHP and baseHP <= 0 and self._recordState == "RECORDING" and self._recordContext == ctx then
+            task.delay(0.35, function()
+                if self._recordState == "RECORDING" and self._recordContext == ctx then
+                    local ended = tonumber(ctx:GetAttribute("GameEndTime")) or 0
+                    local currentHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+                    if ended > 0 or (currentHP ~= nil and currentHP <= 0) then
+                        self:_saveRecord("Base HP về 0 / trận kết thúc")
+                    end
+                end
+            end)
         end
     end)
 
@@ -11223,6 +11292,7 @@ function MacroEngine:_saveRecord(reason)
         self._saveQueued = false
         self:_stopObserver()
         if self._recordEndConnection then pcall(function() self._recordEndConnection:Disconnect() end); self._recordEndConnection = nil end
+        if self._recordBaseHPConnection then pcall(function() self._recordBaseHPConnection:Disconnect() end); self._recordBaseHPConnection = nil end
         if self._recordLegacyTerminalConnection then pcall(function() self._recordLegacyTerminalConnection:Disconnect() end); self._recordLegacyTerminalConnection = nil end
         if not self._autoRepeatArmed then self:_disconnectMacroLifecycleWatchers() end
         if api then api.setMacroRecordUI(false, true) end
@@ -11397,6 +11467,10 @@ function MacroEngine:_saveRecord(reason)
         pcall(function() self._recordEndConnection:Disconnect() end)
         self._recordEndConnection = nil
     end
+    if self._recordBaseHPConnection then
+        pcall(function() self._recordBaseHPConnection:Disconnect() end)
+        self._recordBaseHPConnection = nil
+    end
     if self._recordLegacyTerminalConnection then
         pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
         self._recordLegacyTerminalConnection = nil
@@ -11499,11 +11573,70 @@ function MacroEngine:StartRecord()
     self._saveQueued = false
     self._savingRecord = false
 
-    self:_ensureMacroLifecycleWatchers()
-    if api then
-        api.setMacroRecordUI(true, true)
-        api.setMacroStatus("WAITING FOR NEXT MATCH · Đã chuẩn bị Record. Đang chờ trận tiếp theo...", true)
+    self._recordWaitGeneration = (tonumber(self._recordWaitGeneration) or 0) + 1
+    local waitGeneration = self._recordWaitGeneration
+
+    local watcherOK, watcherError = pcall(function()
+        self:_ensureMacroLifecycleWatchers()
+    end)
+    if not watcherOK then
+        self._recordWaitGeneration = self._recordWaitGeneration + 1
+        self._recordState = "OFF"
+        self._recordKey = nil
+        self._recordOriginContext = nil
+        self._recordOriginStartStamp = nil
+        self._recordOriginEnded = false
+        self.Recording = false
+        if api and api.setMacroStatus then
+            pcall(api.setMacroStatus, "RECORD SETUP FAILED · " .. tostring(watcherError), false)
+        end
+        return false, "Không khởi tạo được watcher chuyển trận: " .. tostring(watcherError)
     end
+    if api then
+        if api.setMacroRecordUI then pcall(api.setMacroRecordUI, true, true) end
+        if api.setMacroStatus then
+            pcall(api.setMacroStatus,
+                "WAITING FOR NEXT MATCH · Record đã được kích hoạt. Đang chờ trận kế tiếp...", true)
+        end
+        if api.notify then
+            pcall(api.notify, "Record đã bật · đang chờ trận kế tiếp",
+                Color3.fromRGB(50, 200, 110), "RECORD ARMED")
+        end
+    end
+
+    -- CFW giữ watcher theo Context/Attribute. Bổ sung polling dự phòng để không bỏ lỡ
+    -- Context được tạo trước khi kết nối kịp hoặc attribute không phát Changed signal.
+    task.spawn(function()
+        local lastStatusAt = 0
+        while not destroyed
+            and waitGeneration == self._recordWaitGeneration
+            and self._recordState == "WAITING_FOR_NEXT_MATCH" do
+            local ok, err = pcall(function()
+                self:_ensureMacroLifecycleWatchers()
+                local contexts = workspace:FindFirstChild("Contexts")
+                if contexts then
+                    for _, ctx in ipairs(contexts:GetChildren()) do
+                        if self._recordState ~= "WAITING_FOR_NEXT_MATCH" then break end
+                        self:_tryStartWaitingRecord(ctx)
+                    end
+                else
+                    local active = getActiveMacroMatchContext()
+                    if active then self:_tryStartWaitingRecord(active) end
+                end
+            end)
+            if not ok then
+                self:_diag("RECORD", "Wait-next-match poll error: " .. tostring(err))
+                if api then pcall(api.setMacroStatus, "RECORD WAIT ERROR · " .. tostring(err), false) end
+            elseif api and os.clock() - lastStatusAt >= 3
+                and self._recordState == "WAITING_FOR_NEXT_MATCH" then
+                lastStatusAt = os.clock()
+                pcall(api.setMacroStatus,
+                    "WAITING FOR NEXT MATCH · Đã bật Record · đang theo dõi trận hiện tại và chờ trận mới.",
+                    true)
+            end
+            task.wait(0.5)
+        end
+    end)
 
     -- Không kích hoạt Record trong trận đang diễn ra tại thời điểm bấm.
     -- Nếu đang ở Lobby, context trận sắp tới sẽ tự kích hoạt khi GameStartTime > 0.
@@ -11512,6 +11645,7 @@ end
 
 function MacroEngine:StopRecord(reason)
     if self._recordState == "WAITING_FOR_NEXT_MATCH" then
+        self._recordWaitGeneration = (tonumber(self._recordWaitGeneration) or 0) + 1
         self._recordState = "OFF"
         self._recordKey = nil
         self._recordOriginContext = nil
@@ -12754,7 +12888,8 @@ end
 local function isMacroContextEnded(ctx)
     if not ctx then return false end
     local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-    return endTime > 0 or not ctx.Parent
+    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+    return endTime > 0 or (baseHP ~= nil and baseHP <= 0) or not ctx.Parent
 end
 
 local function waitMacroTime(targetTime, ctx, token)
@@ -13850,10 +13985,18 @@ function MacroEngine:_onNewMatchStarted(ctx)
     local startStamp = getMacroStartStamp(ctx)
     local origin = self._playOriginContext
     if origin then
-        local originEnd = tonumber(origin:GetAttribute("GameEndTime")) or 0
-        local originEnded = self._playOriginEnded or originEnd > 0 or not origin.Parent
-        local sameOriginRun = ctx == origin and startStamp == self._playOriginStartStamp
-        if sameOriginRun or not originEnded then return end
+        local originStartStamp = tonumber(self._playOriginStartStamp) or getMacroStartStamp(origin)
+        local sameOriginRun = ctx == origin and startStamp == originStartStamp
+        local sameContextRestarted = ctx == origin and startStamp ~= originStartStamp
+        local newerContextStarted = ctx ~= origin and startStamp > originStartStamp
+        if sameOriginRun then return end
+        if not sameContextRestarted and not newerContextStarted then
+            local originEnd = tonumber(origin:GetAttribute("GameEndTime")) or 0
+            local originHP = tonumber(origin:GetAttribute("BaseHP_1"))
+            local originEnded = self._playOriginEnded or originEnd > 0
+                or (originHP ~= nil and originHP <= 0) or not origin.Parent
+            if not originEnded then return end
+        end
     end
     if self._lastReplayContext == ctx and self._lastReplayStartStamp == startStamp then return end
 
@@ -13873,10 +14016,11 @@ function MacroEngine:_onNewMatchStarted(ctx)
     end)
 end
 
-function MacroEngine:_queueAutoRestart(ctx)
+function MacroEngine:_queueAutoRestart(ctx, allowBaseZero)
     if not self.AutoPlayAgainEnabled or not ctx or self._restartRequested[ctx] then return end
     local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-    if endTime <= 0 then return end
+    local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+    if endTime <= 0 and not (allowBaseZero and baseHP and baseHP <= 0) then return end
     self._restartRequested[ctx] = true
 
     -- Match lifecycle cleanup is independent of the optional RestartGame request.
@@ -13965,10 +14109,21 @@ function MacroEngine:_bindRestartContext(ctx)
     local startConnection = ctx:GetAttributeChangedSignal("GameStartTime"):Connect(function()
         task.defer(function() self:_onNewMatchStarted(ctx) end)
     end)
+    local baseConnection = ctx:GetAttributeChangedSignal("BaseHP_1"):Connect(function()
+        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
+        if baseHP and baseHP <= 0 then
+            task.delay(0.35, function()
+                if self.AutoPlayAgainEnabled and ctx.Parent then self:_queueAutoRestart(ctx, true) end
+            end)
+        end
+    end)
     table.insert(self._restartWatchConnections, endConnection)
     table.insert(self._restartWatchConnections, startConnection)
+    table.insert(self._restartWatchConnections, baseConnection)
     if (tonumber(ctx:GetAttribute("GameEndTime")) or 0) > 0 then
         self:_queueAutoRestart(ctx)
+    elseif (tonumber(ctx:GetAttribute("BaseHP_1")) or math.huge) <= 0 then
+        self:_queueAutoRestart(ctx, true)
     elseif self._waitingNextMatch then
         self:_onNewMatchStarted(ctx)
     end
@@ -14022,7 +14177,12 @@ function MacroEngine:SetAutoPlayAgain(enabled)
     end
     if activeContext then
         local ended = tonumber(activeContext:GetAttribute("GameEndTime")) or 0
-        if ended > 0 then self:_queueAutoRestart(activeContext) end
+        local baseHP = tonumber(activeContext:GetAttribute("BaseHP_1"))
+        if ended > 0 then
+            self:_queueAutoRestart(activeContext)
+        elseif baseHP and baseHP <= 0 then
+            self:_queueAutoRestart(activeContext, true)
+        end
     end
     return true, "Auto Play Again đã bật để yêu cầu trận mới. Macro Repeat tự quản lý việc chạy lại khi phát hiện trận mới."
 end
@@ -14151,6 +14311,9 @@ function MacroEngine:Destroy()
     stopMacroGameClock()
 
     self.AutoDifficultyEnabled = false
+    self._difficultyAttempted = false
+    self._difficultyAttempts = 0
+    self._difficultyRetryAt = 0
     self.AutoPlayAgainEnabled = false
     self:_disconnectMacroLifecycleWatchers()
     self:_disconnectRestartWatchers()
@@ -14159,6 +14322,10 @@ function MacroEngine:Destroy()
     if self._recordEndConnection then
         pcall(function() self._recordEndConnection:Disconnect() end)
         self._recordEndConnection = nil
+    end
+    if self._recordBaseHPConnection then
+        pcall(function() self._recordBaseHPConnection:Disconnect() end)
+        self._recordBaseHPConnection = nil
     end
     if self._recordLegacyTerminalConnection then
         pcall(function() self._recordLegacyTerminalConnection:Disconnect() end)
@@ -14216,11 +14383,13 @@ callbacks.onMacroPlayChanged = function(enabled)
             return false, "Record đang lưu JSON. Hãy đợi lưu xong rồi bật Play Macro."
         end
         local ok, message = MacroEngine:StartPlay()
-        if ok and MatchStatsTracker then MatchStatsTracker:StartSession() end
+        if ok and MatchStatsTracker and not MatchStatsTracker.Enabled then
+            MatchStatsTracker:StartSession()
+        end
         return ok, message
     end
     local ok, message = MacroEngine:StopPlay("người dùng tắt Play Macro")
-    if MatchStatsTracker then MatchStatsTracker:StopArming() end
+    if MatchStatsTracker and not savedWebhookUrl then MatchStatsTracker:StopArming() end
     return ok, message
 end
 
@@ -14861,15 +15030,18 @@ callbacks.onConfigureWebhook = function(url)
         local saveOK, saveMessage = persistWebhookUrl(url)
         if not saveOK then return false, saveMessage end
         savedWebhookUrl = url
-        return true, "Da luu Discord link tren may; lan sau se tu nap lai."
+        if MatchStatsTracker and not MatchStatsTracker.Enabled then MatchStatsTracker:StartSession() end
+        return true, "Da luu Discord link tren may; tu dong theo doi va gui bao cao WIN/LOSS."
     end
 
     savedWebhookUrl = url
-    return true, "Da luu trong phien nay; executor khong ho tro luu link qua lan chay sau."
+    if MatchStatsTracker and not MatchStatsTracker.Enabled then MatchStatsTracker:StartSession() end
+    return true, "Da luu trong phien nay; tu dong theo doi va gui bao cao WIN/LOSS."
 end
 
 callbacks.onResetWebhook = function()
     savedWebhookUrl = nil
+    if MatchStatsTracker then MatchStatsTracker:StopArming() end
     local cleared, message = clearPersistedWebhookUrl()
     return cleared, message
 end
@@ -14961,6 +15133,9 @@ end, function(scannerReport)
             "MatchScanner: " .. tostring(scannerReport and scannerReport.Result or "terminal"))
     end
 end)
+if savedWebhookUrl and MatchStatsTracker then
+    MatchStatsTracker:StartSession()
+end
 api.setScannerInfo(MatchScanner:GetSnapshot())
 
 -- ============================================================
