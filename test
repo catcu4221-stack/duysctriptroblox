@@ -1,6 +1,7 @@
 --[[
-    TREOST EVADE HYBRID - V1.6
-    AutoDifficulty block is transplanted verbatim from CFW_GOC.
+    TREOST EVADE HYBRID - V1.7
+    AutoDifficulty controller and UI callback are transplanted verbatim from the user-supplied cfw(1).txt.
+    Startup isolation prevents TREOST/Auto Ability setup errors from suppressing the CFW watcher.
     TREOST remains the base for the original Smart Evade engine and persistent ObstacleMemory.
     Selected CFW components are integrated without replacing the TREOST evade algorithms.
 
@@ -6851,17 +6852,9 @@ do
                     or ("Auto Difficulty enabled: Level " .. tostring(selectedDifficultyLevel) .. " will be selected when the level screen appears."))
                 or (uiLanguage == "VI" and "Đã tắt Auto Difficulty." or "Auto Difficulty disabled.")
             if callbacks.onAutoDifficultyChanged then
-                local callOK, result, detail = pcall(callbacks.onAutoDifficultyChanged, enabled)
-                if callOK then
-                    ok, message = result == true, detail
-                else
-                    ok, message = false, "Auto Difficulty callback error: " .. tostring(result)
-                end
+                ok, message = callbacks.onAutoDifficultyChanged(enabled)
             end
             if not ok then autoDifficultySetter(false, true) end
-            if api and api.setMacroStatus then
-                pcall(api.setMacroStatus, tostring(message or "Auto Difficulty updated."), ok)
-            end
             setStatus(message, ok and C.GREEN or C.YELLOW)
         end)
         local autoPlayAgainSetter, getAutoPlayAgain
@@ -8710,8 +8703,8 @@ local function getMacroContext()
         local voteEnd = tonumber(ctx:GetAttribute("DifficultyVoteEnd")) or 0
         score = math.max(score, gst, voteEnd)
         local endTime = tonumber(ctx:GetAttribute("GameEndTime")) or 0
-        local baseHP = tonumber(ctx:GetAttribute("BaseHP_1"))
-        if endTime <= 0 and (baseHP == nil or baseHP > 0) then score += 10000000000 end
+        local hp = tonumber(ctx:GetAttribute("BaseHP_1"))
+        if endTime <= 0 and (hp == nil or hp > 0) then score += 10000000000 end
         if score > bestScore then best, bestScore = ctx, score end
     end
     return best
@@ -15065,8 +15058,15 @@ end
 SaveManager:Init()
 MacroStore:Init()
 api = GUI:Build(callbacks)
-Treost.setLabels(api.getEvadeLabels())
-Treost.updateMemoryLabel()
+local treostLabelBridgeOK, treostLabelBridgeError = pcall(function()
+    local statusLabel, memoryLabel = api.getEvadeLabels()
+    Treost.setLabels(statusLabel, memoryLabel)
+    Treost.updateMemoryLabel()
+end)
+if not treostLabelBridgeOK then
+    warn("[TREOST HYBRID] Evade label bridge error (Macro startup will continue): "
+        .. tostring(treostLabelBridgeError))
+end
 
 api.setMacroStatus("Đang khởi tạo Macro Engine...", true)
 api.setWebhookStatus(
@@ -15081,16 +15081,45 @@ task.defer(function()
     -- Một số server dựng RemoteFunctions chậm sau khi GUI đã hiện; thử lại tối đa 10 giây.
     for attempt = 1, 20 do
         if destroyed then return end
-        macroInitOK, macroInitMessage = MacroEngine:Init()
+        local callOK, initOK, initMessage = pcall(function()
+            return MacroEngine:Init()
+        end)
+        if callOK then
+            macroInitOK, macroInitMessage = initOK == true, initMessage
+        else
+            macroInitOK = false
+            macroInitMessage = "MacroEngine:Init exception: " .. tostring(initOK)
+            warn("[TREOST HYBRID] " .. macroInitMessage)
+        end
         if macroInitOK then break end
         task.wait(0.5)
     end
     if destroyed then return end
     pcall(function() MacroEngine:_ensureMacroLifecycleWatchers() end)
-    AutoAbilityController:Start()
-    MacroEngine:StartDifficultyWatcher()
-    if not macroInitOK then
-        api.setMacroStatus("Macro chưa sẵn sàng: " .. tostring(macroInitMessage), false)
+
+    local autoAbilityOK, autoAbilityError = pcall(function()
+        AutoAbilityController:Start()
+    end)
+    if not autoAbilityOK then
+        warn("[TREOST HYBRID] Auto Ability startup error (AutoDifficulty will still start): "
+            .. tostring(autoAbilityError))
+    end
+
+    local difficultyWatcherOK, difficultyWatcherError = pcall(function()
+        MacroEngine:StartDifficultyWatcher()
+    end)
+    if not difficultyWatcherOK then
+        warn("[TREOST HYBRID] AutoDifficulty watcher startup error: " .. tostring(difficultyWatcherError))
+    end
+
+    if not difficultyWatcherOK then
+        api.setMacroStatus("AutoDifficulty watcher chưa khởi động: " .. tostring(difficultyWatcherError), false)
+    elseif not macroInitOK then
+        api.setMacroStatus("Macro chưa sẵn sàng: " .. tostring(macroInitMessage)
+            .. " · AutoDifficulty watcher đã khởi động; Remote/Context cần được kiểm tra.", false)
+    elseif not autoAbilityOK then
+        api.setMacroStatus("Macro đã khởi tạo; Auto Ability lỗi: " .. tostring(autoAbilityError)
+            .. " · AutoDifficulty watcher vẫn đang chạy.", false)
     else
         api.setMacroStatus(macroInitMessage, MacroEngine._recordHookReady)
     end
