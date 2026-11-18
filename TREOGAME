@@ -3157,11 +3157,11 @@ do
             TextColor = C.RED,
         })
 
-        local logo = makeButton(screen, "CFW", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
-            TextSize = 14,
+        local logo = makeButton(screen, "福维", UDim2.new(0, 22, 0.5, -27), UDim2.new(0, 54, 0, 54), {
+            TextSize = 12,
             Background = Color3.fromRGB(18, 39, 70),
             TextColor = C.ACCENT,
-            Radius = 27,
+            Radius = 23,
         })
         logo.Visible = false
 
@@ -5356,7 +5356,7 @@ local function sendMatchReport(report)
                     .. " · Thua: " .. tostring(report.Losses or 0), inline = false },
                 { name = "🕒 Giờ Việt Nam (UTC+7)", value = vietnamTime, inline = true },
             },
-            footer = { text = "DUY TARGET FIRST · Garden Tower Defense Auto Report" },
+            footer = { text = "Garden Tower Defense Auto Report" },
         }},
     }
     task.spawn(function()
