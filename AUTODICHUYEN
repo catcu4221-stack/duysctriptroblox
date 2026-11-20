@@ -1870,6 +1870,7 @@ local PlayerController = {
     _speed = 1,
     _noclip = false,
     _noclipConnection = nil,
+    _noclipPartConnection = nil,
     _originalCollision = {},
     _originalWalkSpeedByHumanoid = setmetatable({}, { __mode = "k" }),
     _characterAddedConnection = nil,
@@ -1933,25 +1934,91 @@ do
         return self._speed
     end
 
+    -- Nếu nhân vật đang nằm trong vật cản khi tắt Noclip thì đẩy lên cao tới chỗ trống để không bị kẹt.
+    local function unstickCharacter()
+        local character = getCharacter()
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+        pcall(function()
+            local params = OverlapParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = { character }
+            local boxCFrame, boxSize = character:GetBoundingBox()
+            -- Thu nhỏ hộp một chút để mặt sàn đang đứng không bị tính là vật cản.
+            boxSize = Vector3.new(math.max(0.5, boxSize.X - 0.6), math.max(0.5, boxSize.Y - 0.8), math.max(0.5, boxSize.Z - 0.6))
+            local function blockedAt(offsetY)
+                local hits = workspace:GetPartBoundsInBox(boxCFrame + Vector3.new(0, offsetY, 0), boxSize, params)
+                for _, hit in ipairs(hits) do
+                    if hit.CanCollide then return true end
+                end
+                return false
+            end
+            if not blockedAt(0) then return end
+            for offset = 2, 300, 2 do
+                if not blockedAt(offset) then
+                    root.CFrame = root.CFrame + Vector3.new(0, offset + 1, 0)
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                    return
+                end
+            end
+        end)
+    end
+
     function PlayerController:SetNoclip(enabled)
-        self._noclip = enabled == true
+        enabled = enabled == true
+        self._noclip = enabled
 
         if self._noclipConnection then
             self._noclipConnection:Disconnect()
             self._noclipConnection = nil
         end
+        if self._noclipPartConnection then
+            self._noclipPartConnection:Disconnect()
+            self._noclipPartConnection = nil
+        end
 
-        if self._noclip then
-            self._noclipConnection = RunService.Stepped:Connect(function()
-                local character = getCharacter()
-                if not character then return end
-                for _, part in ipairs(character:GetDescendants()) do
-                    if part:IsA("BasePart") then
-                        rememberAndDisable(part)
+        if enabled then
+            -- Cache danh sách Part của nhân vật; không GetDescendants() mỗi bước vật lý (giảm lag).
+            local cachedCharacter, parts = nil, {}
+            local function track(character)
+                if self._noclipPartConnection then
+                    self._noclipPartConnection:Disconnect()
+                    self._noclipPartConnection = nil
+                end
+                cachedCharacter = character
+                parts = {}
+                for _, descendant in ipairs(character:GetDescendants()) do
+                    if descendant:IsA("BasePart") then
+                        parts[#parts + 1] = descendant
+                        rememberAndDisable(descendant)
                     end
                 end
-            end)
+                self._noclipPartConnection = character.DescendantAdded:Connect(function(descendant)
+                    if descendant:IsA("BasePart") then
+                        parts[#parts + 1] = descendant
+                        rememberAndDisable(descendant)
+                    end
+                end)
+            end
+            local function step()
+                local character = getCharacter()
+                if not character then return end
+                if character ~= cachedCharacter then track(character) end
+                for index = #parts, 1, -1 do
+                    local part = parts[index]
+                    if part.Parent then
+                        if part.CanCollide then rememberAndDisable(part) end
+                    else
+                        table.remove(parts, index)
+                    end
+                end
+            end
+            step() -- áp dụng ngay lập tức, không chờ khung hình kế tiếp
+            -- Stepped chạy TRƯỚC mô phỏng vật lý nên CanCollide=false có hiệu lực ngay trong cùng bước.
+            self._noclipConnection = RunService.Stepped:Connect(step)
         else
+            unstickCharacter()
             restoreCollision()
         end
     end
@@ -2261,6 +2328,19 @@ do
         return current, maximum
     end
 
+    -- Setup Skip: đọc Wave KHÔNG giới hạn 40 (ví dụ Wave 41, 100...). Không ảnh hưởng parseWave cũ.
+    local function parseWaveAny(text, instance)
+        if typeof(text) ~= "string" then return nil end
+        local clean = stripRichText(text)
+        local current = clean:match("[Ww]ave%s*:?%s*(%d+)%s*/%s*%d+")
+        if not current and instance and string.find(string.lower(instance.Name), "wave", 1, true) then
+            current = clean:match("[Ww]ave%s*:?%s*(%d+)")
+        end
+        current = tonumber(current)
+        if current and current >= 1 and current < 1000000 then return current end
+        return nil
+    end
+
     local function isDefeatText(text)
         local clean = string.lower(stripRichText(text))
         return clean:match("%f[%a]defeat%f[%A]") ~= nil
@@ -2428,6 +2508,11 @@ do
             self._handledTerminalText[instance] = nil
         end
 
+        if string.find(lowered, "wave", 1, true) then
+            local anyWave = parseWaveAny(text, instance)
+            if anyWave and isVisible(instance) then self.SkipWave = anyWave end
+        end
+
         -- Chi xu ly chuoi co tu Wave; bo qua Night 6 va cac so UI khac.
         if string.find(lowered, "wave", 1, true)
             or (CONFIG.WAVE_LABEL_NAME and instance.Name == CONFIG.WAVE_LABEL_NAME) then
@@ -2477,6 +2562,7 @@ do
     function MatchScanner:Reset()
         self.CurrentMatch = 1
         self.CurrentWave = nil
+        self.SkipWave = nil
         self.MaxWave = 40
         self.Result = "IN PROGRESS"
         self.WaveSource = "WAITING FOR WAVE UI"
@@ -2588,6 +2674,7 @@ do
             MatchNumber = self.CurrentMatch,
             Result = self.Result,
             Wave = self.CurrentWave,
+            WaveAny = self.SkipWave or self.CurrentWave,
             MaxWave = self.MaxWave,
             WaveSource = self.WaveSource,
             DefeatVisible = self.DefeatVisible,
@@ -4918,9 +5005,10 @@ local WaypointRuntime = {
     PausedTargetIndex = nil,
     Moving = false,
     ManualOverride = false,
-    ScanRadius = 40,
+    ScanRadius = 60,
     WaveThreshold = 0, -- 0 = không tự chuyển theo Wave
     OverWave = false, -- true = ở mãi chế độ Waypoint, bỏ qua ngưỡng Wave (kể cả Wave > 50)
+    AutoAround = false, -- true = chạy liên tục giữa các Point, không chờ phát hiện quái
     LastStartedMatch = 1,
 }
 
@@ -5103,7 +5191,8 @@ local function updateWaypointMovement(humanoid, root, enemies)
         end
     end
 
-    if not enemyInRange then
+    -- AUTO AROUND: bỏ qua điều kiện "phải có quái trong phạm vi"; tới Point nào là đi tiếp Point kế tiếp ngay.
+    if not enemyInRange and not WaypointRuntime.AutoAround then
         setEvadeStatus("Waypoint: đang chờ tại Point " .. tostring(WaypointRuntime.CurrentIndex)
             .. " · phạm vi " .. tostring(radius) .. " studs", Color3.fromRGB(100, 255, 140))
         return true
@@ -5117,8 +5206,12 @@ local function updateWaypointMovement(humanoid, root, enemies)
     AppState.WaypointMoveExpected = true
     AppState.WaypointGoalPosition = nextPoint
     humanoid:MoveTo(nextPoint) -- Đi thẳng tới tọa độ, không dùng né quái/pathfinding.
-    setEvadeStatus("Có địch trong " .. tostring(radius) .. " studs · đi Point " .. tostring(nextIndex),
-        Color3.fromRGB(255, 190, 90))
+    if enemyInRange or not WaypointRuntime.AutoAround then
+        setEvadeStatus("Có địch trong " .. tostring(radius) .. " studs · đi Point " .. tostring(nextIndex),
+            Color3.fromRGB(255, 190, 90))
+    else
+        setEvadeStatus("Auto Around: đi liên tục · Point " .. tostring(nextIndex), Color3.fromRGB(255, 190, 90))
+    end
     return true
 end
 
@@ -5832,7 +5925,7 @@ Treost = {
     WaypointRuntime = {
         Enabled = false, AutoEvadeEnabled = false, AutoSwitchedToOriginal = false,
         Points = {}, CurrentIndex = 1, TargetIndex = nil, PausedTargetIndex = nil,
-        Moving = false, ManualOverride = false, ScanRadius = 40, WaveThreshold = 0, OverWave = false,
+        Moving = false, ManualOverride = false, ScanRadius = 60, WaveThreshold = 0, OverWave = false, AutoAround = false,
     },
     setLabels = function() end,
     updateMemoryLabel = function() end,
@@ -7013,6 +7106,35 @@ do
             TextSize = 7, Color = C.YELLOW,
         })
 
+        -- NOCLIP: xuyên vật cản tức thì (backend PlayerController:SetNoclip); tắt thì tự gỡ kẹt.
+        local noclipSetter
+        do
+            local movementPanel = newInstance("Frame", {
+                Position = UDim2.new(0, 12, 0, 208),
+                Size = UDim2.new(0.48, -8, 0, 96),
+                BackgroundColor3 = C.INPUT,
+                BorderSizePixel = 0,
+            }, globalPanel)
+            addCorner(movementPanel, 9)
+            addStroke(movementPanel, Color3.fromRGB(132, 22, 44), 1)
+            makeLabel(movementPanel, "MOVEMENT", UDim2.new(0, 10, 0, 8), UDim2.new(1, -20, 0, 20), {
+                Font = Enum.Font.GothamBold, TextSize = 10, Color = C.ACCENT,
+            })
+            noclipSetter = makeToggle(movementPanel, "NOCLIP", UDim2.new(0, 10, 0, 34), function(enabled)
+                local message = enabled
+                    and "Noclip BẬT: xuyên vật cản ngay lập tức."
+                    or "Noclip TẮT: đã khôi phục va chạm và gỡ kẹt nếu đang nằm trong vật cản."
+                if callbacks.onNoclip then
+                    local callOK, err = pcall(callbacks.onNoclip, enabled)
+                    if not callOK then return false, "Noclip lỗi: " .. tostring(err) end
+                end
+                setStatus(message, C.GREEN)
+                return true, message
+            end)
+            makeLabel(movementPanel, "Tắt Noclip khi đang nằm trong tường: nhân vật tự được đẩy lên chỗ trống.",
+                UDim2.new(0, 10, 0, 66), UDim2.new(1, -20, 0, 26), { TextSize = 8, Color = C.DIM, Wrapped = true })
+        end
+
         local automationPanel = newInstance("Frame", {
             Position = UDim2.new(0.50, 0, 0, 72),
             Size = UDim2.new(0.50, -12, 0, 360),
@@ -7104,6 +7226,7 @@ do
             setStatus(message, ok and C.GREEN or C.YELLOW)
             return ok, message
         end)
+        local skipCtl = { lastMatch = nil, lastWave = nil } -- trạng thái Setup Skip (tab Evade)
         local autoSkipSetter, getAutoSkip
         autoSkipSetter, getAutoSkip = makeToggle(automationPanel, "AUTO SKIP", UDim2.new(0, 10, 0, 273), function(enabled)
             local ok, message
@@ -7113,6 +7236,8 @@ do
                 ok, message = false, uiLanguage == "VI" and "Auto Skip Remote chưa được nối." or "Auto Skip Remote is not connected."
             end
             setStatus(message, ok and C.GREEN or C.YELLOW)
+            -- Người chơi tự đổi Auto Skip: Setup Skip nhường quyền và tính lại mốc đợt từ Wave hiện tại.
+            if ok and skipCtl.onManual then pcall(skipCtl.onManual, enabled) end
             return ok, message
         end)
 
@@ -7504,7 +7629,7 @@ do
 
         local evadeRight = newInstance("Frame", {
             Position = evadeStackLayout and UDim2.new(0, 9, 0, 380) or UDim2.new(0.54, 2, 0, 9),
-            Size = evadeStackLayout and UDim2.new(1, -18, 0, 360) or UDim2.new(0.46, -12, 0, 440),
+            Size = evadeStackLayout and UDim2.new(1, -18, 0, 420) or UDim2.new(0.46, -12, 0, 440),
             BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
         }, evadeTab)
         addCorner(evadeRight, 10)
@@ -7526,7 +7651,7 @@ do
             return ok, message
         end)
         makeLabel(evadeRight, "WAYPOINT ENEMY RANGE (STUDS)", UDim2.new(0, 10, 0, 81), UDim2.new(1, -20, 0, 17), { TextSize = 8, Color = C.DIM })
-        local waypointRadiusBox = makeTextBox(evadeRight, "40", UDim2.new(0, 10, 0, 101), UDim2.new(1, -20, 0, 27))
+        local waypointRadiusBox = makeTextBox(evadeRight, "60", UDim2.new(0, 10, 0, 101), UDim2.new(1, -20, 0, 27))
         makeLabel(evadeRight, "WAVE ĐỂ THOÁT WAYPOINT (0 = TẮT)", UDim2.new(0, 10, 0, 137), UDim2.new(1, -20, 0, 17), { TextSize = 8, Color = C.DIM })
         local waveThresholdBox = makeTextBox(evadeRight, "0", UDim2.new(0, 10, 0, 157), UDim2.new(1, -20, 0, 27))
         makeLabel(evadeRight, "Giới hạn Wave: 0–50 · Smart Evade gốc: 25 studs",
@@ -7555,18 +7680,212 @@ do
             makeLabel(evadeRight, "Bật: ở mãi chế độ Waypoint, không thoát sang Smart Evade dù Wave 1000+.",
                 UDim2.new(0, 10, 0, 251), UDim2.new(1, -20, 0, 26), { TextSize = 8, Color = C.YELLOW, Wrapped = true })
         end
+        -- AUTO AROUND: chỉ có tác dụng khi AUTO EVADE (Waypoint) đang bật. Bật thì chạy liên tục
+        -- A → B → ... không chờ phát hiện quái; tắt thì quay lại kiểu cũ (chờ quái vào phạm vi mới đi).
+        do
+            makeToggle(evadeRight, "AUTO AROUND", UDim2.new(0, 10, 0, 282), function(enabled)
+                enabled = enabled == true
+                Treost.WaypointRuntime.AutoAround = enabled
+                local message = enabled
+                    and "AUTO AROUND BẬT: Waypoint chạy liên tục giữa các Point, không chờ quái."
+                    or "AUTO AROUND TẮT: Waypoint chỉ di chuyển khi phát hiện quái."
+                evadeFileOperationLabel.Text = message
+                evadeFileOperationLabel.TextColor3 = enabled and C.GREEN or C.YELLOW
+                return true, message
+            end)
+            makeLabel(evadeRight, "Bật cùng AUTO EVADE: chạy vòng liên tục Point A → B thay vì chờ phát hiện quái.",
+                UDim2.new(0, 10, 0, 312), UDim2.new(1, -20, 0, 26), { TextSize = 8, Color = C.YELLOW, Wrapped = true })
+        end
         local evadeModeStatus = makeLabel(evadeRight, "MODE: OFF",
-            UDim2.new(0, 10, 0, 282), UDim2.new(1, -20, 0, 40), { TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top })
+            UDim2.new(0, 10, 0, 343), UDim2.new(1, -20, 0, 40), { TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top })
         local evadeMemoryStatus = makeLabel(evadeRight, "Vùng cấm: --",
-            UDim2.new(0, 10, 0, 325), UDim2.new(1, -20, 0, 20), { TextSize = 8, Color = C.DIM })
-        if evadeStackLayout then
-            evadeTab.CanvasSize = UDim2.new(0, 0, 0, 770)
-        else
-            evadeTab.CanvasSize = UDim2.new(0, 0, 0, 470)
+            UDim2.new(0, 10, 0, 386), UDim2.new(1, -20, 0, 20), { TextSize = 8, Color = C.DIM })
+
+        -- ============================================================
+        -- SETUP SKIP: tắt/bật Auto Skip theo Wave (Wave không giới hạn, đọc từ MatchScanner.SkipWave)
+        -- ============================================================
+        local evadeSkipPanel = newInstance("Frame", {
+            Position = evadeStackLayout and UDim2.new(0, 9, 0, 809) or UDim2.new(0, 9, 0, 458),
+            Size = UDim2.new(1, -18, 0, 300),
+            BackgroundColor3 = C.PANEL, BorderSizePixel = 0,
+        }, evadeTab)
+        addCorner(evadeSkipPanel, 10)
+        addStroke(evadeSkipPanel, Color3.fromRGB(145, 24, 48), 1)
+        do
+            makeLabel(evadeSkipPanel, "SETUP SKIP", UDim2.new(0, 10, 0, 9), UDim2.new(1, -20, 0, 22), {
+                Font = Enum.Font.GothamBold, TextSize = 11, Color = C.ACCENT, Align = Enum.TextXAlignment.Center,
+            })
+            makeLabel(evadeSkipPanel, "Điều khiển Auto Skip theo Wave. Cần bật AUTO SKIP ở tab Main; Wave theo đợt chỉ chạy khi Auto Skip đang bật.",
+                UDim2.new(0, 10, 0, 33), UDim2.new(1, -20, 0, 32), { TextSize = 8, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top })
+
+            makeLabel(evadeSkipPanel, "WAVE TẮT SKIP (≥ 1, KHÔNG GIỚI HẠN)", UDim2.new(0, 10, 0, 70), UDim2.new(1, -20, 0, 17), { TextSize = 8, Color = C.DIM })
+            local skipWaveBox = makeTextBox(evadeSkipPanel, "vd: 50", UDim2.new(0, 10, 0, 88), UDim2.new(1, -20, 0, 27))
+            local skipCycleBox = makeTextBox(evadeSkipPanel, "vd: 3", UDim2.new(0, 10, 0, 174), UDim2.new(1, -20, 0, 27))
+            makeLabel(evadeSkipPanel, "WAVE THEO ĐỢT (1 - 5)", UDim2.new(0, 10, 0, 156), UDim2.new(1, -20, 0, 17), { TextSize = 8, Color = C.DIM })
+            local skipStatus = makeLabel(evadeSkipPanel, "Setup Skip: chưa bật.",
+                UDim2.new(0, 10, 0, 244), UDim2.new(1, -20, 0, 50), { TextSize = 9, Color = C.DIM, Wrapped = true, YAlign = Enum.TextYAlignment.Top })
+            local function say(text, color)
+                skipStatus.Text = text
+                skipStatus.TextColor3 = color or C.DIM
+            end
+
+            local function readWaveN()
+                local value = tonumber(skipWaveBox.Text)
+                value = value and math.floor(value)
+                if value and value >= 1 then return value end
+                return nil
+            end
+            local function readCycleK()
+                local value = tonumber(skipCycleBox.Text)
+                value = value and math.floor(value)
+                if value then return math.clamp(value, 1, 5) end
+                return nil
+            end
+            skipWaveBox.FocusLost:Connect(function()
+                local value = readWaveN()
+                skipWaveBox.Text = value and tostring(value) or ""
+            end)
+            skipCycleBox.FocusLost:Connect(function()
+                local value = readCycleK()
+                skipCycleBox.Text = value and tostring(value) or ""
+            end)
+
+            local getWaveStop, getCycle
+            local function skipIsOn() return getAutoSkip ~= nil and getAutoSkip() == true end
+            local function setSkip(value)
+                if not callbacks.onAutoSkipChanged then
+                    say("Auto Skip Remote chưa được nối.", C.YELLOW)
+                    return false
+                end
+                local callOK, ok, message = pcall(callbacks.onAutoSkipChanged, value)
+                if not callOK or not ok then
+                    say("Không đổi được Auto Skip: " .. tostring(callOK and message or ok), C.YELLOW)
+                    return false
+                end
+                autoSkipSetter(value, true) -- cập nhật nút Main, không kích hoạt lại callback
+                return true
+            end
+            local function resetMatchState(restoreSkip)
+                if restoreSkip and skipCtl.forcedOff and not skipCtl.locked then
+                    if setSkip(true) then say("Trận mới: đã bật lại Auto Skip.", C.GREEN) end
+                end
+                skipCtl.locked = false
+                skipCtl.forcedOff = false
+                skipCtl.forcedWave = nil
+                skipCtl.base = nil
+                skipCtl.lastWave = nil
+            end
+            skipCtl.onManual = function()
+                skipCtl.forcedOff = false
+                skipCtl.base = nil
+            end
+
+            local waveStopSetter
+            waveStopSetter, getWaveStop = makeToggle(evadeSkipPanel, "WAVE: TẮT SKIP ĐẾN HẾT TRẬN", UDim2.new(0, 10, 0, 120), function(enabled)
+                enabled = enabled == true
+                if enabled and not readWaveN() then
+                    say("Hãy nhập Wave ≥ 1 trước khi bật.", C.YELLOW)
+                    return false, "Chưa nhập Wave."
+                end
+                if not enabled then skipCtl.locked = false end
+                local message = enabled
+                    and ("WAVE BẬT: tới Wave " .. tostring(readWaveN()) .. " sẽ tắt Auto Skip đến hết trận.")
+                    or "WAVE TẮT."
+                say(message, enabled and C.GREEN or C.YELLOW)
+                return true, message
+            end)
+            local cycleSetter
+            cycleSetter, getCycle = makeToggle(evadeSkipPanel, "WAVE THEO ĐỢT", UDim2.new(0, 10, 0, 206), function(enabled)
+                enabled = enabled == true
+                if enabled and not readCycleK() then
+                    say("Hãy nhập số từ 1 đến 5 trước khi bật.", C.YELLOW)
+                    return false, "Chưa nhập số đợt."
+                end
+                skipCtl.base = nil
+                if not enabled and skipCtl.forcedOff then
+                    if setSkip(true) then skipCtl.forcedOff = false end
+                end
+                local message = enabled
+                    and ("THEO ĐỢT BẬT: Auto Skip chạy " .. tostring(readCycleK()) .. " wave rồi tắt 1 wave, lặp lại.")
+                    or "THEO ĐỢT TẮT."
+                say(message, enabled and C.GREEN or C.YELLOW)
+                return true, message
+            end)
+
+            local function skipTick()
+                local snapshot = MatchScanner:GetSnapshot()
+                local matchNo = snapshot.MatchNumber
+                if skipCtl.lastMatch ~= nil and skipCtl.lastMatch ~= matchNo then
+                    resetMatchState(true) -- sang trận mới: mở khóa; bật lại Auto Skip nếu đang bị tắt theo đợt
+                end
+                skipCtl.lastMatch = matchNo
+                local wave = tonumber(snapshot.WaveAny)
+                if not wave then return end
+                if skipCtl.lastWave and wave < skipCtl.lastWave then
+                    resetMatchState(true) -- Wave tụt xuống = trận mới
+                end
+                skipCtl.lastWave = wave
+
+                -- (A) WAVE: tới Wave nhập → tắt Auto Skip, KHÔNG tự bật lại đến hết trận.
+                if getWaveStop() and not skipCtl.locked then
+                    local limit = readWaveN()
+                    if limit and wave >= limit then
+                        skipCtl.locked = true
+                        skipCtl.forcedOff = false
+                        if skipIsOn() and not setSkip(false) then skipCtl.locked = false return end
+                        say("Đã tới Wave " .. tostring(wave) .. " (≥ " .. tostring(limit)
+                            .. "): Auto Skip TẮT đến hết trận. Muốn bật lại phải tự bật.", C.YELLOW)
+                        return
+                    end
+                end
+                if skipCtl.locked then return end
+
+                -- (B) WAVE THEO ĐỢT: chỉ chạy khi Auto Skip đang hoạt động.
+                if getCycle() then
+                    local k = readCycleK()
+                    if not k then return end
+                    if skipCtl.forcedOff and wave ~= skipCtl.forcedWave then
+                        if setSkip(true) then
+                            skipCtl.forcedOff = false
+                            say("Wave " .. tostring(wave) .. ": bật lại Auto Skip.", C.GREEN)
+                        end
+                    end
+                    if not skipCtl.forcedOff and skipIsOn() then
+                        if not skipCtl.base then skipCtl.base = wave end
+                        if (wave - skipCtl.base) % (k + 1) == k then
+                            if setSkip(false) then
+                                skipCtl.forcedOff = true
+                                skipCtl.forcedWave = wave
+                                say("Wave " .. tostring(wave) .. ": tắt Auto Skip, sang Wave kế tiếp sẽ bật lại (mỗi "
+                                    .. tostring(k) .. " wave).", C.YELLOW)
+                            end
+                        end
+                    end
+                end
+            end
+            task.spawn(function()
+                while not destroyed and evadeSkipPanel.Parent do
+                    task.wait(0.25)
+                    if destroyed then break end
+                    local ok, err = pcall(skipTick)
+                    if not ok then say("Setup Skip lỗi: " .. tostring(err), C.YELLOW) end
+                end
+            end)
         end
 
+        local function layoutEvadeSkipPanel(stack)
+            if stack then
+                evadeSkipPanel.Position = UDim2.new(0, 9, 0, 809)
+                evadeTab.CanvasSize = UDim2.new(0, 0, 0, 1130)
+            else
+                evadeSkipPanel.Position = UDim2.new(0, 9, 0, 458)
+                evadeTab.CanvasSize = UDim2.new(0, 0, 0, 780)
+            end
+        end
+        layoutEvadeSkipPanel(evadeStackLayout)
+
         local selectedEvadeKey = nil
-        Treost.WaypointRuntime.ScanRadius = 40
+        Treost.WaypointRuntime.ScanRadius = 60
         Treost.WaypointRuntime.WaveThreshold = 0
         local renameConfirmAt = 0
         local deleteConfirmAt = 0
@@ -7965,14 +8284,14 @@ do
                 evadeLeft.Position = UDim2.new(0, 9, 0, 9)
                 evadeLeft.Size = UDim2.new(1, -18, 0, 360)
                 evadeRight.Position = UDim2.new(0, 9, 0, 380)
-                evadeRight.Size = UDim2.new(1, -18, 0, 360)
-                evadeTab.CanvasSize = UDim2.new(0, 0, 0, 770)
+                evadeRight.Size = UDim2.new(1, -18, 0, 420)
+                layoutEvadeSkipPanel(true)
             else
                 evadeLeft.Position = UDim2.new(0, 9, 0, 9)
                 evadeLeft.Size = UDim2.new(0.54, -12, 0, 440)
                 evadeRight.Position = UDim2.new(0.54, 2, 0, 9)
                 evadeRight.Size = UDim2.new(0.46, -12, 0, 440)
-                evadeTab.CanvasSize = UDim2.new(0, 0, 0, 470)
+                layoutEvadeSkipPanel(false)
             end
         end)
 
@@ -8340,7 +8659,9 @@ do
             setTargetInfo = function() end,
             setRouteStatus = function() end,
             setSpeedUI = function() end,
-            setNoclipUI = function() end,
+            setNoclipUI = function(enabled, silent)
+                if noclipSetter then noclipSetter(enabled == true, silent == true) end
+            end,
             setFollowUI = function() end,
             setScannerUI = function() end,
             setSpeedModeUI = function() end,
@@ -15648,6 +15969,7 @@ task.defer(function()
             Treost.WaypointRuntime.ScanRadius = stubRuntime.ScanRadius or Treost.WaypointRuntime.ScanRadius
             Treost.WaypointRuntime.WaveThreshold = stubRuntime.WaveThreshold or Treost.WaypointRuntime.WaveThreshold
             Treost.WaypointRuntime.OverWave = stubRuntime.OverWave == true
+            Treost.WaypointRuntime.AutoAround = stubRuntime.AutoAround == true
         end
         treostCoreReady = true
         if api and api.getEvadeLabels then
