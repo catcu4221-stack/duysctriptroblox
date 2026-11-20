@@ -2218,6 +2218,9 @@ local MatchScanner = {
     _connections = {},
     _watchedText = {},
     _watchedGui = {},
+    _terminalCandidates = {}, -- v1.5 perf: chỉ các Text đang chứa Victory/Defeat/Game over
+    _instanceConnections = setmetatable({}, { __mode = "k" }),
+    _checkPending = false,
     _waveLabel = nil,
     _terminalLocked = false,
     _reportedTerminal = false,
@@ -2338,8 +2341,12 @@ do
 
     local function checkResultTexts(self)
         if not self._active then return end
-        for instance in pairs(self._watchedText) do
-            if instance and instance.Parent and isTextObject(instance) then
+        -- v1.5 perf: trước đây duyệt TOÀN BỘ Text của PlayerGui mỗi khi 1 GuiObject đổi Visible
+        -- (bấm Unit đổi hàng trăm Visible -> lag). Giờ chỉ duyệt các ứng viên Victory/Defeat.
+        for instance in pairs(self._terminalCandidates) do
+            if not (instance and instance.Parent) then
+                self._terminalCandidates[instance] = nil
+            elseif isTextObject(instance) then
                 if isVisible(instance) then
                     local text = stripRichText(instance.Text)
                     if isDefeatText(text) or isVictoryText(text) then
@@ -2358,6 +2365,16 @@ do
                 end
             end
         end
+    end
+
+    -- Gộp nhiều sự kiện Visible/Enabled liên tiếp thành 1 lần kiểm tra (0.12s).
+    local function scheduleResultCheck(self)
+        if self._checkPending or not self._active then return end
+        self._checkPending = true
+        task.delay(0.12, function()
+            self._checkPending = false
+            if self._active then checkResultTexts(self) end
+        end)
     end
 
     local function handleWave(self, instance)
@@ -2390,7 +2407,16 @@ do
     local function handleTextChanged(self, instance)
         if not self._active or not isTextObject(instance) then return end
         local text = stripRichText(instance.Text)
-        if isVisible(instance) and (isDefeatText(text) or isVictoryText(text)) then
+        local lowered = string.lower(text)
+        local maybeTerminal = string.find(lowered, "defeat", 1, true)
+            or string.find(lowered, "game over", 1, true)
+            or string.find(lowered, "victory", 1, true)
+        if maybeTerminal then
+            self._terminalCandidates[instance] = true
+        else
+            self._terminalCandidates[instance] = nil
+        end
+        if maybeTerminal and isVisible(instance) and (isDefeatText(text) or isVictoryText(text)) then
             local result = isDefeatText(text) and "LOSS (DEFEAT)" or "WIN (VICTORY)"
             local signature = result .. "|" .. string.lower(text)
             if self._handledTerminalText[instance] ~= signature then
@@ -2403,7 +2429,7 @@ do
         end
 
         -- Chi xu ly chuoi co tu Wave; bo qua Night 6 va cac so UI khac.
-        if string.find(string.lower(text), "wave", 1, true)
+        if string.find(lowered, "wave", 1, true)
             or (CONFIG.WAVE_LABEL_NAME and instance.Name == CONFIG.WAVE_LABEL_NAME) then
             local current = parseWave(text)
             if current then
@@ -2417,17 +2443,24 @@ do
         table.insert(MatchScanner._connections, connection)
     end
 
+    -- Kết nối gắn với 1 instance: ngắt khi instance bị xóa (tránh rò rỉ khi UI Unit tạo/xóa liên tục).
+    local function connectFor(self, instance, connection)
+        local list = self._instanceConnections[instance]
+        if not list then list = {}; self._instanceConnections[instance] = list end
+        table.insert(list, connection)
+    end
+
     local function watchGuiObject(self, instance)
         if self._watchedGui[instance] then return end
         if not instance:IsA("GuiObject") and not instance:IsA("ScreenGui") then return end
         self._watchedGui[instance] = true
         if instance:IsA("GuiObject") then
-            connect(instance:GetPropertyChangedSignal("Visible"):Connect(function()
-                checkResultTexts(self)
+            connectFor(self, instance, instance:GetPropertyChangedSignal("Visible"):Connect(function()
+                scheduleResultCheck(self)
             end))
         elseif instance:IsA("ScreenGui") then
-            connect(instance:GetPropertyChangedSignal("Enabled"):Connect(function()
-                checkResultTexts(self)
+            connectFor(self, instance, instance:GetPropertyChangedSignal("Enabled"):Connect(function()
+                scheduleResultCheck(self)
             end))
         end
     end
@@ -2435,7 +2468,7 @@ do
     local function watchTextObject(self, instance)
         if not isTextObject(instance) or self._watchedText[instance] then return end
         self._watchedText[instance] = true
-        connect(instance:GetPropertyChangedSignal("Text"):Connect(function()
+        connectFor(self, instance, instance:GetPropertyChangedSignal("Text"):Connect(function()
             handleTextChanged(self, instance)
         end))
         handleTextChanged(self, instance)
@@ -2465,18 +2498,32 @@ do
         self.WaveSource = "LISTENING FOR WAVE / RESULT"
 
         -- Mot lan duyet UI khi bat scanner; sau do chi lang nghe su kien Text/Visible.
-        for _, instance in ipairs(PlayerGui:GetDescendants()) do
-            watchGuiObject(self, instance)
-            watchTextObject(self, instance)
-        end
-
+        -- v1.5 perf: duyệt theo lô nhỏ trong luồng riêng, không đứng hình khi vừa mở menu.
         connect(PlayerGui.DescendantAdded:Connect(function(instance)
             watchGuiObject(self, instance)
             watchTextObject(self, instance)
         end))
+        task.spawn(function()
+            local okList, list = pcall(function() return PlayerGui:GetDescendants() end)
+            if not okList then return end
+            for index, instance in ipairs(list) do
+                if not self._active then return end
+                if instance.Parent then
+                    watchGuiObject(self, instance)
+                    watchTextObject(self, instance)
+                end
+                if index % 150 == 0 then task.wait() end
+            end
+        end)
         connect(PlayerGui.DescendantRemoving:Connect(function(instance)
             self._watchedText[instance] = nil
             self._watchedGui[instance] = nil
+            self._terminalCandidates[instance] = nil
+            local list = self._instanceConnections[instance]
+            if list then
+                for _, connection in ipairs(list) do pcall(function() connection:Disconnect() end) end
+                self._instanceConnections[instance] = nil
+            end
             self._handledTerminalText[instance] = nil
             if self._waveLabel == instance then self._waveLabel = nil end
         end))
@@ -2489,6 +2536,11 @@ do
             pcall(function() connection:Disconnect() end)
         end
         table.clear(self._connections)
+        for _, list in pairs(self._instanceConnections) do
+            for _, connection in ipairs(list) do pcall(function() connection:Disconnect() end) end
+        end
+        table.clear(self._instanceConnections)
+        table.clear(self._terminalCandidates)
         table.clear(self._watchedText)
         table.clear(self._watchedGui)
         table.clear(self._handledTerminalText)
@@ -8467,11 +8519,11 @@ do
             if not instance or not instance.Parent then return end
             if not (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")) then return end
             if instance:IsA("TextButton") then
-                instance.Font = Enum.Font.GothamBold
+                if instance.Font ~= Enum.Font.GothamBold then instance.Font = Enum.Font.GothamBold end
             elseif instance:IsA("TextBox") and instance.Font ~= Enum.Font.Code then
-                instance.Font = Enum.Font.GothamMedium
+                if instance.Font ~= Enum.Font.GothamMedium then instance.Font = Enum.Font.GothamMedium end
             elseif instance:IsA("TextLabel") then
-                instance.Font = Enum.Font.GothamSemibold
+                if instance.Font ~= Enum.Font.GothamSemibold then instance.Font = Enum.Font.GothamSemibold end
             end
             local width = math.max(48, instance.AbsoluteSize.X - 12)
             local height = math.max(14, instance.AbsoluteSize.Y - 3)
@@ -8492,12 +8544,15 @@ do
                 if ok and bounds and bounds.Y <= height + 1 and (wrapped or bounds.X <= width + 1) then break end
                 candidate -= 1
             end
-            instance.TextSize = math.max(minimum, candidate)
-            instance.TextTransparency = 0
-            instance.TextStrokeColor3 = Color3.fromRGB(5, 8, 14)
-            instance.TextStrokeTransparency = 1 -- avoid dark halo that makes Delta text look blurred
-            instance.TextScaled = false
-            pcall(function() instance.TextTruncate = Enum.TextTruncate.None end)
+            -- v1.5 perf: chỉ ghi thuộc tính khi khác giá trị hiện tại (tránh kích hoạt lại sự kiện/render).
+            local finalSize = math.max(minimum, candidate)
+            if instance.TextSize ~= finalSize then instance.TextSize = finalSize end
+            if instance.TextTransparency ~= 0 then instance.TextTransparency = 0 end
+            if instance.TextStrokeTransparency ~= 1 then instance.TextStrokeTransparency = 1 end -- avoid dark halo that makes Delta text look blurred
+            if instance.TextScaled then instance.TextScaled = false end
+            if instance.TextTruncate ~= Enum.TextTruncate.None then
+                pcall(function() instance.TextTruncate = Enum.TextTruncate.None end)
+            end
         end
         local function registerDeltaText(instance)
             if not instance or not instance.Parent then return end
@@ -8515,9 +8570,16 @@ do
             deltaTextConnections[instance] = connections
         end
         local function applyDeltaTextReadability()
-            for _, descendant in ipairs(screen:GetDescendants()) do
-                registerDeltaText(descendant)
-            end
+            -- v1.5 perf: xử lý theo lô nhỏ, không khóa khung hình khi mở menu.
+            task.spawn(function()
+                local count = 0
+                for _, descendant in ipairs(screen:GetDescendants()) do
+                    if not screen.Parent then return end
+                    registerDeltaText(descendant)
+                    count += 1
+                    if count % 40 == 0 then task.wait() end
+                end
+            end)
             if not deltaTextConnection then
                 deltaTextConnection = screen.DescendantAdded:Connect(function(descendant)
                     task.defer(function() registerDeltaText(descendant) end)
@@ -14570,9 +14632,13 @@ end
 
 local function isChooseLevelVisible()
     for _, child in ipairs(PlayerGui:GetDescendants()) do
-        if (child:IsA("TextLabel") or child:IsA("TextButton")) and isVisibleGui(child) then
-            local text = tostring(child.Text or ""):lower():gsub("%s+", " ")
-            if text:find("choose level", 1, true) then return true end
+        if child:IsA("TextLabel") or child:IsA("TextButton") then
+            -- v1.5 perf: lọc chữ trước (rẻ), chỉ đi ngược cây cha khi đúng "choose".
+            local raw = child.Text
+            if type(raw) == "string" and #raw >= 12 and raw:lower():find("choose", 1, true) then
+                local text = raw:lower():gsub("%s+", " ")
+                if text:find("choose level", 1, true) and isVisibleGui(child) then return true end
+            end
         end
     end
     return false
@@ -15813,12 +15879,18 @@ local teleportResumeToken = 0
 
 -- ============================================================
 -- RUNTIME UPDATE LOOP (SHARED ENEMY CACHE FOR BOSS/PERFORMANCE; SMART EVADE OWNS MOVEMENT)
+local matchNotifyElapsed = 0
 local heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
     if destroyed then return end
 
-    local activeMatchContext = getActiveMacroMatchContext()
-    if activeMatchContext and isMacroMatchActive(activeMatchContext) then
-        notifyMatchStartedOnce(activeMatchContext)
+    -- v1.5 perf: không quét Contexts mỗi khung hình; 0.35s/lần là đủ cho thông báo bắt đầu trận.
+    matchNotifyElapsed += deltaTime
+    if matchNotifyElapsed >= 0.35 then
+        matchNotifyElapsed = 0
+        local activeMatchContext = getActiveMacroMatchContext()
+        if activeMatchContext and isMacroMatchActive(activeMatchContext) then
+            notifyMatchStartedOnce(activeMatchContext)
+        end
     end
 
     enemyElapsed += deltaTime
