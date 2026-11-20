@@ -4918,7 +4918,7 @@ local WaypointRuntime = {
     PausedTargetIndex = nil,
     Moving = false,
     ManualOverride = false,
-    ScanRadius = 60,
+    ScanRadius = 40,
     WaveThreshold = 0, -- 0 = không tự chuyển theo Wave
     OverWave = false, -- true = ở mãi chế độ Waypoint, bỏ qua ngưỡng Wave (kể cả Wave > 50)
     LastStartedMatch = 1,
@@ -5832,7 +5832,7 @@ Treost = {
     WaypointRuntime = {
         Enabled = false, AutoEvadeEnabled = false, AutoSwitchedToOriginal = false,
         Points = {}, CurrentIndex = 1, TargetIndex = nil, PausedTargetIndex = nil,
-        Moving = false, ManualOverride = false, ScanRadius = 60, WaveThreshold = 0, OverWave = false,
+        Moving = false, ManualOverride = false, ScanRadius = 40, WaveThreshold = 0, OverWave = false,
     },
     setLabels = function() end,
     updateMemoryLabel = function() end,
@@ -7526,7 +7526,7 @@ do
             return ok, message
         end)
         makeLabel(evadeRight, "WAYPOINT ENEMY RANGE (STUDS)", UDim2.new(0, 10, 0, 81), UDim2.new(1, -20, 0, 17), { TextSize = 8, Color = C.DIM })
-        local waypointRadiusBox = makeTextBox(evadeRight, "60", UDim2.new(0, 10, 0, 101), UDim2.new(1, -20, 0, 27))
+        local waypointRadiusBox = makeTextBox(evadeRight, "40", UDim2.new(0, 10, 0, 101), UDim2.new(1, -20, 0, 27))
         makeLabel(evadeRight, "WAVE ĐỂ THOÁT WAYPOINT (0 = TẮT)", UDim2.new(0, 10, 0, 137), UDim2.new(1, -20, 0, 17), { TextSize = 8, Color = C.DIM })
         local waveThresholdBox = makeTextBox(evadeRight, "0", UDim2.new(0, 10, 0, 157), UDim2.new(1, -20, 0, 27))
         makeLabel(evadeRight, "Giới hạn Wave: 0–50 · Smart Evade gốc: 25 studs",
@@ -7566,7 +7566,7 @@ do
         end
 
         local selectedEvadeKey = nil
-        Treost.WaypointRuntime.ScanRadius = 60
+        Treost.WaypointRuntime.ScanRadius = 40
         Treost.WaypointRuntime.WaveThreshold = 0
         local renameConfirmAt = 0
         local deleteConfirmAt = 0
